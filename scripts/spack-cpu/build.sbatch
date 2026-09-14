@@ -74,8 +74,8 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=c
 logs="$PREPARATION/build-logs"
 mkdir -p "$logs" "$version/stages"
 "$python" "$spack" bootstrap status > "$logs/bootstrap-status.txt"
-"$python" "$spack" -e "$environment" mirror list > "$logs/mirrors.txt"
-if awk 'NF >= 2 && $2 !~ /^file:\/\//' "$logs/mirrors.txt" | grep -q .; then echo "non-local Spack mirror is enabled" >&2; exit 1; fi
+"$python" "$spack" -e "$environment" config get mirrors --json > "$logs/mirrors.json"
+"$python" "$verify" mirrors "$logs/mirrors.json" "file://$PREPARATION/source-mirror"
 "$python" "$spack" -e "$environment" fetch -D -m > "$logs/offline-fetch-proof.txt" 2>&1
 
 stage() {

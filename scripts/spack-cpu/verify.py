@@ -77,6 +77,13 @@ def verify_prepared(preparation, plan_key=None):
     return receipt
 
 
+def verify_mirrors(configuration, expected_url):
+    mirrors = json.loads(configuration.read_text())
+    expected = {"mirrors": {"source-cache": expected_url}}
+    if mirrors != expected:
+        raise RuntimeError("effective Spack mirrors are not the prepared local source mirror")
+
+
 def verify_build(preparation):
     return verify_built_artifacts(preparation, True)
 
@@ -144,6 +151,9 @@ def main():
     build.add_argument("preparation", type=Path)
     artifacts = sub.add_parser("artifacts")
     artifacts.add_argument("preparation", type=Path)
+    mirrors = sub.add_parser("mirrors")
+    mirrors.add_argument("configuration", type=Path)
+    mirrors.add_argument("expected_url")
     args = parser.parse_args()
     if args.command is None:
         parser.error("a verification command is required")
@@ -151,6 +161,8 @@ def main():
         verify_prepared(args.preparation.resolve(), args.plan_key)
     elif args.command == "build":
         verify_build(args.preparation.resolve())
+    elif args.command == "mirrors":
+        verify_mirrors(args.configuration.resolve(), args.expected_url)
     else:
         verify_built_artifacts(args.preparation.resolve())
 

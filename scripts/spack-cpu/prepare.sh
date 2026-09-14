@@ -189,9 +189,9 @@ PY
 "$python" "$spack" bootstrap disable spack-install
 "$python" "$spack" bootstrap status > "$work/offline-bootstrap-status.txt"
 "$python" "$spack" -e "$work/generated/environment" mirror create -a -j "$jobs" -d "$work/source-mirror" > "$work/source-mirror-create.txt"
-"$python" "$spack" -e "$work/generated/environment" mirror add --scope env source-cache "file://$work/source-mirror"
-"$python" "$spack" -e "$work/generated/environment" mirror list > "$work/mirrors.txt"
-if awk 'NF >= 2 && $2 !~ /^file:\/\//' "$work/mirrors.txt" | grep -q .; then echo "non-local Spack mirror is enabled" >&2; exit 1; fi
+"$python" "$spack" -e "$work/generated/environment" config --scope "env:$work/generated/environment" add "mirrors::source-cache:'file://$work/source-mirror'"
+"$python" "$spack" -e "$work/generated/environment" config get mirrors --json > "$work/mirrors.json"
+"$python" "$frozen_scripts/verify.py" mirrors "$work/mirrors.json" "file://$work/source-mirror"
 export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ftp_proxy=http://127.0.0.1:9
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy FTP_PROXY=$ftp_proxy NO_PROXY= no_proxy=
 "$python" "$spack" -e "$work/generated/environment" fetch -D -m > "$work/offline-fetch-proof.txt"
