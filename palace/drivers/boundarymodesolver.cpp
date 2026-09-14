@@ -45,8 +45,8 @@ ExtractBoundary2DSubmesh(mfem::Mesh &parent, const mfem::Array<int> &surface_att
   auto sub = std::make_unique<mfem::SubMesh>(
       mfem::SubMesh::CreateFromBoundary(parent, surface_attrs));
   // Project to 2D before remapping element attributes: ProjectSubmeshTo2D's call to
-  // GetSurfaceNormal walks the mesh's unique-attribute list, which RemapSubMeshAttributes
-  // leaves stale relative to the per-element attributes it just rewrote.
+  // GetSurfaceNormal walks the unique-attribute list, which the remap rewrites from the
+  // surface tags to the neighboring domain materials.
   frame.normal = mesh::ProjectSubmeshTo2D(*sub, frame.centroid, frame.e1, frame.e2);
   mesh::RemapSubMeshAttributes(*sub);
   mesh::RemapSubMeshBdrAttributes(*sub, surface_attrs);
@@ -107,7 +107,8 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
 
     // Parent boundary face types whose intersection with the cross-section should
     // become 2D boundary edges: BCs that pin the tangential E-field (PEC, auxpec,
-    // impedance, conductivity, farfield) plus other-waveports (relabeled to PEC below).
+    // impedance, conductivity, rational impedance, farfield) plus other-waveports
+    // (relabeled to PEC below).
     std::vector<int> internal_bdr_attrs;
     const auto &bdr = iodata.boundaries;
     auto append = [&](const auto &src)
@@ -119,6 +120,10 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
       append(d.attributes);
     }
     for (const auto &d : bdr.conductivity)
+    {
+      append(d.attributes);
+    }
+    for (const auto &d : bdr.rational_impedance)
     {
       append(d.attributes);
     }
@@ -253,12 +258,10 @@ BoundaryModeSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   }
   else
   {
-    double c_min = mode_op.GetMaterialOp().GetLightSpeedMax().Min();
-    Mpi::GlobalMin(1, &c_min, mode_op.GetComm());
-    MFEM_VERIFY(c_min > 0.0 && c_min < mfem::infinity(),
-                "Invalid material speed of light!");
-    kn_target = omega / c_min * std::sqrt(1.1);
-    Mpi::Print(" Auto kn_target = {:.6e} (from c_min = {:.6e})\n", kn_target, c_min);
+    const double mu_eps_max = mode_op.GetMaterialOp().GetMaxMuEpsilon();
+    kn_target = omega * std::sqrt(1.1 * mu_eps_max);
+    Mpi::Print(" Auto kn_target = {:.6e} (from max(mu_r) * max(epsilon_r) = {:.6e})\n",
+               kn_target, mu_eps_max);
   }
 
   // Solve the eigenvalue problem.

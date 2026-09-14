@@ -4,6 +4,7 @@
 #ifndef PALACE_MODELS_WAVE_PORT_OPERATOR_HPP
 #define PALACE_MODELS_WAVE_PORT_OPERATOR_HPP
 
+#include <array>
 #include <complex>
 #include <map>
 #include <memory>
@@ -29,6 +30,8 @@ class MaterialOperator;
 class MaterialPropertyCoefficient;
 class SumVectorCoefficient;
 class SurfaceConductivityOperator;
+class SurfaceFunctional;
+class SurfaceRationalImpedanceOperator;
 class SurfaceImpedanceOperator;
 class Units;
 
@@ -61,6 +64,7 @@ public:
   double d_offset;
   int excitation;
   bool active;
+  bool include_in_synthesis;
   std::complex<double> kn0;
   double omega0;
   mfem::Vector port_normal;
@@ -85,6 +89,7 @@ private:
   std::unique_ptr<SurfaceImpedanceOperator> port_surf_z_op;
   std::unique_ptr<FarfieldBoundaryOperator> port_farfield_op;
   std::unique_ptr<SurfaceConductivityOperator> port_surf_sigma_op;
+  std::unique_ptr<SurfaceRationalImpedanceOperator> port_surf_rz_op;
 
   // Boundary mode eigenvalue problem solver.
   std::unique_ptr<ModeEigenSolver> mode_solver;
@@ -100,10 +105,36 @@ private:
   std::unique_ptr<GridFunction> port_E0t, port_E0n, port_S0t, port_E;
   std::unique_ptr<mfem::LinearForm> port_sr, port_si;
 
+  // libCEED surface functional for port power computation, replacing per-call boundary
+  // LinearForm assembly in the legacy path when supported.
+  mutable std::unique_ptr<SurfaceFunctional> power_func;
+
   // Voltage path for line integral (optional, for impedance postprocessing).
   std::vector<mfem::Vector> voltage_path;
   int voltage_n_samples;
   bool has_voltage_coords = false;
+
+  // Reverse transfer map (port submesh → parent mesh) and parent-mesh GridFunction
+  // used to evaluate line integrals of the port mode field via GSLIB on the 3D parent
+  // mesh. Only allocated if the user configured a voltage path.
+  std::unique_ptr<mfem::ParTransferMap> port_nd_transfer_reverse;
+  std::unique_ptr<GridFunction> parent_E0t;
+
+  // Cached GSLIB point locator for the voltage-path line integrals, Setup once on the
+  // (fixed) parent mesh. The geometric Setup is the dominant cost, so reusing it across
+  // every Initialize() avoids an O(num_elements) hash rebuild per frequency — critical for
+  // the circuit-synthesis dispersion fit, which evaluates the mode at many frequencies.
+  // Only allocated if the user configured a voltage path.
+#if defined(MFEM_USE_GSLIB)
+  std::unique_ptr<mfem::FindPointsGSLIB> voltage_gslib_op;
+#endif
+
+  // Optional polarity attributes (parent-mesh boundary attrs [high, low], signal
+  // first, ground second). When non-zero (i.e. set by the user) the mode is flipped
+  // so that E points from high to low, matching the lumped-port `+R Direction`
+  // convention. Computed without GSLIB by evaluating the mode at port-submesh
+  // boundary element centroids adjacent to each attribute.
+  std::array<int, 2> polarity_attributes = {0, 0};
 
 public:
   // 3D submesh constructor: extracts submesh from parent mesh.
@@ -121,6 +152,24 @@ public:
   const auto &GetAttrList() const { return attr_list; }
 
   void Initialize(double omega);
+
+  // Compute the sign of the modal E-field projected on the (high → low) direction
+  // implied by the given pair of parent-mesh boundary attributes (signal terminal
+  // first, ground terminal second). Returns +1, -1, or 0 if attributes were not
+  // resolvable on this mesh partition. Used by Initialize() to flip the mode polarity
+  // without requiring GSLIB.
+  [[nodiscard]] int GetModePolaritySign(int high_attr, int low_attr) const;
+
+  // Solve the cross-section modal EVP at a COMPLEX frequency and return the complex
+  // propagation constant k_n(ω), WITHOUT reconstructing the mode field or disturbing the
+  // cached real-ω state (omega0 / kn0 / port_E0t). This evaluates the wave-port BC as an
+  // analytic continuation onto the complex-λ plane (λ = i·ω) by re-solving the EVP at the
+  // genuinely complex ω, used by the eigenmode nonlinear eigensolver to evaluate the
+  // wave-port BC at the complex eigenvalue. MPI-collective on the FE space communicator
+  // (matrix assembly), with the eigenvalue broadcast from the port root. For real ω this
+  // returns the same k_n as Initialize(ω) (full complex value, including any cross-section
+  // loss), whereas GetWavePortKn truncates to the real part.
+  std::complex<double> SolveKnComplex(std::complex<double> omega);
 
   HYPRE_BigInt GlobalTrueNDSize() const { return port_nd_fespace->GlobalTrueVSize(); }
   HYPRE_BigInt GlobalTrueH1Size() const { return port_h1_fespace->GlobalTrueVSize(); }
@@ -171,7 +220,9 @@ private:
                                mfem::ParFiniteElementSpace &h1_fespace);
   void PrintBoundaryInfo(const Units &units, const mfem::ParMesh &mesh);
 
+protected:
   // Compute boundary modes for all wave port boundaries at the specified frequency.
+  // Protected so test fixtures can drive this directly via a thin subclass.
   void Initialize(double omega);
 
 public:
@@ -201,6 +252,44 @@ public:
   // Add contributions to system matrix from wave ports.
   void AddExtraSystemBdrCoefficients(double omega, MaterialPropertyCoefficient &fbr,
                                      MaterialPropertyCoefficient &fbi);
+
+  // Add the ω-independent boundary mass contribution from a single wave port to a material
+  // property coefficient. The full system contribution from this port is
+  // i·k_n(ω)·(this) — see AddExtraSystemBdrCoefficients. Used to factor out the
+  // ω-independent operator for reuse by the reduced-order model. This unit operator is
+  // available for active and inactive ports; callers that stamp the physical boundary
+  // condition are responsible for applying the port's Active flag.
+  void AddBoundaryMassBdrCoefficients(int port_idx, MaterialPropertyCoefficient &fb) const;
+
+  // As above, with an explicit scale factor on the contribution. Used internally by
+  // AddExtraSystemBdrCoefficients after its Active check to share the per-port coefficient
+  // setup without duplicating the mfem::MaterialPropertyCoefficient construction.
+  void AddBoundaryMassBdrCoefficients(int port_idx, MaterialPropertyCoefficient &fb,
+                                      double scale) const;
+
+  // Complex-frequency wave-port BC overload for the eigenmode nonlinear solve. Stamps the
+  // full complex wave-port term i·k_n(ω)·M_p with k_n(ω) from the exact cross-section EVP
+  // solved at the genuinely complex frequency ω = -i·λ (WavePortData::SolveKnComplex): the
+  // line-attenuation −Im(k_n)·M goes on fbr and the propagating Re(k_n)·M on fbi. Does not
+  // disturb the cached real-ω modal state. For real ω this matches the double overload's
+  // physics with the attenuation additionally carried on fbr.
+  void AddExtraSystemBdrCoefficients(std::complex<double> omega,
+                                     MaterialPropertyCoefficient &fbr,
+                                     MaterialPropertyCoefficient &fbi);
+
+  // Compute and return the (real part of the) modal propagation constant k_n for the
+  // specified port at the given operating frequency. Triggers the per-port cross-section
+  // EVP via WavePortData::Initialize; result is cached per port (per ω). Used by the
+  // reduced-order model to assemble the wave-port contribution online without touching
+  // any HDM-size object.
+  double GetWavePortKn(int port_idx, double omega);
+
+  // Complex-frequency propagation constant k_n(ω) for the eigenmode nonlinear solve's
+  // complex-λ wave-port BC (λ = i·ω). Runs the cross-section modal EVP at a genuinely
+  // complex ω and returns the recovered complex k_n without disturbing the cached real-ω
+  // modal field. The complex-ω counterpart of GetWavePortKn (which solves at real ω and
+  // truncates to Re(k_n)). See WavePortData::SolveKnComplex.
+  std::complex<double> GetWavePortKnComplex(int port_idx, std::complex<double> omega);
 
   // Add contributions to the right-hand side source term vector for an incident field at
   // excited port boundaries.

@@ -15,6 +15,7 @@
 #include "models/materialoperator.hpp"
 #include "models/surfaceconductivityoperator.hpp"
 #include "models/surfaceimpedanceoperator.hpp"
+#include "models/surfacerationalimpedanceoperator.hpp"
 #include "models/waveportoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/geodata.hpp"
@@ -79,6 +80,7 @@ ModeResult SolveRectangularModes(double width, double height, double freq_ghz,
   SurfaceImpedanceOperator surf_z_op(iodata, mat_op, palace_mesh.Get());
   FarfieldBoundaryOperator farfield_op(iodata, mat_op, palace_mesh.Get());
   SurfaceConductivityOperator surf_sigma_op(iodata, mat_op, palace_mesh.Get());
+  SurfaceRationalImpedanceOperator surf_rz_op(iodata, mat_op, palace_mesh.Get());
 
   mfem::Array<int> nd_dbc_tdof_list, h1_dbc_tdof_list;
   {
@@ -99,14 +101,16 @@ ModeResult SolveRectangularModes(double width, double height, double freq_ghz,
 
   double omega =
       2.0 * M_PI * iodata.units.Nondimensionalize<Units::ValueType::FREQUENCY>(freq_ghz);
-  double c_min = mat_op.GetLightSpeedMax().Min();
-  Mpi::GlobalMin(1, &c_min, nd_fespace.GetComm());
-  double kn_target = omega / c_min * std::sqrt(1.1);
+  double kn_target = omega * std::sqrt(1.1 * mat_op.GetMaxMuEpsilon());
 
-  ModeEigenSolver mode_solver(
-      mat_op, nullptr, surf_z_op, farfield_op, surf_sigma_op, nd_fespace, h1_fespace,
-      dbc_tdof_list, num_modes, -1, 1.0e-8, EigenvalueSolver::WhichType::LARGEST_REAL,
-      iodata.solver.linear, iodata.solver.boundary_mode.type, 0, nd_fespace.GetComm());
+  // ModeEigenSolver requires a positive Krylov subspace size (num_vec). Mirror the
+  // formula used by IoData::CheckConfiguration for eigenmode.max_size.
+  const int num_vec = std::max(2 * num_modes, num_modes + 15);
+  ModeEigenSolver mode_solver(mat_op, nullptr, surf_z_op, farfield_op, surf_sigma_op,
+                              surf_rz_op, nd_fespace, h1_fespace, dbc_tdof_list, num_modes,
+                              num_vec, 1.0e-8, EigenvalueSolver::WhichType::LARGEST_REAL,
+                              iodata.solver.linear, iodata.solver.boundary_mode.type, 0,
+                              nd_fespace.GetComm());
 
   double sigma = -kn_target * kn_target;
   auto result = mode_solver.Solve(omega, sigma);

@@ -6,7 +6,8 @@
 #
 
 # CMake 3.21 was released in Jul. 2021 (required for HIP support)
-cmake_minimum_required(VERSION 3.21)
+# Cmake 3.24 was released in Aug. 2022 (required for portable WHOLE_ARCHIVE linking of tests)
+cmake_minimum_required(VERSION 3.24)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -26,7 +27,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Initialize the project
-project(palace LANGUAGES CXX VERSION 0.16.1)
+project(palace LANGUAGES CXX VERSION 0.18.0)
 
 # Define build settings and defaults
 set(PALACE_WITH_OPENMP OFF CACHE BOOL "Use OpenMP for shared-memory parallelism")
@@ -36,6 +37,7 @@ set(PALACE_WITH_HIP OFF CACHE BOOL "Use HIP for AMD or NVIDIA GPU support")
 set(PALACE_WITH_SUPERLU ON CACHE BOOL "Build with SuperLU_DIST sparse direct solver")
 set(PALACE_WITH_STRUMPACK OFF CACHE BOOL "Build with STRUMPACK sparse direct solver")
 set(PALACE_WITH_MUMPS OFF CACHE BOOL "Build with MUMPS sparse direct solver")
+set(PALACE_WITH_CUDSS OFF CACHE BOOL "Build with cuDSS sparse direct solver")
 set(PALACE_WITH_SLEPC ON CACHE BOOL "Build with SLEPc eigenvalue solver")
 set(PALACE_WITH_ARPACK OFF CACHE BOOL "Build with ARPACK eigenvalue solver")
 set(PALACE_WITH_SUNDIALS ON CACHE BOOL "Build with SUNDIALS time integrators")
@@ -89,6 +91,9 @@ set(GSLIB_DIR "" CACHE STRING
 )
 set(SCALAPACK_DIR "" CACHE STRING
   "Path to ScaLAPACK build or installation directory (not required if already on CMAKE_PREFIX_PATH)"
+)
+set(CUDSS_DIR "" CACHE STRING
+  "Path to cuDSS installation directory (not required if already on CMAKE_PREFIX_PATH)"
 )
 
 # Enable Fortran if required
@@ -229,18 +234,19 @@ endif()
 
 # Find libCEED
 include(PkgConfigHelpers)
-set(LIBCEED_TEST_DEPS)
-if(PALACE_WITH_OPENMP)
-  list(APPEND LIBCEED_TEST_DEPS OpenMP::OpenMP_CXX)
-endif()
+set(GPU_TEST_DEPS)
 if(PALACE_WITH_CUDA)
   if(BUILD_SHARED_LIBS)
-    list(APPEND LIBCEED_TEST_DEPS CUDA::cudart CUDA::cublas)
+    list(APPEND GPU_TEST_DEPS CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   else()
-    list(APPEND LIBCEED_TEST_DEPS CUDA::cudart_static CUDA::cublas_static)
+    list(APPEND GPU_TEST_DEPS CUDA::cudart_static CUDA::cublas_static CUDA::cuda_driver)
   endif()
 elseif(PALACE_WITH_HIP)
-  list(APPEND LIBCEED_TEST_DEPS hip::host)
+  list(APPEND GPU_TEST_DEPS hip::host)
+endif()
+set(LIBCEED_TEST_DEPS ${GPU_TEST_DEPS})
+if(PALACE_WITH_OPENMP)
+  list(APPEND LIBCEED_TEST_DEPS OpenMP::OpenMP_CXX)
 endif()
 find_libceed_pkgconfig("${LIBCEED_TEST_DEPS}" LIBCEED_TARGET)
 if("${LIBCEED_TARGET}" STREQUAL "")
@@ -249,7 +255,7 @@ endif()
 
 # Find PETSc and SLEPc
 if(PALACE_WITH_SLEPC)
-  set(PETSC_TEST_DEPS MPI::MPI_CXX)
+  set(PETSC_TEST_DEPS MPI::MPI_CXX ${GPU_TEST_DEPS})
   if(PALACE_WITH_OPENMP)
     list(APPEND PETSC_TEST_DEPS OpenMP::OpenMP_CXX)
   endif()
@@ -301,6 +307,11 @@ add_subdirectory(fem)
 add_subdirectory(linalg)
 add_subdirectory(models)
 add_subdirectory(utils)
+
+target_sources(${LIB_TARGET_NAME}
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/driver.cpp
+)
 
 # Add executable target
 set(TARGET_NAME palace)
@@ -419,6 +430,12 @@ target_link_libraries(${LIB_TARGET_NAME}
          nlohmann_json_schema_validator::validator fmt::fmt scn::scn
          Eigen3::Eigen LAPACK::LAPACK MPI::MPI_CXX
 )
+if(PALACE_WITH_CUDA)
+  # libCEED uses the CUDA driver API. FindCUDAToolkit resolves this target to
+  # the toolkit stub at build time without adding the stub directory to RPATH;
+  # the NVIDIA driver provides libcuda.so.1 at runtime.
+  target_link_libraries(${LIB_TARGET_NAME} PUBLIC CUDA::cuda_driver)
+endif()
 
 # Add MFEM include directory for Spack builds
 if(NOT "${MFEM_DIR}" STREQUAL "")
@@ -599,6 +616,15 @@ if(PALACE_WITH_MUMPS)
       SCALAPACK::SCALAPACK ${MPI_Fortran_LIBRARIES})
     target_include_directories(${LIB_TARGET_NAME} PUBLIC ${MUMPS_INCLUDE_DIR})
   endif()
+endif()
+
+# Link cuDSS
+if(PALACE_WITH_CUDSS)
+  find_library(CUDSS_LIBRARY NAMES cudss HINTS ${CUDSS_DIR}/lib REQUIRED)
+  find_path(CUDSS_INCLUDE_DIR NAMES cudss.h HINTS ${CUDSS_DIR}/include REQUIRED)
+  message(STATUS "Found cuDSS: ${CUDSS_LIBRARY}")
+  target_link_libraries(${LIB_TARGET_NAME} PUBLIC ${CUDSS_LIBRARY})
+  target_include_directories(${LIB_TARGET_NAME} PUBLIC ${CUDSS_INCLUDE_DIR})
 endif()
 
 # Link METIS and ParMETIS (must come after SuperLU_DIST, STRUMPACK, MUMPS for static linking)

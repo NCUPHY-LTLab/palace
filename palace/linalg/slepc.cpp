@@ -544,8 +544,7 @@ SlepcEPSSolverBase::~SlepcEPSSolverBase()
 
 void SlepcEPSSolverBase::SetNumModes(int num_eig, int num_vec)
 {
-  PalacePetscCall(EPSSetDimensions(eps, num_eig, (num_vec > 0) ? num_vec : PETSC_DEFAULT,
-                                   PETSC_DEFAULT));
+  PalacePetscCall(EPSSetDimensions(eps, num_eig, num_vec, PETSC_DEFAULT));
 }
 
 void SlepcEPSSolverBase::SetTol(PetscReal tol)
@@ -558,8 +557,7 @@ void SlepcEPSSolverBase::SetTol(PetscReal tol)
 
 void SlepcEPSSolverBase::SetMaxIter(int max_it)
 {
-  PalacePetscCall(
-      EPSSetTolerances(eps, PETSC_DEFAULT, (max_it > 0) ? max_it : PETSC_DEFAULT));
+  PalacePetscCall(EPSSetTolerances(eps, PETSC_DEFAULT, max_it));
 }
 
 void SlepcEPSSolverBase::SetWhichEigenpairs(EigenvalueSolver::WhichType type)
@@ -1033,8 +1031,7 @@ SlepcPEPSolverBase::~SlepcPEPSolverBase()
 
 void SlepcPEPSolverBase::SetNumModes(int num_eig, int num_vec)
 {
-  PalacePetscCall(PEPSetDimensions(pep, num_eig, (num_vec > 0) ? num_vec : PETSC_DEFAULT,
-                                   PETSC_DEFAULT));
+  PalacePetscCall(PEPSetDimensions(pep, num_eig, num_vec, PETSC_DEFAULT));
 }
 
 void SlepcPEPSolverBase::SetTol(PetscReal tol)
@@ -1046,8 +1043,7 @@ void SlepcPEPSolverBase::SetTol(PetscReal tol)
 
 void SlepcPEPSolverBase::SetMaxIter(int max_it)
 {
-  PalacePetscCall(
-      PEPSetTolerances(pep, PETSC_DEFAULT, (max_it > 0) ? max_it : PETSC_DEFAULT));
+  PalacePetscCall(PEPSetTolerances(pep, PETSC_DEFAULT, max_it));
 }
 
 void SlepcPEPSolverBase::SetWhichEigenpairs(EigenvalueSolver::WhichType type)
@@ -1385,8 +1381,7 @@ SlepcNEPSolverBase::~SlepcNEPSolverBase()
 
 void SlepcNEPSolverBase::SetNumModes(int num_eig, int num_vec)
 {
-  PalacePetscCall(NEPSetDimensions(nep, num_eig, (num_vec > 0) ? num_vec : PETSC_DEFAULT,
-                                   PETSC_DEFAULT));
+  PalacePetscCall(NEPSetDimensions(nep, num_eig, num_vec, PETSC_DEFAULT));
 }
 
 void SlepcNEPSolverBase::SetTol(PetscReal tol)
@@ -1397,8 +1392,7 @@ void SlepcNEPSolverBase::SetTol(PetscReal tol)
 
 void SlepcNEPSolverBase::SetMaxIter(int max_it)
 {
-  PalacePetscCall(
-      NEPSetTolerances(nep, PETSC_DEFAULT, (max_it > 0) ? max_it : PETSC_DEFAULT));
+  PalacePetscCall(NEPSetTolerances(nep, PETSC_DEFAULT, max_it));
 }
 
 void SlepcNEPSolverBase::SetShiftInvert(std::complex<double> s, bool precond)
@@ -1602,14 +1596,15 @@ SlepcNEPSolver::SlepcNEPSolver(MPI_Comm comm, int print, const std::string &pref
 }
 
 void SlepcNEPSolver::SetExtraSystemMatrix(
-    std::function<std::unique_ptr<ComplexOperator>(double)> A2)
+    std::function<std::unique_ptr<ComplexOperator>(std::complex<double>)> A2)
 {
   funcA2 = A2;
 }
 
 void SlepcNEPSolver::SetPreconditionerUpdate(
-    std::function<std::unique_ptr<ComplexOperator>(
-        std::complex<double>, std::complex<double>, std::complex<double>, double)>
+    std::function<
+        std::unique_ptr<ComplexOperator>(std::complex<double>, std::complex<double>,
+                                         std::complex<double>, std::complex<double>)>
         P)
 {
   funcP = P;
@@ -1770,7 +1765,7 @@ PetscReal SlepcNEPSolver::GetResidualNorm(PetscScalar l, const ComplexVector &x,
   opM->AddMult(x, r, l * l);
   if (funcA2)
   {
-    auto A2 = (*funcA2)(std::abs(l.imag()));
+    auto A2 = (*funcA2)(l);
     A2->AddMult(x, r, 1.0 + 0.0i);
   }
   return linalg::Norml2(GetComm(), r);
@@ -2142,12 +2137,13 @@ PetscErrorCode __pc_apply_NEP(PC pc, Vec x, Vec y)
   {
     if (ctx->lambda.imag() == 0.0)
       ctx->lambda = ctx->sigma;
-    ctx->opA2_pc = (*ctx->funcA2)(std::abs(ctx->lambda.imag()));
+    ctx->opA2_pc = (*ctx->funcA2)(ctx->lambda);
     ctx->opA_pc = palace::BuildParSumOperator(
         {1.0 + 0.0i, ctx->lambda, ctx->lambda * ctx->lambda, 1.0 + 0.0i},
         {ctx->opK, ctx->opC, ctx->opM, ctx->opA2_pc.get()}, true);
     ctx->opP_pc = (*ctx->funcP)(std::complex<double>(1.0, 0.0), ctx->lambda,
-                                ctx->lambda * ctx->lambda, ctx->lambda.imag());
+                                ctx->lambda * ctx->lambda,
+                                ctx->lambda / std::complex<double>(0.0, 1.0));
     ctx->opInv->SetOperators(*ctx->opA_pc, *ctx->opP_pc);
     ctx->new_lambda = false;
   }
@@ -2172,8 +2168,8 @@ PetscErrorCode __form_NEP_function(NEP nep, PetscScalar lambda, Mat fun, Mat B, 
   PetscFunctionBeginUser;
   palace::slepc::SlepcNEPSolver *ctxF;
   PetscCall(MatShellGetContext(fun, (void **)&ctxF));
-  // A(λ) = K + λ C + λ² M + A2(Im{λ}).
-  ctxF->opA2 = (*ctxF->funcA2)(std::abs(lambda.imag()));
+  // A(λ) = K + λ C + λ² M + A2(λ).
+  ctxF->opA2 = (*ctxF->funcA2)(lambda);
   ctxF->opA = palace::BuildParSumOperator(
       {1.0 + 0.0i, lambda, lambda * lambda, 1.0 + 0.0i},
       {ctxF->opK, ctxF->opC, ctxF->opM, ctxF->opA2.get()}, true);
@@ -2187,12 +2183,12 @@ PetscErrorCode __form_NEP_jacobian(NEP nep, PetscScalar lambda, Mat fun, void *c
   PetscFunctionBeginUser;
   palace::slepc::SlepcNEPSolver *ctxF;
   PetscCall(MatShellGetContext(fun, (void **)&ctxF));
-  // A(λ) = K + λ C + λ² M + A2(Im{λ}).
-  // J(λ) = C + 2 λ M + A2'(Im{λ}).
-  ctxF->opA2 = (*ctxF->funcA2)(std::abs(lambda.imag()));
+  // A(λ) = K + λ C + λ² M + A2(λ).
+  // J(λ) = C + 2 λ M + A2'(λ).
+  ctxF->opA2 = (*ctxF->funcA2)(lambda);
   const auto eps = std::sqrt(std::numeric_limits<double>::epsilon());
-  ctxF->opA2p = (*ctxF->funcA2)(std::abs(lambda.imag()) * (1.0 + eps));
-  std::complex<double> denom = std::complex<double>(0.0, eps * std::abs(lambda.imag()));
+  ctxF->opA2p = (*ctxF->funcA2)(lambda * (1.0 + eps));
+  std::complex<double> denom = eps * lambda;
   ctxF->opAJ = palace::BuildParSumOperator({1.0 / denom, -1.0 / denom},
                                            {ctxF->opA2p.get(), ctxF->opA2.get()}, true);
   ctxF->opJ = palace::BuildParSumOperator(

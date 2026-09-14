@@ -5,7 +5,10 @@
 #define PALACE_UTILS_GEODATA_HPP
 
 #include <cmath>
+#include <map>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <mfem.hpp>
 
@@ -48,6 +51,14 @@ double ComputeReferenceLength(const std::unique_ptr<mfem::Mesh> &mesh, MPI_Comm 
 // increased refinement. Ownership of the initial coarse mesh is inherited by the fine
 // meshes and it should not be deleted. The fine mesh hierarchy is owned by the user.
 void RefineMesh(const IoData &iodata, std::vector<std::unique_ptr<mfem::ParMesh>> &mesh);
+
+// Print parallel mesh statistics (element/vertex/edge/face counts, element size h, and
+// shape regularity kappa). When `full` is true, also prints the (refinement-invariant)
+// mesh curvature order and bounding box; pass false to print only the statistics that
+// change under refinement (used after each adaptive mesh refinement iteration). `prefix`
+// is prepended to the stats block (e.g. "Coarse "/"Refined ").
+void PrintMeshInfo(mfem::ParMesh &mesh, const IoData &iodata, bool full = true,
+                   const std::string &prefix = "");
 
 // Dimensionalize a mesh for use in exporting a mesh. Scales vertices and nodes by L.
 void DimensionalizeMesh(mfem::Mesh &mesh, double L);
@@ -94,6 +105,19 @@ inline mfem::Array<int> AttrToMarker(int max_attr, const T &attr_list,
   mfem::Array<int> marker;
   AttrToMarker(max_attr, attr_list, marker, skip_invalid);
   return marker;
+}
+
+// Maximum boundary attribute over all local boundary elements. This can differ from
+// mesh.bdr_attributes.Max() for internally-added boundary elements.
+int GetMaxBdrAttribute(const mfem::ParMesh &mesh);
+
+// Helper function to convert boundary attribute numbers to a marker array sized by the
+// maximum actual boundary element attribute.
+template <typename T>
+inline mfem::Array<int> BdrAttrToMarker(const mfem::ParMesh &mesh, const T &attr_list,
+                                        bool skip_invalid = false)
+{
+  return AttrToMarker(GetMaxBdrAttribute(mesh), attr_list, skip_invalid);
 }
 
 // Helper function to construct the axis-aligned bounding box for all elements with the
@@ -322,15 +346,56 @@ inline double GetVolume(const mfem::ParMesh &mesh, int attr)
 std::unique_ptr<mfem::ParMesh> DistributeSerialMesh(MPI_Comm comm,
                                                     std::unique_ptr<mfem::Mesh> &smesh);
 
-// Write the current adaptive mesh to the postprocessing directory when SaveAdaptMesh is enabled.
-void SaveAdaptMesh(const IoData &iodata, mfem::ParMesh &mesh);
+// Order-independent (conforming) topological entity counts for a mesh, broken down per
+// geometry. Populated only on the root rank when an adapted mesh is written (see
+// RebalanceMesh and CompleteMeshEntityCounts).
+struct MeshEntityCounts
+{
+  int dim = 0;
+  long long true_vertices = 0;
+  long long true_edges = 0;
+  // TRUE codim-1 faces by geometry (3D only; empty in 2D). Keys are TRIANGLE, SQUARE.
+  std::map<mfem::Geometry::Type, long long> true_faces;
+  // Raw cells by geometry (2D: TRIANGLE, SQUARE; 3D: TETRAHEDRON, CUBE, PRISM, PYRAMID).
+  std::map<mfem::Geometry::Type, long long> cells;
+  std::vector<int> domain_attributes, boundary_attributes;
+  bool valid = false;  // set true only when populated (root, save happened)
+};
+
+// Write the current adaptive mesh to the output directory when SaveAdaptMesh is enabled.
+// When out_counts is non-null, populate its gathered topology just as RebalanceMesh does.
+void SaveAdaptMesh(const IoData &iodata, mfem::ParMesh &mesh,
+                   MeshEntityCounts *out_counts = nullptr);
 
 // Helper function responsible for rebalancing the mesh, and optionally writing meshes from
-// the intermediate stages to disk. Returns the imbalance ratio before rebalancing.
-double RebalanceMesh(const IoData &iodata, std::unique_ptr<mfem::ParMesh> &mesh);
+// the intermediate stages to disk. Returns the imbalance ratio before rebalancing. When
+// `out_counts` is non-null and the adapted mesh is written, geometry-resolved counts are
+// filled on the root rank. Nonconforming vertex and edge counts must then be completed
+// collectively with CompleteMeshEntityCounts.
+double RebalanceMesh(const IoData &iodata, std::unique_ptr<mfem::ParMesh> &mesh,
+                     MeshEntityCounts *out_counts = nullptr);
+
+// Complete true vertex and edge counts for a nonconforming mesh using distributed
+// lowest-order H1 and ND spaces. This is collective over the mesh communicator and must be
+// called on every rank after RebalanceMesh has populated out_counts for the final mesh.
+void CompleteMeshEntityCounts(mfem::ParMesh &mesh, MeshEntityCounts &counts);
 
 // Helper for creating a hexahedral mesh from a tetrahedral mesh.
 mfem::Mesh MeshTetToHex(const mfem::Mesh &orig_mesh);
+
+// Helper function for matching boundary edges between parent mesh and submesh in parallel.
+void MatchBoundaryEdges(
+    const mfem::ParMesh &mesh, const mfem::ParSubMesh &boundary_submesh,
+    const mfem::Array<int> &submesh_boundary_edge_ids,
+    const std::unordered_map<int, int> &submesh_to_parent_bdr_edge_map,
+    const std::vector<std::unordered_map<int, int>> &hole_dof_to_edge_maps,
+    std::vector<mfem::Array<int>> &hole_boundary_edges);
+
+// Helper function for computing edge orientations on submesh boundaries.
+void ComputeSubmeshBoundaryEdgeOrientations(
+    const mfem::ParSubMesh &submesh, const mfem::Array<int> &inner_boundary_edges,
+    const mfem::Vector &loop_normal, std::unordered_map<int, double> &edge_oriented_lengths,
+    int order);
 
 }  // namespace mesh
 

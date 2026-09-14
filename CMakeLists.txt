@@ -17,7 +17,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 # Initialize the project
-project(palace-superbuild LANGUAGES CXX C VERSION 0.16.1)
+project(palace-superbuild LANGUAGES CXX C VERSION 0.18.0)
 
 # Define build settings and defaults
 set(PALACE_WITH_64BIT_INT OFF CACHE BOOL "Use 64 bit integers")
@@ -31,6 +31,7 @@ set(PALACE_BUILD_EXTERNAL_DEPS ON CACHE BOOL "Build external third-party depende
 set(PALACE_WITH_SUPERLU ON CACHE BOOL "Build with SuperLU_DIST sparse direct solver")
 set(PALACE_WITH_STRUMPACK OFF CACHE BOOL "Build with STRUMPACK sparse direct solver")
 set(PALACE_WITH_MUMPS OFF CACHE BOOL "Build with MUMPS sparse direct solver")
+set(PALACE_WITH_CUDSS OFF CACHE BOOL "Build with cuDSS sparse direct solver")
 set(PALACE_WITH_SLEPC ON CACHE BOOL "Build with SLEPc eigenvalue solver")
 set(PALACE_WITH_ARPACK OFF CACHE BOOL "Build with ARPACK eigenvalue solver")
 set(PALACE_WITH_LIBXSMM ON CACHE BOOL "Build with LIBXSMM backend for libCEED")
@@ -47,6 +48,9 @@ set(ANALYZE_SOURCES_CPPCHECK OFF CACHE BOOL "Run static analysis checks using cp
 
 set(PALACE_BUILD_WITH_COVERAGE OFF CACHE BOOL "Compile Palace with coverage flags (source-based for LLVM; gcov for GCC)")
 set(PALACE_BUILD_WITH_SANITIZERS OFF CACHE BOOL "Compile Palace with sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer)")
+set(PALACE_TESTS_NUMPROC 2 CACHE STRING "MPI ranks per [Parallel] unit-test case")
+set(PALACE_REGRESSION_NUMPROC 2 CACHE STRING "MPI ranks per [Regression]/[Long] case")
+set(PALACE_TESTS_OMP_THREADS 1 CACHE STRING "OpenMP threads per test process")
 
 # Enable Fortran if required
 if(PALACE_WITH_STRUMPACK OR PALACE_WITH_MUMPS OR PALACE_WITH_ARPACK)
@@ -70,7 +74,7 @@ if(PALACE_WITH_CUDA)
         string(REGEX REPLACE "\\." "" CUDA_CAPS "${CUDA_CAPS}")
         string(REGEX REPLACE "\n" ";" CUDA_CAPS "${CUDA_CAPS}")
         list(REMOVE_DUPLICATES CUDA_CAPS)
-        string(REPLACE ";" "," CMAKE_CUDA_ARCHITECTURES "${CUDA_CAPS}")
+        set(CMAKE_CUDA_ARCHITECTURES "${CUDA_CAPS}")
         message(STATUS "Detected CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
       else()
         set(CMAKE_CUDA_ARCHITECTURES "70")
@@ -142,12 +146,18 @@ endif()
 
 # Add extra CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(ArchitectureHelpers)
 
 # Intel classic compilers no longer supported (prior to CMake 3.20, the new compilers are
 # detected as Clang instead of IntelLLVM)
 if(CMAKE_C_COMPILER_ID STREQUAL "Intel" OR CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
   message(WARNING "The Intel classic compilers (icc/icpc) are no longer supported and \
 have been replaced by the newer Clang-based icx/icpx from Intel oneAPI")
+endif()
+
+# cuDSS is only for CUDA builds
+if(PALACE_WITH_CUDSS AND NOT PALACE_WITH_CUDA)
+  message(FATAL_ERROR "PALACE_WITH_CUDSS requires PALACE_WITH_CUDA")
 endif()
 
 # MAGMA is only for GPU builds

@@ -12,6 +12,7 @@ target_sources(${LIB_TARGET_NAME}
   ${CMAKE_CURRENT_SOURCE_DIR}/currentdipoleoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/domainpostoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/farfieldboundaryoperator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/floquetportoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/laplaceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lumpedportoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/materialoperator.cpp
@@ -23,9 +24,12 @@ target_sources(${LIB_TARGET_NAME}
   ${CMAKE_CURRENT_SOURCE_DIR}/strattonchu.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/spaceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/surfaceconductivityoperator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/surfacecurlsolver.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/surfacecurrentoperator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/surfacefluxoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/surfaceimpedanceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/surfacepostoperator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/surfacerationalimpedanceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/timeoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/waveportoperator.cpp
 )

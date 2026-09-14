@@ -12,6 +12,7 @@
 #include "linalg/ams.hpp"
 #include "linalg/arpack.hpp"
 #include "linalg/blockprecond.hpp"
+#include "linalg/cudss.hpp"
 #include "linalg/gmg.hpp"
 #include "linalg/iterative.hpp"
 #include "linalg/mumps.hpp"
@@ -25,6 +26,7 @@
 #include "models/materialoperator.hpp"
 #include "models/surfaceconductivityoperator.hpp"
 #include "models/surfaceimpedanceoperator.hpp"
+#include "models/surfacerationalimpedanceoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/configfile.hpp"
 #include "utils/iodata.hpp"
@@ -64,12 +66,24 @@ ComplexHypreParMatrix AssembleBtt(const FiniteElementSpace &nd_fespace,
           nullptr};
 }
 
-ComplexHypreParMatrix
-AssembleAtt(const FiniteElementSpace &nd_fespace, const MaterialOperator &mat_op,
-            const mfem::Vector *normal, SurfaceImpedanceOperator &surf_z_op,
-            FarfieldBoundaryOperator &farfield_op,
-            SurfaceConductivityOperator &surf_sigma_op, double omega, double sigma)
+ComplexHypreParMatrix AssembleAtt(
+    const FiniteElementSpace &nd_fespace, const MaterialOperator &mat_op,
+    const mfem::Vector *normal, SurfaceImpedanceOperator &surf_z_op,
+    FarfieldBoundaryOperator &farfield_op, SurfaceConductivityOperator &surf_sigma_op,
+    SurfaceRationalImpedanceOperator &surf_rz_op, std::complex<double> omega, double sigma)
 {
+  // Complex-ω decomposition. The transverse block carries the second-order operator
+  // K + iωC - ω²M (domain + boundary). For real ω the imaginary parts below are all
+  // zero and this reduces bit-for-bit to the original real-ω assembly. For complex ω,
+  // ω² = (w2r + i·w2i) so the -ω²·ε_real domain mass term acquires an imaginary part
+  // -w2i·ε_real (Atti), and the surface RLC / farfield multipliers (iω, -ω²) pick up
+  // real-part contributions that move to the real block. Cross terms between Im(ω) and
+  // material loss (ε_imag, σ) are included for completeness but are second order.
+  const double wr = omega.real(), wi = omega.imag();
+  const std::complex<double> w2 = omega * omega;
+  const double w2r = w2.real(), w2i = w2.imag();
+  const bool complex_omega = (wi != 0.0);
+
   MaterialPropertyCoefficient muinv_cc_func(mat_op.GetAttributeToMaterial(),
                                             normal ? mat_op.GetInvPermeability()
                                                    : mat_op.GetCurlCurlInvPermeability());
@@ -78,10 +92,22 @@ AssembleAtt(const FiniteElementSpace &nd_fespace, const MaterialOperator &mat_op
     muinv_cc_func.NormalProjectedCoefficient(*normal);
   }
 
-  MaterialPropertyCoefficient eps_shifted_func(
-      mat_op.GetAttributeToMaterial(), mat_op.GetPermittivityReal(), -omega * omega);
+  MaterialPropertyCoefficient eps_shifted_func(mat_op.GetAttributeToMaterial(),
+                                               mat_op.GetPermittivityReal(), -w2r);
   eps_shifted_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
                                   mat_op.GetInvPermeability(), -sigma);
+  if (complex_omega && mat_op.HasLossTangent())
+  {
+    // Cross term: Re(-ω²·(i·ε_imag)) = +w2i·ε_imag.
+    eps_shifted_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
+                                    mat_op.GetPermittivityImag(), w2i);
+  }
+  if (complex_omega && mat_op.HasConductivity())
+  {
+    // Cross term: Re(+iω·σ) = -wi·σ.
+    eps_shifted_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
+                                    mat_op.GetConductivity(), -wi);
+  }
   if (mat_op.HasLondonDepth())
   {
     eps_shifted_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
@@ -90,11 +116,18 @@ AssembleAtt(const FiniteElementSpace &nd_fespace, const MaterialOperator &mat_op
 
   const int max_bdr_attr = mat_op.MaxCeedBdrAttribute();
   MaterialPropertyCoefficient fbr(max_bdr_attr), fbi(max_bdr_attr);
-  surf_z_op.AddStiffnessBdrCoefficients(1.0, fbr);
-  surf_z_op.AddDampingBdrCoefficients(omega, fbi);
-  surf_z_op.AddMassBdrCoefficients(-omega * omega, fbr);
-  farfield_op.AddDampingBdrCoefficients(omega, fbi);
+  surf_z_op.AddStiffnessBdrCoefficients(1.0, fbr);  // K: 1/Ls (real, ω-independent)
+  surf_z_op.AddDampingBdrCoefficients(wr, fbi);     // C: Im(iω)/Rs = wr
+  surf_z_op.AddMassBdrCoefficients(-w2r, fbr);      // M: Re(-ω²)·Cs
+  farfield_op.AddDampingBdrCoefficients(wr, fbi);
+  if (complex_omega)
+  {
+    surf_z_op.AddDampingBdrCoefficients(-wi, fbr);  // C: Re(iω)/Rs = -wi
+    surf_z_op.AddMassBdrCoefficients(-w2i, fbi);    // M: Im(-ω²)·Cs
+    farfield_op.AddDampingBdrCoefficients(-wi, fbr);
+  }
   surf_sigma_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
+  surf_rz_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
 
   BilinearForm att(nd_fespace);
   att.AddDomainIntegrator<CurlCurlMassIntegrator>(muinv_cc_func, eps_shifted_func);
@@ -107,23 +140,31 @@ AssembleAtt(const FiniteElementSpace &nd_fespace, const MaterialOperator &mat_op
 
   std::unique_ptr<mfem::HypreParMatrix> Atti_assembled;
   {
-    const bool has_imag =
-        mat_op.HasLossTangent() || mat_op.HasConductivity() || !fbi.empty();
+    const bool has_imag = mat_op.HasLossTangent() || mat_op.HasConductivity() ||
+                          !fbi.empty() || complex_omega;
     if (has_imag)
     {
       // Coefficients must outlive the BilinearForm (integrators hold raw pointers).
       const int n_attr = mat_op.GetAttributeToMaterial().Size();
       MaterialPropertyCoefficient negepstandelta_func(n_attr);
       MaterialPropertyCoefficient fi_domain(n_attr);
+      if (complex_omega)
+      {
+        // New term: Im(-ω²·ε_real) = -w2i·ε_real.
+        negepstandelta_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
+                                           mat_op.GetPermittivityReal(), -w2i);
+      }
       if (mat_op.HasLossTangent())
       {
+        // Im(-ω²·(i·ε_imag)) = -w2r·ε_imag.
         negepstandelta_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
-                                           mat_op.GetPermittivityImag(), -omega * omega);
+                                           mat_op.GetPermittivityImag(), -w2r);
       }
       if (mat_op.HasConductivity())
       {
+        // Im(+iω·σ) = +wr·σ.
         fi_domain.AddCoefficient(mat_op.GetAttributeToMaterial(), mat_op.GetConductivity(),
-                                 omega);
+                                 wr);
       }
       BilinearForm atti(nd_fespace);
       if (!negepstandelta_func.empty())
@@ -145,13 +186,22 @@ AssembleAtt(const FiniteElementSpace &nd_fespace, const MaterialOperator &mat_op
   return {std::move(Attr_assembled), std::move(Atti_assembled)};
 }
 
-ComplexHypreParMatrix AssembleAnn(const FiniteElementSpace &h1_fespace,
-                                  const MaterialOperator &mat_op,
-                                  const mfem::Vector *normal,
-                                  SurfaceImpedanceOperator &surf_z_op,
-                                  FarfieldBoundaryOperator &farfield_op,
-                                  SurfaceConductivityOperator &surf_sigma_op, double omega)
+ComplexHypreParMatrix
+AssembleAnn(const FiniteElementSpace &h1_fespace, const MaterialOperator &mat_op,
+            const mfem::Vector *normal, SurfaceImpedanceOperator &surf_z_op,
+            FarfieldBoundaryOperator &farfield_op,
+            SurfaceConductivityOperator &surf_sigma_op,
+            SurfaceRationalImpedanceOperator &surf_rz_op, std::complex<double> omega)
 {
+  // Complex-ω decomposition for the normal (H1) block. Sign convention is OPPOSITE the
+  // transverse block: the ε mass term enters as +ω²·ε (vs -ω²·ε in Att), surf-Z damping
+  // as -iω, surf-Z mass as +ω², farfield as -iω. For real ω the imaginary parts are
+  // zero and this reduces bit-for-bit to the original assembly.
+  const double wr = omega.real(), wi = omega.imag();
+  const std::complex<double> w2 = omega * omega;
+  const double w2r = w2.real(), w2i = w2.imag();
+  const bool complex_omega = (wi != 0.0);
+
   MaterialPropertyCoefficient neg_muinv_func(mat_op.GetAttributeToMaterial(),
                                              mat_op.GetInvPermeability(), -1.0);
   if (normal)
@@ -159,10 +209,27 @@ ComplexHypreParMatrix AssembleAnn(const FiniteElementSpace &h1_fespace,
     neg_muinv_func.NormalProjectedCoefficient(*normal);
   }
 
-  MaterialPropertyCoefficient poseps_h1_func(mat_op.GetAttributeToMaterial(),
-                                             normal ? mat_op.GetPermittivityReal()
-                                                    : mat_op.GetPermittivityScalar(),
-                                             omega * omega);
+  MaterialPropertyCoefficient poseps_h1_func(
+      mat_op.GetAttributeToMaterial(),
+      normal ? mat_op.GetPermittivityReal() : mat_op.GetPermittivityScalar(), w2r);
+  if (complex_omega && mat_op.HasLossTangent())
+  {
+    // Cross term: Re(+ω²·(i·ε_imag)) = -w2i·ε_imag — mirror of the +w2i·ε_imag term in
+    // AssembleAtt. Accumulate before the (destructive) normal projection below;
+    // projection is linear so this equals projecting the sum.
+    poseps_h1_func.AddCoefficient(
+        mat_op.GetAttributeToMaterial(),
+        normal ? mat_op.GetPermittivityImag() : mat_op.GetPermittivityImagScalar(), -w2i);
+  }
+  if (complex_omega && mat_op.HasConductivity())
+  {
+    // Cross term: Re(-iω·σ) = +wi·σ — mirror of the -wi·σ term in AssembleAtt (the
+    // conduction current enters the normal block with the opposite sign, -iωσ vs +iωσ,
+    // following the +ω²ε_c vs -ω²ε_c convention).
+    poseps_h1_func.AddCoefficient(
+        mat_op.GetAttributeToMaterial(),
+        normal ? mat_op.GetConductivity() : mat_op.GetConductivityScalar(), wi);
+  }
   if (normal)
   {
     poseps_h1_func.NormalProjectedCoefficient(*normal);
@@ -190,11 +257,17 @@ ComplexHypreParMatrix AssembleAnn(const FiniteElementSpace &h1_fespace,
   const int max_bdr_attr = mat_op.MaxCeedBdrAttribute();
   MaterialPropertyCoefficient nn_fbr(max_bdr_attr), nn_fbi(max_bdr_attr);
   surf_z_op.AddStiffnessBdrCoefficients(-1.0, nn_fbr);
-  surf_z_op.AddDampingBdrCoefficients(-omega, nn_fbi);
-  surf_z_op.AddMassBdrCoefficients(omega * omega, nn_fbr);
+  surf_z_op.AddDampingBdrCoefficients(-wr, nn_fbi);  // Im(-iω)/Rs = -wr
+  surf_z_op.AddMassBdrCoefficients(w2r, nn_fbr);
+  if (complex_omega)
+  {
+    surf_z_op.AddDampingBdrCoefficients(wi, nn_fbr);  // Re(-iω)/Rs = wi
+    surf_z_op.AddMassBdrCoefficients(w2i, nn_fbi);
+  }
   if (farfield_op.GetAttrList().Size() > 0)
   {
-    // Farfield boundary: scalar inverse impedance for the H1 mass integrator.
+    // Farfield boundary: scalar inverse impedance for the H1 mass integrator. The
+    // multiplier is -iω·(1/Z0): Im → nn_fbi (·-wr), Re → nn_fbr (·wi).
     const auto &farfield_attrs = farfield_op.GetAttrList();
     const auto &inv_z = mat_op.GetInvImpedance();
     const auto &bdr_attr_to_mat = mat_op.GetBdrAttributeToMaterial();
@@ -206,13 +279,18 @@ ComplexHypreParMatrix AssembleAnn(const FiniteElementSpace &h1_fespace,
       auto ceed_attrs = mat_op.GetCeedBdrAttributes(attr);
       if (ceed_attrs.Size() > 0)
       {
-        nn_fbi.AddMaterialProperty(ceed_attrs, inv_z0_scalar, -omega);
+        nn_fbi.AddMaterialProperty(ceed_attrs, inv_z0_scalar, -wr);
+        if (complex_omega)
+        {
+          nn_fbr.AddMaterialProperty(ceed_attrs, inv_z0_scalar, wi);
+        }
       }
     }
   }
   {
     MaterialPropertyCoefficient cond_r(max_bdr_attr), cond_i(max_bdr_attr);
     surf_sigma_op.AddExtraSystemBdrCoefficients(omega, cond_r, cond_i);
+    surf_rz_op.AddExtraSystemBdrCoefficients(omega, cond_r, cond_i);
     if (!cond_r.empty())
     {
       cond_r *= -1.0;
@@ -238,24 +316,43 @@ ComplexHypreParMatrix AssembleAnn(const FiniteElementSpace &h1_fespace,
 
   std::unique_ptr<mfem::HypreParMatrix> Anni_assembled;
   {
-    const bool has_imag = mat_op.HasLossTangent() || !nn_fbi.empty();
+    const bool has_imag = mat_op.HasLossTangent() || mat_op.HasConductivity() ||
+                          !nn_fbi.empty() || complex_omega;
     if (has_imag)
     {
       const int n_attr = mat_op.GetAttributeToMaterial().Size();
       MaterialPropertyCoefficient posepsi_h1_func(n_attr);
+      // Accumulate both contributions into the (possibly tensor) coefficient first, then
+      // normal-project ONCE at the end: NormalProjectedCoefficient is destructive (it
+      // collapses the tensor to a scalar), and projection is linear so the sum of
+      // projections equals the projection of the sum.
+      if (complex_omega)
+      {
+        // New term: Im(+ω²·ε_real) = +w2i·ε_real.
+        posepsi_h1_func.AddCoefficient(
+            mat_op.GetAttributeToMaterial(),
+            normal ? mat_op.GetPermittivityReal() : mat_op.GetPermittivityScalar(), w2i);
+      }
       if (mat_op.HasLossTangent())
       {
-        if (normal)
-        {
-          posepsi_h1_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
-                                         mat_op.GetPermittivityImag(), omega * omega);
-          posepsi_h1_func.NormalProjectedCoefficient(*normal);
-        }
-        else
-        {
-          posepsi_h1_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
-                                         mat_op.GetPermittivityImagScalar(), omega * omega);
-        }
+        // Im(+ω²·(i·ε_imag)) = +w2r·ε_imag.
+        posepsi_h1_func.AddCoefficient(mat_op.GetAttributeToMaterial(),
+                                       normal ? mat_op.GetPermittivityImag()
+                                              : mat_op.GetPermittivityImagScalar(),
+                                       w2r);
+      }
+      if (mat_op.HasConductivity())
+      {
+        // Im(-iω·σ) = -wr·σ: the conduction-current part of the complex permittivity
+        // ε_c = ε - iσ/ω in the normal block's +ω²·ε_c term (mirror of the +wr·σ term in
+        // AssembleAtt, opposite sign convention).
+        posepsi_h1_func.AddCoefficient(
+            mat_op.GetAttributeToMaterial(),
+            normal ? mat_op.GetConductivity() : mat_op.GetConductivityScalar(), -wr);
+      }
+      if (normal && !posepsi_h1_func.empty())
+      {
+        posepsi_h1_func.NormalProjectedCoefficient(*normal);
       }
       BilinearForm anni(h1_fespace);
       if (!posepsi_h1_func.empty())
@@ -298,7 +395,8 @@ constexpr bool skip_zeros = false;
 ModeEigenSolver::ModeEigenSolver(
     const MaterialOperator &mat_op, const mfem::Vector *normal,
     SurfaceImpedanceOperator &surf_z_op, FarfieldBoundaryOperator &farfield_op,
-    SurfaceConductivityOperator &surf_sigma_op, const FiniteElementSpace &nd_fespace,
+    SurfaceConductivityOperator &surf_sigma_op,
+    SurfaceRationalImpedanceOperator &surf_rz_op, const FiniteElementSpace &nd_fespace,
     const FiniteElementSpace &h1_fespace, const mfem::Array<int> &dbc_tdof_list,
     int num_modes, int num_vec, double eig_tol, EigenvalueSolver::WhichType which_eig,
     const config::LinearSolverData &linear, EigenSolverBackend eigen_backend, int verbose,
@@ -306,8 +404,8 @@ ModeEigenSolver::ModeEigenSolver(
   : num_modes(num_modes), num_vec(num_vec), eig_tol(eig_tol), which_eig(which_eig),
     linear(linear), eigen_backend(eigen_backend), verbose(verbose), mat_op(mat_op),
     normal(normal), surf_z_op(surf_z_op), farfield_op(farfield_op),
-    surf_sigma_op(surf_sigma_op), nd_fespace(nd_fespace), h1_fespace(h1_fespace),
-    dbc_tdof_list(dbc_tdof_list)
+    surf_sigma_op(surf_sigma_op), surf_rz_op(surf_rz_op), nd_fespace(nd_fespace),
+    h1_fespace(h1_fespace), dbc_tdof_list(dbc_tdof_list)
 {
   // Assemble Atn, Btn = -Atn^T, Btt locally (no BMO available on this path).
   std::tie(owned_Atnr, owned_Atni) =
@@ -341,8 +439,8 @@ ModeEigenSolver::ModeEigenSolver(BoundaryModeOperator &bmo,
     linear(linear), eigen_backend(eigen_backend), verbose(verbose),
     mat_op(bmo.GetMaterialOp()), normal(nullptr), surf_z_op(bmo.GetSurfZOp()),
     farfield_op(bmo.GetFarfieldOp()), surf_sigma_op(bmo.GetSurfSigmaOp()),
-    nd_fespace(bmo.GetNDSpace()), h1_fespace(bmo.GetH1Space()), bmo(&bmo),
-    dbc_tdof_list(dbc_tdof_list)
+    surf_rz_op(bmo.GetSurfRZOp()), nd_fespace(bmo.GetNDSpace()),
+    h1_fespace(bmo.GetH1Space()), bmo(&bmo), dbc_tdof_list(dbc_tdof_list)
 {
   // Alias BMO-owned frequency-independent matrices; no local assembly.
   Atnr = bmo.GetAtnr();
@@ -392,7 +490,7 @@ void ModeEigenSolver::Init(MPI_Comm solver_comm)
   }
 }
 
-void ModeEigenSolver::AssembleFrequencyDependent(double omega, double sigma)
+void ModeEigenSolver::AssembleFrequencyDependent(std::complex<double> omega, double sigma)
 {
   // Frequency-dependent Att/Ann: delegate to BMO on the 2D domain path; otherwise
   // assemble locally via the shared free functions.
@@ -404,10 +502,12 @@ void ModeEigenSolver::AssembleFrequencyDependent(double omega, double sigma)
   }
   else
   {
-    std::tie(Attr, Atti) = mode_assembly::AssembleAtt(
-        nd_fespace, mat_op, normal, surf_z_op, farfield_op, surf_sigma_op, omega, sigma);
-    std::tie(Annr_local, Anni_local) = mode_assembly::AssembleAnn(
-        h1_fespace, mat_op, normal, surf_z_op, farfield_op, surf_sigma_op, omega);
+    std::tie(Attr, Atti) =
+        mode_assembly::AssembleAtt(nd_fespace, mat_op, normal, surf_z_op, farfield_op,
+                                   surf_sigma_op, surf_rz_op, omega, sigma);
+    std::tie(Annr_local, Anni_local) =
+        mode_assembly::AssembleAnn(h1_fespace, mat_op, normal, surf_z_op, farfield_op,
+                                   surf_sigma_op, surf_rz_op, omega);
   }
 
   // Shifted (1,0) block: -sigma * Btn_r (real-only).
@@ -423,7 +523,8 @@ void ModeEigenSolver::AssembleFrequencyDependent(double omega, double sigma)
   opA = std::make_unique<ComplexWrapperOperator>(std::move(Ar), std::move(Ai));
 }
 
-ModeEigenSolver::SolveResult ModeEigenSolver::Solve(double omega, double sigma,
+ModeEigenSolver::SolveResult ModeEigenSolver::Solve(std::complex<double> omega,
+                                                    double sigma,
                                                     const ComplexVector *initial_space)
 {
   sigma_cached = sigma;
@@ -441,8 +542,11 @@ ModeEigenSolver::SolveResult ModeEigenSolver::Solve(double omega, double sigma,
   {
     // Multigrid path: assemble preconditioner operators at all levels and set on the
     // block-diagonal preconditioner. The outer Krylov solver gets the monolithic opA.
-    att_mg_op = AssembleAttPreconditioner(omega, sigma);
-    ann_mg_op = AssembleAnnPreconditioner(omega);
+    // The preconditioner is a real approximation built at Re(omega); the imaginary parts
+    // of the complex-ω operator are carried only by the monolithic opA above, so the
+    // matching system matrix still sees the full complex frequency.
+    att_mg_op = AssembleAttPreconditioner(omega.real(), sigma);
+    ann_mg_op = AssembleAnnPreconditioner(omega.real());
     block_pc_ptr->SetBlockOperators(*att_mg_op, *ann_mg_op);
 
     // Set the off-diagonal operator -sigma*Btn for block lower-triangular preconditioning.
@@ -539,26 +643,36 @@ ModeEigenSolver::ComplexHypreParMatrix ModeEigenSolver::BuildSystemMatrixA(
     // HypreParMatrixFromBlocks requires at least one non-null block per row and column
     // to determine sizes. Since (1,0) is always null (shifted Btn is real-only), add
     // zero diagonal placeholders when an entire block row or column would be null.
+    //
+    // The 4-arg HypreParMatrix(comm, glob, row_starts, &diag) constructor does NOT
+    // deep-copy `diag`: it aliases the SparseMatrix's CSR arrays (CopyCSR with
+    // mem_owner=false). The backing Vector + SparseMatrix must therefore outlive both
+    // the placeholder HypreParMatrix AND the HypreParMatrixFromBlocks call below (which
+    // reads each block's diag via hypre_MergeDiagAndOffd). Keep them in this outer scope
+    // — declaring them inside the `if` blocks would free them before FromBlocks runs,
+    // leaving the placeholder pointing at freed memory (use-after-free → segfault).
     std::unique_ptr<mfem::HypreParMatrix> Dtt_zero, Dnn_zero;
+    Vector dtt, dnn;
+    std::unique_ptr<mfem::SparseMatrix> diag_tt, diag_nn;
     if (!Atti && !Atni)
     {
-      Vector d(nd_size);
-      d.UseDevice(false);
-      d = 0.0;
-      mfem::SparseMatrix diag(d);
+      dtt.SetSize(nd_size);
+      dtt.UseDevice(false);
+      dtt = 0.0;
+      diag_tt = std::make_unique<mfem::SparseMatrix>(dtt);
       Dtt_zero = std::make_unique<mfem::HypreParMatrix>(
           nd_fespace.Get().GetComm(), nd_fespace.Get().GlobalTrueVSize(),
-          nd_fespace.Get().GetTrueDofOffsets(), &diag);
+          nd_fespace.Get().GetTrueDofOffsets(), diag_tt.get());
     }
     if (!Anni)
     {
-      Vector d(h1_size);
-      d.UseDevice(false);
-      d = 0.0;
-      mfem::SparseMatrix diag(d);
+      dnn.SetSize(h1_size);
+      dnn.UseDevice(false);
+      dnn = 0.0;
+      diag_nn = std::make_unique<mfem::SparseMatrix>(dnn);
       Dnn_zero = std::make_unique<mfem::HypreParMatrix>(
           h1_fespace.Get().GetComm(), h1_fespace.Get().GlobalTrueVSize(),
-          h1_fespace.Get().GetTrueDofOffsets(), &diag);
+          h1_fespace.Get().GetTrueDofOffsets(), diag_nn.get());
     }
     blocks(0, 0) = Atti ? Atti : Dtt_zero.get();
     blocks(0, 1) = Atni;
@@ -636,9 +750,11 @@ void ModeEigenSolver::SetUpLinearSolver(MPI_Comm comm)
     pc_type = LinearSolver::STRUMPACK;
 #elif defined(MFEM_USE_MUMPS)
     pc_type = LinearSolver::MUMPS;
+#elif defined(MFEM_USE_CUDSS)
+    pc_type = LinearSolver::CUDSS;
 #else
     MFEM_ABORT("ModeEigenSolver requires building with SuperLU_DIST, STRUMPACK, "
-               "or MUMPS!");
+               "MUMPS, or cuDSS!");
 #endif
   }
   else if (pc_type == LinearSolver::SUPERLU)
@@ -660,6 +776,13 @@ void ModeEigenSolver::SetUpLinearSolver(MPI_Comm comm)
 #if !defined(MFEM_USE_MUMPS)
     MFEM_ABORT("Solver was not built with MUMPS support, please choose a "
                "different solver!");
+#endif
+  }
+  else if (pc_type == LinearSolver::CUDSS)
+  {
+#if !defined(MFEM_USE_CUDSS)
+    MFEM_ABORT("Solver was not built with cuDSS support, please choose a "
+               "different solver");
 #endif
   }
 
@@ -689,6 +812,13 @@ void ModeEigenSolver::SetUpLinearSolver(MPI_Comm comm)
           return std::make_unique<MumpsSolver>(comm, MatrixSymmetry::UNSYMMETRIC,
                                                linear.sym_factorization,
                                                linear.strumpack_lr_tol, true, verbose - 1);
+#endif
+        }
+        else if (pc_type == LinearSolver::CUDSS)
+        {
+#if defined(MFEM_USE_CUDSS)
+          return std::make_unique<CuDSSSolver>(comm, MatrixSymmetry::UNSYMMETRIC,
+                                               linear.sym_factorization, true, verbose - 1);
 #endif
         }
         MFEM_ABORT("Unsupported linear solver type for boundary mode solver!");
@@ -779,6 +909,17 @@ void ModeEigenSolver::SetUpMultigridLinearSolver(MPI_Comm comm)
             linear.reorder_reuse);
 #else
         MFEM_ABORT("Solver was not built with MUMPS support!");
+        return {};
+#endif
+      case LinearSolver::CUDSS:
+#if defined(MFEM_USE_CUDSS)
+        return std::make_unique<MfemWrapperSolver<ComplexOperator>>(
+            std::make_unique<CuDSSSolver>(comm, MatrixSymmetry::UNSYMMETRIC,
+                                          linear.sym_factorization, true, print),
+            false, linear.complex_coarse_solve, linear.drop_small_entries,
+            linear.reorder_reuse);
+#else
+        MFEM_ABORT("Solver was not built with cuDSS support!");
         return {};
 #endif
       default:
@@ -882,10 +1023,10 @@ ModeEigenSolver::AssembleAttPreconditioner(double omega, double sigma) const
                                    fbr);
   farfield_op.AddDampingBdrCoefficients(omega, fbr);
   surf_sigma_op.AddExtraSystemBdrCoefficients(omega, fbr, fbr);
+  surf_rz_op.AddExtraSystemBdrCoefficients(omega, fbr, fbr);
 
-  // Assemble ND operators at all levels using the hierarchy-aware assembly pattern
-  // (matching SpaceOperator::AssembleOperators). Creates a BilinearForm on the finest
-  // space and uses Assemble(fespaces) to produce operators at all levels.
+  // Assemble ND operators at all levels from one BilinearForm. Unlike SpaceOperator's
+  // configured-coarse/active-fine split, these domain coefficients are always nonzero.
   constexpr bool assemble_q_data = false;
   {
     BilinearForm att(bmo->GetNDSpaceHierarchy().GetFinestFESpace());
@@ -896,8 +1037,8 @@ ModeEigenSolver::AssembleAttPreconditioner(double omega, double sigma) const
     }
     auto att_ops = att.Assemble(bmo->GetNDSpaceHierarchy(), skip_zeros);
 
-    // Auxiliary H1 operators for Hiptmair smoothing (matching SpaceOperator::
-    // AssembleAuxOperators — uses DiffusionIntegrator with the mass coefficient).
+    // Assemble the auxiliary H1 operators for Hiptmair smoothing from the same always-
+    // nonzero mass coefficient.
     BilinearForm att_aux(bmo->GetH1AuxSpaceHierarchy().GetFinestFESpace());
     att_aux.AddDomainIntegrator<DiffusionIntegrator>(eps_shifted_pc);
     if (!fbr.empty())
@@ -962,6 +1103,7 @@ ModeEigenSolver::AssembleAnnPreconditioner(double omega) const
   {
     MaterialPropertyCoefficient cond_r(max_bdr_attr);
     surf_sigma_op.AddExtraSystemBdrCoefficients(omega, cond_r, cond_r);
+    surf_rz_op.AddExtraSystemBdrCoefficients(omega, cond_r, cond_r);
     if (!cond_r.empty())
     {
       cond_r *= -1.0;

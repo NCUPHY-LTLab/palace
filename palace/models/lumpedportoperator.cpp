@@ -3,6 +3,7 @@
 
 #include "lumpedportoperator.hpp"
 
+#include <set>
 #include <fmt/ranges.h>
 #include "fem/coefficient.hpp"
 #include "fem/gridfunction.hpp"
@@ -19,7 +20,8 @@ using namespace std::complex_literals;
 
 LumpedPortData::LumpedPortData(const config::LumpedPortData &data,
                                const MaterialOperator &mat_op, const mfem::ParMesh &mesh)
-  : mat_op(mat_op), excitation(data.excitation), active(data.active)
+  : mat_op(mat_op), excitation(data.excitation), active(data.active),
+    include_in_synthesis(data.include_in_synthesis)
 {
   // Check inputs. Only one of the circuit or per square properties should be specified
   // for the port boundary.
@@ -36,15 +38,15 @@ LumpedPortData::LumpedPortData(const config::LumpedPortData &data,
   {
     if (has_circ)
     {
-      MFEM_VERIFY(data.R > 0.0, "Excited lumped port must have nonzero resistance!");
-      MFEM_VERIFY(data.C == 0.0 && data.L == 0.0,
-                  "Lumped port excitations do not support nonzero reactance!");
+      MFEM_VERIFY(data.R >= 0.0, "Excited lumped port must have non-negative resistance!");
+      MFEM_VERIFY(data.L >= 0.0 && data.C >= 0.0,
+                  "Excited lumped port must have non-negative inductance and capacitance!");
     }
     else
     {
-      MFEM_VERIFY(data.Rs > 0.0, "Excited lumped port must have nonzero resistance!");
-      MFEM_VERIFY(data.Cs == 0.0 && data.Ls == 0.0,
-                  "Lumped port excitations do not support nonzero reactance!");
+      MFEM_VERIFY(data.Rs >= 0.0, "Excited lumped port must have non-negative resistance!");
+      MFEM_VERIFY(data.Ls >= 0.0 && data.Cs >= 0.0,
+                  "Excited lumped port must have non-negative inductance and capacitance!");
     }
   }
 
@@ -141,12 +143,16 @@ double LumpedPortData::GetExcitationPower() const
 double LumpedPortData::GetExcitationVoltage() const
 {
   // Incident voltage should be the same across all elements of an excited lumped port.
+  // Reference the same real resistance used to normalize the incident drive
+  // (GetExcitationRefResistance: R for a resistive port, the unit reference for a purely
+  // reactive R == 0 port), so the reported V_inc is consistent with the assembled drive
+  // and nonzero for a reactive excitation.
   if (HasExcitation())
   {
     double V_inc = 0.0;
     for (const auto &elem : elems)
     {
-      const double Rs = R * GetToSquare(*elem);
+      const double Rs = GetExcitationRefResistance() * GetToSquare(*elem);
       const double E_inc = std::sqrt(
           Rs / (elem->GetGeometryWidth() * elem->GetGeometryLength() * elems.size()));
       V_inc += E_inc * elem->GetGeometryLength() / elems.size();
@@ -157,6 +163,38 @@ double LumpedPortData::GetExcitationVoltage() const
   {
     return 0.0;
   }
+}
+
+SurfaceModeCoefficient LumpedPortData::GetModeCoefficient(const LumpedElementData &elem,
+                                                          double coeff) const
+{
+  SurfaceModeCoefficient mode;
+  mode.attr_list = elem.GetAttrList();
+  mode.scale = coeff;
+  if (const auto *uniform = dynamic_cast<const UniformElementData *>(&elem))
+  {
+    mode.type = SurfaceModeCoefficient::Type::UNIFORM;
+    const auto &dir = uniform->GetDirection();
+    for (int d = 0; d < 3; d++)
+    {
+      mode.direction[d] = (d < dir.Size()) ? dir(d) : 0.0;
+    }
+  }
+  else if (const auto *coax = dynamic_cast<const CoaxialElementData *>(&elem))
+  {
+    mode.type = SurfaceModeCoefficient::Type::COAXIAL;
+    mode.scale *= coax->GetDirection();
+    const auto &origin = coax->GetOrigin();
+    for (int d = 0; d < 3; d++)
+    {
+      mode.origin[d] = (d < origin.Size()) ? origin(d) : 0.0;
+    }
+  }
+  else
+  {
+    MFEM_ABORT("Unknown lumped element type for mode-overlap coefficient!");
+  }
+  return mode;
 }
 
 void LumpedPortData::InitializeLinearForms(mfem::ParFiniteElementSpace &nd_fespace) const
@@ -181,7 +219,13 @@ void LumpedPortData::InitializeLinearForms(mfem::ParFiniteElementSpace &nd_fespa
     SumVectorCoefficient fb(mesh.SpaceDimension());
     for (const auto &elem : elems)
     {
-      const double Rs = R * GetToSquare(*elem);
+      // Reference the S-parameter projection to the same real resistance used to normalize
+      // the incident drive (R for a resistive port; the unit reference for a purely
+      // reactive R == 0 port, so this does not divide by zero). The reactance is already
+      // present in the system matrix, so the projected field is the physical response; a
+      // purely reactive port's own S is not a meaningful traveling-wave quantity
+      // regardless.
+      const double Rs = GetExcitationRefResistance() * GetToSquare(*elem);
       const double Hinc = (std::abs(Rs) > 0.0)
                               ? 1.0 / std::sqrt(Rs * elem->GetGeometryWidth() *
                                                 elem->GetGeometryLength() * elems.size())
@@ -225,14 +269,54 @@ std::complex<double> LumpedPortData::GetPower(GridFunction &E, GridFunction &B) 
   // Compute port power, (E x H) ⋅ n = E ⋅ (-n x H), integrated over the port surface using
   // the computed E and H = μ⁻¹ B fields, where +n is the direction of propagation (into the
   // domain). The BdrSurfaceCurrentVectorCoefficient computes -n x H for an outward normal,
-  // so we multiply by -1. The linear form is reconstructed from scratch each time due to
-  // changing H.
+  // so we multiply by -1.
+  MFEM_VERIFY((E.HasImag() && B.HasImag()) || (!E.HasImag() && !B.HasImag()),
+              "Mismatch between real- and complex-valued E and B fields in port power "
+              "calculation!");
+  auto &nd_fespace = *E.ParFESpace();
+  const auto &mesh = *nd_fespace.GetParMesh();
+
+  // Use the libCEED surface functional path when supported, avoiding per-call
+  // boundary LinearForm assembly in the legacy coefficient path.
+  if (!power_func)
+  {
+    mfem::Array<int> attr_list;
+    for (const auto &elem : elems)
+    {
+      attr_list.Append(elem->GetAttrList());
+    }
+    int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
+    mfem::Array<int> attr_marker = mesh::AttrToMarker(bdr_attr_max, attr_list);
+    mfem::Vector x0(mesh.SpaceDimension());
+    x0 = 0.0;
+    power_func = std::make_unique<SurfaceFunctional>(
+        mat_op.GetMesh(), attr_marker, &nd_fespace, B.ParFESpace(), mat_op,
+        SurfaceFlux::POWER, /*two_sided*/ true, x0);
+  }
+  if (power_func && power_func->IsValid())
+  {
+    return power_func->EvalComplexPower(E, B);
+  }
+  if (mesh.Dimension() == 3 && mesh.SpaceDimension() == 3)
+  {
+    MFEM_VERIFY(power_func && power_func->IsValid(),
+                "libCEED lumped-port power postprocessing could not assemble for a "
+                "supported 3D port surface!");
+  }
+  return GetPowerLegacy(E, B);
+}
+
+std::complex<double> LumpedPortData::GetPowerLegacy(GridFunction &E, GridFunction &B) const
+{
+  // MFEM coefficient/linear-form implementation used for unsupported dimensions and as
+  // an independent numerical reference in tests.
   MFEM_VERIFY((E.HasImag() && B.HasImag()) || (!E.HasImag() && !B.HasImag()),
               "Mismatch between real- and complex-valued E and B fields in port power "
               "calculation!");
   const bool has_imag = E.HasImag();
   auto &nd_fespace = *E.ParFESpace();
   const auto &mesh = *nd_fespace.GetParMesh();
+
   SumVectorCoefficient fbr(mesh.SpaceDimension()), fbi(mesh.SpaceDimension());
   mfem::Array<int> attr_list;
   for (const auto &elem : elems)
@@ -282,20 +366,40 @@ std::complex<double> LumpedPortData::GetPower(GridFunction &E, GridFunction &B) 
 
 std::complex<double> LumpedPortData::GetSParameter(GridFunction &E) const
 {
-  // Compute port S-parameter, or the projection of the field onto the port mode.
-  InitializeLinearForms(*E.ParFESpace());
-  std::complex<double> dot((*s) * E.Real(), 0.0);
-  if (E.HasImag())
-  {
-    dot.imag((*s) * E.Imag());
-  }
-  Mpi::GlobalSum(1, &dot, E.GetComm());
-  return dot;
+  // The S-parameter mode coefficient is the voltage coefficient scaled by
+  // 1/sqrt(R_ref): H_inc = 1 / sqrt((R_ref W/L n) W L n) =
+  // 1 / (W n sqrt(R_ref)). For purely reactive ports, use the same unit reference
+  // resistance as the excitation source.
+  return GetVoltage(E) / std::sqrt(GetExcitationRefResistance());
 }
 
 std::complex<double> LumpedPortData::GetVoltage(GridFunction &E) const
 {
-  // Compute the average voltage across the port.
+  // Compute the average voltage across the port using the same mode-overlap machinery as
+  // S-parameters, with the voltage normalization coefficient.
+  if (!v_func)
+  {
+    std::vector<SurfaceModeCoefficient> modes;
+    modes.reserve(elems.size());
+    for (const auto &elem : elems)
+    {
+      modes.push_back(
+          GetModeCoefficient(*elem, 1.0 / (elem->GetGeometryWidth() * elems.size())));
+    }
+    v_func = std::make_unique<SurfaceFunctional>(mat_op.GetMesh(), *E.ParFESpace(), modes);
+  }
+  if (v_func && v_func->IsValid())
+  {
+    return v_func->EvalModeOverlap(E);
+  }
+  const auto &mesh = *E.ParFESpace()->GetParMesh();
+  if (mesh.Dimension() == 3 && mesh.SpaceDimension() == 3)
+  {
+    MFEM_VERIFY(v_func && v_func->IsValid(),
+                "libCEED lumped-port voltage postprocessing could not assemble for a "
+                "supported 3D port surface!");
+  }
+
   InitializeLinearForms(*E.ParFESpace());
   std::complex<double> dot((*v) * E.Real(), 0.0);
   if (E.HasImag())
@@ -471,6 +575,215 @@ const LumpedPortData &LumpedPortOperator::GetPort(int idx) const
   return it->second;
 }
 
+std::map<int, std::complex<double>> LumpedPortOperator::GetPowers(GridFunction &E,
+                                                                  GridFunction &B) const
+{
+  std::map<int, std::complex<double>> powers;
+  if (ports.empty())
+  {
+    return powers;
+  }
+  // Assemble one union-surface POWER functional for all disjoint lumped ports. The
+  // SurfaceFunctional still accumulates per-boundary-element slots;
+  // EvalComplexPowerByAttribute bins those slots back to the port indices, so no
+  // processor-boundary or ghost-side behavior is weakened relative to the per-port path.
+  if (!batched_power_bins.unavailable)
+  {
+    if (!batched_power_func)
+    {
+      auto &nd_fespace = *E.ParFESpace();
+      const auto &mesh = *nd_fespace.GetParMesh();
+      const int bdr_attr_max = mesh::GetMaxBdrAttribute(mesh);
+      batched_power_bins.attr_to_port.SetSize(bdr_attr_max);
+      for (int i = 0; i < batched_power_bins.attr_to_port.Size(); i++)
+      {
+        batched_power_bins.attr_to_port[i] = -1;
+      }
+      batched_power_bins.port_indices.clear();
+
+      mfem::Array<int> attr_list;
+      std::set<int> seen_attrs;
+      bool can_batch = true;
+      int bin = 0;
+      for (const auto &[idx, data] : ports)
+      {
+        batched_power_bins.port_indices.push_back(idx);
+        for (const auto &elem : data.elems)
+        {
+          for (int attr : elem->GetAttrList())
+          {
+            if (attr <= 0 || attr > bdr_attr_max || !seen_attrs.insert(attr).second)
+            {
+              can_batch = false;
+              break;
+            }
+            attr_list.Append(attr);
+            batched_power_bins.attr_to_port[attr - 1] = bin;
+          }
+          if (!can_batch)
+          {
+            break;
+          }
+        }
+        if (!can_batch)
+        {
+          break;
+        }
+        bin++;
+      }
+
+      Mpi::GlobalAnd(1, &can_batch, nd_fespace.GetComm());
+
+      if (can_batch && attr_list.Size() > 0)
+      {
+        const auto &data0 = ports.begin()->second;
+        mfem::Array<int> attr_marker = mesh::AttrToMarker(bdr_attr_max, attr_list);
+
+        mfem::Vector x0(mesh.SpaceDimension());
+        x0 = 0.0;
+        batched_power_func = std::make_unique<SurfaceFunctional>(
+            data0.mat_op.GetMesh(), attr_marker, &nd_fespace, B.ParFESpace(), data0.mat_op,
+            SurfaceFlux::POWER, /*two_sided*/ true, x0);
+      }
+      else
+      {
+        batched_power_bins.unavailable = true;
+      }
+    }
+
+    if (batched_power_func && batched_power_func->IsValid())
+    {
+      auto values = batched_power_func->EvalComplexPowerByAttribute(
+          E, B, batched_power_bins.attr_to_port,
+          static_cast<int>(batched_power_bins.port_indices.size()));
+      for (std::size_t i = 0; i < batched_power_bins.port_indices.size(); i++)
+      {
+        powers.emplace(batched_power_bins.port_indices[i], values[i]);
+      }
+      return powers;
+    }
+    if (batched_power_func)
+    {
+      if (E.ParFESpace()->GetParMesh()->Dimension() == 3 &&
+          E.ParFESpace()->GetParMesh()->SpaceDimension() == 3)
+      {
+        MFEM_VERIFY(batched_power_func->IsValid(),
+                    "libCEED batched lumped-port power postprocessing could not assemble "
+                    "for supported 3D port surfaces!");
+      }
+      batched_power_bins.unavailable = true;
+    }
+  }
+
+  for (const auto &[idx, data] : ports)
+  {
+    powers.emplace(idx, data.GetPower(E, B));
+  }
+  return powers;
+}
+
+std::map<int, std::complex<double>> LumpedPortOperator::GetVoltages(GridFunction &E) const
+{
+  std::map<int, std::complex<double>> voltages;
+  if (ports.empty())
+  {
+    return voltages;
+  }
+  // Assemble one union-surface mode-overlap functional for all disjoint lumped ports.
+  // EvalModeOverlapByAttribute bins per-boundary-element slots back to port indices,
+  // avoiding one separate mode-overlap apply per port while preserving per-port values.
+  if (!batched_voltage_bins.unavailable)
+  {
+    if (!batched_voltage_func)
+    {
+      auto &nd_fespace = *E.ParFESpace();
+      const auto &mesh = *nd_fespace.GetParMesh();
+      const int bdr_attr_max = mesh::GetMaxBdrAttribute(mesh);
+      batched_voltage_bins.attr_to_port.SetSize(bdr_attr_max);
+      for (int i = 0; i < batched_voltage_bins.attr_to_port.Size(); i++)
+      {
+        batched_voltage_bins.attr_to_port[i] = -1;
+      }
+      batched_voltage_bins.port_indices.clear();
+
+      std::vector<SurfaceModeCoefficient> modes;
+      std::set<int> seen_attrs;
+      bool can_batch = true;
+      int bin = 0;
+      for (const auto &[idx, data] : ports)
+      {
+        batched_voltage_bins.port_indices.push_back(idx);
+        for (const auto &elem : data.elems)
+        {
+          SurfaceModeCoefficient mode = data.GetModeCoefficient(
+              *elem, 1.0 / (elem->GetGeometryWidth() * data.elems.size()));
+          for (int attr : mode.attr_list)
+          {
+            if (attr <= 0 || attr > bdr_attr_max || !seen_attrs.insert(attr).second)
+            {
+              can_batch = false;
+              break;
+            }
+            batched_voltage_bins.attr_to_port[attr - 1] = bin;
+          }
+          if (!can_batch)
+          {
+            break;
+          }
+          modes.push_back(std::move(mode));
+        }
+        if (!can_batch)
+        {
+          break;
+        }
+        bin++;
+      }
+
+      Mpi::GlobalAnd(1, &can_batch, nd_fespace.GetComm());
+
+      if (can_batch && !modes.empty())
+      {
+        const auto &data0 = ports.begin()->second;
+        batched_voltage_func =
+            std::make_unique<SurfaceFunctional>(data0.mat_op.GetMesh(), nd_fespace, modes);
+      }
+      else
+      {
+        batched_voltage_bins.unavailable = true;
+      }
+    }
+
+    if (batched_voltage_func && batched_voltage_func->IsValid())
+    {
+      auto values = batched_voltage_func->EvalModeOverlapByAttribute(
+          E, batched_voltage_bins.attr_to_port,
+          static_cast<int>(batched_voltage_bins.port_indices.size()));
+      for (std::size_t i = 0; i < batched_voltage_bins.port_indices.size(); i++)
+      {
+        voltages.emplace(batched_voltage_bins.port_indices[i], values[i]);
+      }
+      return voltages;
+    }
+    if (batched_voltage_func)
+    {
+      if (E.ParFESpace()->GetParMesh()->Dimension() == 3 &&
+          E.ParFESpace()->GetParMesh()->SpaceDimension() == 3)
+      {
+        MFEM_VERIFY(batched_voltage_func->IsValid(),
+                    "libCEED batched lumped-port voltage postprocessing could not "
+                    "assemble for supported 3D port surfaces!");
+      }
+      batched_voltage_bins.unavailable = true;
+    }
+  }
+
+  for (const auto &[idx, data] : ports)
+  {
+    voltages.emplace(idx, data.GetVoltage(E));
+  }
+  return voltages;
+}
+
 mfem::Array<int> LumpedPortOperator::GetAttrList() const
 {
   mfem::Array<int> attr_list;
@@ -618,9 +931,13 @@ void LumpedPortOperator::AddExcitationBdrCoefficients(int excitation_idx,
                                                       SumVectorCoefficient &fb)
 {
   // Construct the RHS source term for lumped port boundaries, which looks like -U_inc =
-  // +2 iω/Z_s E_inc for a port boundary with an incident field E_inc. The chosen incident
-  // field magnitude corresponds to a unit incident power over the full port boundary. See
-  // p. 49 and p. 82 of the COMSOL RF Module manual for more detail.
+  // +2 iω/R_ref E_inc for a port boundary with an incident field E_inc, where R_ref is the
+  // real reference resistance from GetExcitationRefResistance() (the port R, or the unit
+  // internal reference for a purely reactive R == 0 port; any port reactance acts through
+  // the system-matrix termination iω/Z_s, not through this drive coefficient). The chosen
+  // incident field magnitude corresponds to a unit incident power over the full port
+  // boundary, referenced to R_ref. See p. 49 and p. 82 of the COMSOL RF Module manual for
+  // more detail.
   // Note: The real RHS returned here does not yet have the factor of (iω) included, so
   // works for time domain simulations requiring RHS -U_inc(t).
   for (const auto &[idx, data] : ports)
@@ -629,11 +946,16 @@ void LumpedPortOperator::AddExcitationBdrCoefficients(int excitation_idx,
     {
       continue;
     }
-    MFEM_VERIFY(std::abs(data.R) > 0.0,
-                "Unexpected zero resistance in excited lumped port!");
+    // Normalize the incident field to a real reference resistance. For a resistive port
+    // this is the port resistance R (legacy behaviour, unchanged). For a purely reactive
+    // excited port (R == 0) there is no real port resistance to reference the incident
+    // power to, so we use the unit reference |Z_R| = 1 in internal units purely to define a
+    // finite drive amplitude; the reactance itself acts through the system-matrix
+    // termination, not through this normalization.
+    const double R_ref = data.GetExcitationRefResistance();
     for (const auto &elem : data.elems)
     {
-      const double Rs = data.R * data.GetToSquare(*elem);
+      const double Rs = R_ref * data.GetToSquare(*elem);
       const double Hinc = 1.0 / std::sqrt(Rs * elem->GetGeometryWidth() *
                                           elem->GetGeometryLength() * data.elems.size());
       fb.AddCoefficient(elem->GetModeCoefficient(2.0 * Hinc));

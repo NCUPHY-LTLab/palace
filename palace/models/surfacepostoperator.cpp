@@ -9,6 +9,7 @@
 #include <complex>
 #include <map>
 #include <set>
+#include <string>
 #include "fem/gridfunction.hpp"
 #include "fem/integrator.hpp"
 #include "linalg/vector.hpp"
@@ -25,6 +26,26 @@ namespace palace
 
 namespace
 {
+
+bool IsSupportedSurfaceFunctionalDimension(const mfem::ParMesh &mesh)
+{
+  return (mesh.Dimension() == 2 && mesh.SpaceDimension() == 2) ||
+         (mesh.Dimension() == 3 && mesh.SpaceDimension() == 3);
+}
+
+bool IsSupportedSurfaceFluxDimension(const mfem::ParMesh &mesh)
+{
+  // The libCEED surface-flux kernels currently implement 3D surface integrals. 2D line
+  // flux semantics remain on the legacy path explicitly rather than by silent invalid
+  // fallback.
+  return mesh.Dimension() == 3 && mesh.SpaceDimension() == 3;
+}
+
+void RequireCeedSurfaceFunctional(const SurfaceFunctional *func, const std::string &what)
+{
+  MFEM_VERIFY(func && func->IsValid(), "libCEED postprocessing was expected for " + what +
+                                           ", but SurfaceFunctional could not assemble!");
+}
 
 template <typename T>
 mfem::Array<int> SetUpBoundaryProperties(const T &data,
@@ -393,6 +414,26 @@ std::complex<double> SurfacePostOperator::GetSurfaceFlux(int idx, const GridFunc
   const auto &mesh = *h1_fespace.GetParMesh();
   int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
   mfem::Array<int> attr_marker = mesh::AttrToMarker(bdr_attr_max, it->second.attr_list);
+
+  // Use the libCEED surface functional path when supported, avoiding per-call
+  // boundary LinearForm assembly in the legacy coefficient path.
+  auto &func = flux_funcs[idx];
+  if (!func)
+  {
+    func = std::make_unique<SurfaceFunctional>(
+        mat_op.GetMesh(), attr_marker, E ? E->ParFESpace() : nullptr,
+        B ? B->ParFESpace() : nullptr, mat_op, it->second.type, it->second.two_sided,
+        it->second.center);
+  }
+  if (func && func->IsValid())
+  {
+    return func->EvalFlux(E, B);
+  }
+  if (IsSupportedSurfaceFluxDimension(mesh))
+  {
+    RequireCeedSurfaceFunctional(func.get(), "3D surface flux");
+  }
+
   auto f =
       it->second.GetCoefficient(E ? &E->Real() : nullptr, B ? &B->Real() : nullptr, mat_op);
   std::complex<double> dot(GetLocalSurfaceIntegral(*f, attr_marker), 0.0);
@@ -458,6 +499,25 @@ double SurfacePostOperator::GetInterfaceElectricFieldEnergy(int idx,
   const auto &mesh = *h1_fespace.GetParMesh();
   int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
   mfem::Array<int> attr_marker = mesh::AttrToMarker(bdr_attr_max, it->second.attr_list);
+
+  // Use the libCEED surface functional path when supported, avoiding per-call
+  // boundary LinearForm assembly in the legacy coefficient path.
+  auto &func = eps_funcs[idx];
+  if (!func)
+  {
+    func = std::make_unique<SurfaceFunctional>(mat_op.GetMesh(), attr_marker,
+                                               *E.ParFESpace(), mat_op, it->second.type,
+                                               it->second.t, it->second.epsilon);
+  }
+  if (func && func->IsValid())
+  {
+    return func->Eval(E);
+  }
+  if (IsSupportedSurfaceFunctionalDimension(mesh))
+  {
+    RequireCeedSurfaceFunctional(func.get(), "interface dielectric postprocessing");
+  }
+
   auto f = it->second.GetCoefficient(E, mat_op);
   double dot = GetLocalSurfaceIntegral(*f, attr_marker);
   Mpi::GlobalSum(1, &dot, E.GetComm());
@@ -499,7 +559,7 @@ SurfacePostOperator::GetLocalSurfaceIntegral(mfem::Coefficient &f,
 
 std::vector<std::array<std::complex<double>, 3>> SurfacePostOperator::GetFarFieldrE(
     const std::vector<std::pair<double, double>> &theta_phi_pairs, const GridFunction &E,
-    const GridFunction &B, double omega_re, double omega_im) const
+    const GridFunction &B, std::complex<double> omega) const
 {
   if (theta_phi_pairs.empty())
     return {};
@@ -510,8 +570,6 @@ std::vector<std::array<std::complex<double>, 3>> SurfacePostOperator::GetFarFiel
   // Compute target unit vectors from the given theta and phis.
   std::vector<std::array<double, 3>> r_naughts;
   r_naughts.reserve(theta_phi_pairs.size());
-
-  r_naughts.reserve(theta_phi_pairs.size());
   for (const auto &[theta, phi] : theta_phi_pairs)
   {
     r_naughts.emplace_back(std::array<double, 3>{
@@ -521,6 +579,25 @@ std::vector<std::array<std::complex<double>, 3>> SurfacePostOperator::GetFarFiel
   const auto &mesh = *nd_fespace.GetParMesh();
   int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
   mfem::Array<int> attr_marker = mesh::AttrToMarker(bdr_attr_max, farfield.attr_list);
+
+  // Use the libCEED surface functional path when supported, avoiding per-point host
+  // coefficient evaluation in the MFEM path. Observation directions are part of the
+  // assembled operator and must therefore invalidate the cached functional when changed.
+  const bool use_ceed = E.HasImag() && B.HasImag();
+  if (use_ceed && (!farfield_func || farfield_func_dirs != r_naughts))
+  {
+    farfield_func = std::make_unique<SurfaceFunctional>(
+        mat_op.GetMesh(), attr_marker, *E.ParFESpace(), *B.ParFESpace(), mat_op, r_naughts);
+    farfield_func_dirs = r_naughts;
+  }
+  if (use_ceed && farfield_func && farfield_func->IsValid())
+  {
+    return farfield_func->EvalFarField(E, B, omega);
+  }
+  if (use_ceed)
+  {
+    RequireCeedSurfaceFunctional(farfield_func.get(), "3D far-field postprocessing");
+  }
 
   // Integrate. Each MPI process computes its contribution and we will reduce
   // everything at the end. We make them std::vector<std::array<double, 3>>
@@ -539,8 +616,8 @@ std::vector<std::array<std::complex<double>, 3>> SurfacePostOperator::GetFarFiel
     const auto *ir =
         &mfem::IntRules.Get(fe->GetGeomType(), fem::DefaultIntegrationOrder::Get(*T));
 
-    AddStrattonChuIntegrandAtElement(E, B, mat_op, omega_re, omega_im, r_naughts, *T, *ir,
-                                     integrals_r, integrals_i);
+    AddStrattonChuIntegrandAtElement(E, B, mat_op, omega.real(), omega.imag(), r_naughts,
+                                     *T, *ir, integrals_r, integrals_i);
   }
 
   double *data_r_ptr = integrals_r.data()->data();

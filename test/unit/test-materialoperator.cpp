@@ -1,12 +1,16 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <limits>
+#include <vector>
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "models/materialoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/configfile.hpp"
+#include "utils/geodata.hpp"
 
 namespace palace
 {
@@ -81,6 +85,142 @@ TEST_CASE("MaterialOperator IsIsotropic", "[materialoperator][Serial]")
       REQUIRE(mat_op.IsIsotropic(1) == false);
     }
   }
+}
+
+TEST_CASE("MaterialPropertyCoefficient exact-zero predicate", "[materialoperator][Serial]")
+{
+  mfem::Array<int> attr_mat(2);
+  attr_mat = 0;
+
+  SECTION("Empty storage is mathematically zero")
+  {
+    MaterialPropertyCoefficient coeff(2);
+    CHECK(coeff.empty());
+    CHECK(coeff.IsExactlyZero());
+  }
+
+  SECTION("Allocated scalar and tensor zeros are exactly zero")
+  {
+    mfem::DenseTensor scalar(1, 1, 1);
+    scalar = 0.0;
+    MaterialPropertyCoefficient scalar_coeff(attr_mat, scalar);
+    CHECK_FALSE(scalar_coeff.empty());
+    CHECK(scalar_coeff.IsExactlyZero());
+
+    mfem::DenseTensor tensor(2, 2, 1);
+    tensor = 0.0;
+    MaterialPropertyCoefficient tensor_coeff(attr_mat, tensor);
+    CHECK_FALSE(tensor_coeff.empty());
+    CHECK(tensor_coeff.IsExactlyZero());
+  }
+
+  SECTION("Zero-scaled coefficient additions retain exact-zero storage")
+  {
+    mfem::DenseTensor tensor(2, 2, 1);
+    tensor = 0.0;
+    tensor(0, 0, 0) = 3.0;
+    tensor(1, 1, 0) = -2.0;
+
+    MaterialPropertyCoefficient from_coefficient(2);
+    from_coefficient.AddCoefficient(attr_mat, tensor, 0.0);
+    CHECK_FALSE(from_coefficient.empty());
+    CHECK(from_coefficient.IsExactlyZero());
+
+    MaterialPropertyCoefficient from_property(2);
+    from_property.AddMaterialProperty(1, 7.0, 0.0);
+    CHECK_FALSE(from_property.empty());
+    CHECK(from_property.IsExactlyZero());
+  }
+
+  SECTION("Mixed and tiny nonzero values are not exactly zero")
+  {
+    mfem::DenseTensor mixed(2, 2, 1);
+    mixed = 0.0;
+    mixed(0, 1, 0) = -4.0;
+    MaterialPropertyCoefficient mixed_coeff(attr_mat, mixed);
+    CHECK_FALSE(mixed_coeff.IsExactlyZero());
+
+    mfem::DenseTensor tiny(1, 1, 1);
+    tiny = std::numeric_limits<double>::min();
+    MaterialPropertyCoefficient tiny_coeff(attr_mat, tiny);
+    CHECK_FALSE(tiny_coeff.IsExactlyZero());
+  }
+}
+
+TEST_CASE("MaterialOperator requires materials for retained mesh domains",
+          "[materialoperator][Serial][Parallel]")
+{
+  MPI_Comm comm = Mpi::World();
+  const int size = Mpi::Size(comm);
+
+  // Give every rank two contiguous x-directed coarse cells. Attribute 2 is confined to
+  // the first cell on rank 0, with an attribute-1 cell separating it from the partition
+  // interface. Thus no other rank sees attribute 2, even through a shared-face neighbor.
+  auto serial_mesh = std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian3D(
+      2 * size, 1, 1, mfem::Element::TETRAHEDRON, 2.0 * size, 1.0, 1.0));
+  std::vector<int> partitioning(serial_mesh->GetNE());
+  for (int i = 0; i < serial_mesh->GetNE(); i++)
+  {
+    const auto *element = serial_mesh->GetElement(i);
+    const auto *vertices = element->GetVertices();
+    double center_x = 0.0;
+    for (int j = 0; j < element->GetNVertices(); j++)
+    {
+      center_x += serial_mesh->GetVertex(vertices[j])[0];
+    }
+    center_x /= element->GetNVertices();
+    serial_mesh->SetAttribute(i, center_x < 1.0 ? 2 : 1);
+    partitioning[i] = static_cast<int>(center_x / 2.0);
+  }
+  serial_mesh->SetAttributes();
+  auto par_mesh = std::make_unique<mfem::ParMesh>(comm, *serial_mesh, partitioning.data());
+  Mesh palace_mesh(std::move(par_mesh));
+
+  const auto &local_attributes = palace_mesh.GetCeedAttributes();
+  const bool has_attr2 = local_attributes.find(2) != local_attributes.end();
+  CHECK(has_attr2 == (Mpi::Rank(comm) == 0));
+  CHECK(palace_mesh.GetNE() > 0);
+
+  config::MaterialData material1;
+  material1.attributes = {1};
+  config::MaterialData material2;
+  material2.attributes = {2};
+  config::PeriodicBoundaryData periodic;
+
+  SECTION("All retained attributes have materials")
+  {
+    CHECK_NOTHROW(MaterialOperator({material1, material2}, periodic,
+                                   ProblemType::ELECTROSTATIC, palace_mesh));
+  }
+
+  SECTION("Missing material is rejected collectively")
+  {
+    CHECK_THROWS_WITH(
+        MaterialOperator({material1}, periodic, ProblemType::ELECTROSTATIC, palace_mesh),
+        Catch::Matchers::ContainsSubstring(
+            "Mesh domain attribute 2 has no corresponding entry in "
+            "config[\"Domains\"][\"Materials\"]!"));
+  }
+}
+
+TEST_CASE("MaterialOperator anisotropic wave-number bound", "[materialoperator][Serial]")
+{
+  auto serial_mesh = std::make_unique<mfem::Mesh>(
+      mfem::Mesh::MakeCartesian3D(1, 1, 1, mfem::Element::TETRAHEDRON));
+  auto par_mesh = std::make_unique<mfem::ParMesh>(Mpi::World(), *serial_mesh);
+  Mesh palace_mesh(std::move(par_mesh));
+
+  config::MaterialData material;
+  material.attributes = {1};
+  material.mu_r.s = {4.0, 1.0, 1.0};
+  material.epsilon_r.s = {1.0, 4.0, 1.0};
+
+  config::PeriodicBoundaryData periodic;
+  MaterialOperator mat_op({material}, periodic, ProblemType::DRIVEN, palace_mesh);
+
+  // Same-axis products max(mu_i * epsilon_i) are only 4, but a wave polarized with E
+  // along y and H along x samples mu_x * epsilon_y = 16.
+  CHECK(mat_op.GetMaxMuEpsilon() == Approx(16.0));
 }
 
 TEST_CASE("MaterialOperator utility functions", "[materialoperator][Serial]")
@@ -212,6 +352,64 @@ TEST_CASE("MaterialOperator utility functions", "[materialoperator][Serial]")
       REQUIRE(!internal::mat::IsIsotropic(data));
     }
   }
+}
+
+TEST_CASE("MaterialOperator ignores ghost-only submesh attributes",
+          "[materialoperator][Parallel]")
+{
+  MPI_Comm comm = Mpi::World();
+  const int rank = Mpi::Rank(comm);
+  REQUIRE(Mpi::Size(comm) >= 2);
+
+  auto serial_mesh = std::make_unique<mfem::Mesh>(
+      mfem::Mesh::MakeCartesian3D(2, 1, 1, mfem::Element::HEXAHEDRON, 2.0, 1.0, 1.0));
+  for (int i = 0; i < serial_mesh->GetNE(); i++)
+  {
+    serial_mesh->SetAttribute(i, 7);
+  }
+  serial_mesh->SetAttributes();
+  serial_mesh->EnsureNCMesh(true);
+
+  int partitioning[2] = {0, 1};
+  auto parent = std::make_unique<mfem::ParMesh>(comm, *serial_mesh, partitioning);
+  mfem::Array<mfem::Refinement> refinements;
+  if (rank == 0)
+  {
+    refinements.Append(mfem::Refinement(0));
+  }
+  parent->GeneralRefinement(refinements, -1);
+
+  mfem::Array<int> surface_attributes;
+  surface_attributes.Append(1);
+  auto submesh = std::make_unique<mfem::ParSubMesh>(
+      mfem::ParSubMesh::CreateFromBoundary(*parent, surface_attributes));
+  Mesh palace_mesh(std::move(submesh));
+  mesh::RemapSubMeshAttributes(static_cast<mfem::ParSubMesh &>(palace_mesh.Get()));
+  palace_mesh.RebuildCeedAttributes();
+
+  const bool owns_elements = rank < 2;
+  CHECK((palace_mesh.GetNE() > 0) == owns_elements);
+  for (int i = 0; i < palace_mesh.GetNE(); i++)
+  {
+    CHECK(palace_mesh.Get().GetAttribute(i) == 7);
+  }
+  const auto &local_attributes = palace_mesh.GetCeedAttributes();
+  if (owns_elements)
+  {
+    CHECK(local_attributes.find(1) != local_attributes.end());
+    CHECK(local_attributes.find(7) != local_attributes.end());
+    // The remap must refresh the cached distinct-attribute array.
+    CHECK(palace_mesh.Get().attributes.Max() == 7);
+  }
+  else
+  {
+    CHECK(local_attributes.empty());
+  }
+
+  config::MaterialData material;
+  material.attributes = {7};
+  config::PeriodicBoundaryData periodic;
+  CHECK_NOTHROW(MaterialOperator({material}, periodic, ProblemType::DRIVEN, palace_mesh));
 }
 
 }  // namespace palace

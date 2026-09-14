@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 name: Lookahead
 
 # Test Palace with newer versions of the dependencies. This test is meant to
@@ -39,8 +42,8 @@ jobs:
               - 'cmake/**'
               - 'extern/**'
               - 'examples/**'
-              - 'test/examples/**'
               - 'test/unit/**'
+              - 'test/data/**'
               - 'spack_repo/**'
               - '.github/actions/**'
               - '.github/workflows/lookahead.yml'
@@ -69,3 +72,66 @@ jobs:
           variant: +cuda
           run-regression-tests: 'true'
           use-develop-deps: 'true'
+
+  # Build against the tip of Spack (develop) rather than the pinned release
+  # series, to catch upstream Spack/spack-packages changes that break Palace.
+  # Dependencies stay at their pinned versions so a failure points at Spack.
+  # This job writes only to the isolated palace-develop buildcache, never the
+  # pinned Spack cache used by required CI.
+  build-test-x64-gcc-spack-develop:
+    needs: filter
+    if: needs.filter.outputs.test == 'true'
+    runs-on: [self-hosted, x64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/palace-ci
+        with:
+          toolchain: gcc
+          run-regression-tests: 'true'
+          spack-version: 'develop'
+          # Keep this job on the moving spack-packages tip as well.
+          spack-packages-commit: ''
+
+  # Refresh the palace-develop buildcache index after its sole cache-producing
+  # job. Runs even if a later test in that job failed, so the index includes
+  # the dependencies it banked; readers keep using the previous complete index
+  # until this upload finishes.
+  #
+  # This is a separate job (not a step in the build above) only because steps
+  # cannot carry `concurrency`. No other job writes this mirror, but two
+  # concurrent Lookahead runs on different PRs are still two writers, and
+  # `update-index` is a read-modify-write of the mirror's single `index.spack`
+  # tag. The workflow-level group is keyed on github.ref and so does not
+  # serialize across refs; this group deliberately omits it, and
+  # cancel-in-progress: false queues the newer writer instead of clobbering.
+  refresh-develop-buildcache-index:
+    needs:
+      - filter
+      - build-test-x64-gcc-spack-develop
+    # Running if the
+    # - the path filter says relevant files have changes
+    # - the event is not a PR from a fork (they can't update the index anyway)
+    if: |
+      !cancelled() &&
+      needs.filter.outputs.test == 'true' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: palace-develop-buildcache-index
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/refresh-buildcache-index
+        with:
+          spack-version: develop
+          mirror-url: oci://ghcr.io/awslabs/palace-develop

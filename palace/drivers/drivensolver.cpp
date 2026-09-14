@@ -16,6 +16,7 @@
 #include "linalg/ksp.hpp"
 #include "linalg/operator.hpp"
 #include "linalg/vector.hpp"
+#include "models/floquetportoperator.hpp"
 #include "models/lumpedportoperator.hpp"
 #include "models/portexcitations.hpp"
 #include "models/postoperator.hpp"
@@ -161,18 +162,16 @@ ErrorIndicator DrivenSolver::SweepUniform(SpaceOperator &space_op) const
       Mpi::Print("\nSweeping excitation index {:d} ({:d}/{:d}):\n", excitation_idx,
                  excitation_counter, port_excitations.Size());
     }
-    // Switch paraview subfolders: one for each excitation, if nr_excitations > 1.
-    post_op.InitializeParaviewDataCollection(excitation_idx);
-
-    // Frequency loop.
-    for (std::size_t omega_i =
-             ((excitation_counter == excitation_restart_counter) ? freq_restart_idx : 0);
-         omega_i < omega_sample.size(); omega_i++)
+    // Frequency loop. Delay the potentially large visualization operators until the
+    // first solution is ready, so they do not increase the solve/preconditioner peak.
+    const std::size_t omega_start =
+        (excitation_counter == excitation_restart_counter) ? freq_restart_idx : 0;
+    for (std::size_t omega_i = omega_start; omega_i < omega_sample.size(); omega_i++)
     {
       auto omega = omega_sample[omega_i];
       // Assemble frequency dependent matrices and initialize operators in linear
       // solver.
-      auto A2 = space_op.GetExtraSystemMatrix<ComplexOperator>(omega, Operator::DIAG_ZERO);
+      auto A2 = space_op.GetExtraSystemOperator(omega, Operator::DIAG_ZERO);
       auto A = space_op.GetSystemMatrix(1.0 + 0.0i, 1i * omega, -omega * omega + 0.0i,
                                         K.get(), C.get(), M.get(), A2.get());
       auto P = space_op.GetPreconditionerMatrix<ComplexOperator>(
@@ -192,6 +191,7 @@ ErrorIndicator DrivenSolver::SweepUniform(SpaceOperator &space_op) const
 
       // Solve linear system.
       space_op.GetExcitationVector(excitation_idx, omega, RHS);
+
       Mpi::Print("\n");
       ksp.Mult(RHS, E);
 
@@ -207,11 +207,18 @@ ErrorIndicator DrivenSolver::SweepUniform(SpaceOperator &space_op) const
       B *= -1.0 / (1i * omega);
       if (space_op.GetMaterialOp().HasWaveVector())
       {
-        // Calculate B field correction for Floquet BCs.
-        // B = -1/(iω) ∇ x E + 1/ω kp x E
-        floquet_corr->AddMult(E, B, 1.0 / omega);
+        // Calculate B field correction for Floquet BCs: B += k_F(ω)/ω × E.
+        // With k₀ = k_F_ref/ω_ref stored, k_F(ω)/ω = k_F_ref/ω_ref = k₀, so scale = 1.
+        floquet_corr->AddMult(
+            E, B,
+            space_op.GetMaterialOp().HasFloquetFrequencyScaling() ? 1.0 : 1.0 / omega);
       }
 
+      if (omega_i == omega_start)
+      {
+        // Switch ParaView subfolders once per excitation, after the first solve.
+        post_op.InitializeParaviewDataCollection(excitation_idx);
+      }
       auto total_domain_energy =
           post_op.MeasureAndPrintAll(excitation_idx, int(omega_i), E, B, omega);
 
@@ -311,6 +318,13 @@ ErrorIndicator DrivenSolver::SweepAdaptive(SpaceOperator &space_op) const
   if (iodata.solver.driven.adaptive_circuit_synthesis)
   {
     prom_op.AddLumpedPortModesForSynthesis();
+    if (space_op.GetWavePortOp().Size() > 0)
+    {
+      // Use the band center as the reference frequency for seeding wave-port modes.
+      // The choice rescales the basis vector but does not change correctness.
+      const double omega_ref = 0.5 * (omega_sample.front() + omega_sample.back());
+      prom_op.AddWavePortModesForSynthesis(omega_ref);
+    }
   }
 
   // Initialize the basis with samples from the top and bottom of the frequency
@@ -331,9 +345,10 @@ ErrorIndicator DrivenSolver::SweepAdaptive(SpaceOperator &space_op) const
     B *= -1.0 / (1i * omega);
     if (space_op.GetMaterialOp().HasWaveVector())
     {
-      // Calculate B field correction for Floquet BCs.
-      // B = -1/(iω) ∇ x E + 1/ω kp x E
-      floquet_corr->AddMult(E, B, 1.0 / omega);
+      // Calculate B field correction for Floquet BCs: B += k_F(ω)/ω × E.
+      // With k₀ = k_F_ref/ω_ref stored, k_F(ω)/ω = k₀, so scale = 1.
+      floquet_corr->AddMult(
+          E, B, space_op.GetMaterialOp().HasFloquetFrequencyScaling() ? 1.0 : 1.0 / omega);
     }
 
     // Measure domain energies for the error indicator only. Don't exchange face_nbr_data,
@@ -422,9 +437,6 @@ ErrorIndicator DrivenSolver::SweepAdaptive(SpaceOperator &space_op) const
     prom_op.PrintPROMMatrices(iodata.units, iodata.problem.output);
   }
 
-  // XX TODO: Add output of eigenvalue estimates from the PROM system (and nonlinear EVP
-  // in the general case with wave ports, etc.?)
-
   // Main fast frequency sweep loop (online phase).
   Mpi::Print("\nBeginning fast frequency sweep online phase\n");
   space_op.GetWavePortOp().SetSuppressOutput(false);  // Disable output suppression
@@ -436,10 +448,7 @@ ErrorIndicator DrivenSolver::SweepAdaptive(SpaceOperator &space_op) const
       Mpi::Print("\nSweeping excitation index {:d} ({:d}/{:d}):\n", excitation_idx,
                  ++excitation_counter, port_excitations.Size());
     }
-    // Switch paraview subfolders: one for each excitation, if nr_excitations > 1.
-    post_op.InitializeParaviewDataCollection(excitation_idx);
-
-    // Frequency loop.
+    // Frequency loop. Delay visualization setup until the first online solution is ready.
     for (std::size_t omega_i = 0; omega_i < omega_sample.size(); omega_i++)
     {
       auto omega = omega_sample[omega_i];
@@ -463,9 +472,16 @@ ErrorIndicator DrivenSolver::SweepAdaptive(SpaceOperator &space_op) const
       B *= -1.0 / (1i * omega);
       if (space_op.GetMaterialOp().HasWaveVector())
       {
-        // Calculate B field correction for Floquet BCs.
-        // B = -1/(iω) ∇ x E + 1/ω kp x E
-        floquet_corr->AddMult(E, B, 1.0 / omega);
+        // Calculate B field correction for Floquet BCs: B += k_F(ω)/ω × E.
+        // With k₀ = k_F_ref/ω_ref stored, k_F(ω)/ω = k_F_ref/ω_ref = k₀, so scale = 1.
+        floquet_corr->AddMult(
+            E, B,
+            space_op.GetMaterialOp().HasFloquetFrequencyScaling() ? 1.0 : 1.0 / omega);
+      }
+      if (omega_i == 0)
+      {
+        // Switch ParaView subfolders once per excitation, after the first solve.
+        post_op.InitializeParaviewDataCollection(excitation_idx);
       }
       post_op.MeasureAndPrintAll(excitation_idx, int(omega_i), E, B, omega);
     }

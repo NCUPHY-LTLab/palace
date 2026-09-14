@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 name: Spack
 
 on:
@@ -36,8 +39,8 @@ jobs:
               - 'cmake/**'
               - 'extern/**'
               - 'examples/**'
-              - 'test/examples/**'
               - 'test/unit/**'
+              - 'test/data/**'
               - 'spack_repo/**'
               - '.github/actions/**'
               - '.github/workflows/spack.yml'
@@ -99,7 +102,7 @@ jobs:
       - uses: ./.github/actions/palace-ci
         with:
           toolchain: llvm
-          additional-test-cases: transmon/transmon_coarse
+          additional-test-cases: transmon_coarse
 
   build-test-x64-intel:
     needs: filter
@@ -110,7 +113,7 @@ jobs:
       - uses: ./.github/actions/palace-ci
         with:
           toolchain: intel-oneapi
-          additional-test-cases: transmon/transmon_coarse
+          additional-test-cases: transmon_coarse
 
   build-test-arm64-gcc:
     needs: filter
@@ -121,7 +124,7 @@ jobs:
       - uses: ./.github/actions/palace-ci
         with:
           toolchain: gcc
-          additional-test-cases: transmon/transmon_coarse
+          additional-test-cases: transmon_coarse
 
   build-test-arm64-llvm:
     needs: filter
@@ -132,7 +135,7 @@ jobs:
       - uses: ./.github/actions/palace-ci
         with:
           toolchain: llvm
-          additional-test-cases: transmon/transmon_coarse
+          additional-test-cases: transmon_coarse
 
   build-test-arm64-gcc-armpl:
     needs: filter
@@ -144,7 +147,50 @@ jobs:
         with:
           toolchain: gcc
           math-libs: armpl-gcc
-          additional-test-cases: transmon/transmon_coarse
+          additional-test-cases: transmon_coarse
+
+  # Refresh the shared Spack 1.2 buildcache index once all cache writers have
+  # finished. Regression jobs can start as soon as their own build completes,
+  # so this full index rebuild is not on their critical path. The index is
+  # best-effort: binaries pushed concurrently remain available through Spack's
+  # direct OCI-tag fallback and will be included by the next refresh.
+  refresh-buildcache-index:
+    needs:
+      - filter
+      - build-x64-gcc
+      - build-gpu-gcc
+      - build-x64-gcc-openmp
+      - build-x64-gcc-cxx20
+      - build-test-x64-llvm
+      - build-test-x64-intel
+      - build-test-arm64-gcc
+      - build-test-arm64-llvm
+      - build-test-arm64-gcc-armpl
+    if: |
+      !cancelled() &&
+      needs.filter.outputs.test == 'true' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    # Serialize index writers across all refs. Individual spec tags are
+    # immutable and may be pushed concurrently, but `update-index` is a
+    # read-modify-write of the mirror's single `index.spack` tag, so two
+    # concurrent writers are last-writer-wins and the loser's specs can drop
+    # out of the index. The workflow-level group is keyed on github.ref and so
+    # does not serialize across branches/PRs; this group deliberately omits it.
+    # cancel-in-progress: false queues the newer writer instead of clobbering.
+    concurrency:
+      group: palace-1.2-buildcache-index
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/refresh-buildcache-index
+        with:
+          spack-version: releases/v1.2
+          mirror-url: oci://ghcr.io/awslabs/palace-1.2
 
   # Test jobs
   test-x64-gcc:
@@ -164,7 +210,7 @@ jobs:
       - uses: ./.github/actions/run-regression-tests
         with:
           toolchain: gcc
-          solver: ${{ matrix.solver }}
+          linear-solver: ${{ matrix.solver }}
 
   test-gpu-gcc:
     needs: [filter, build-gpu-gcc]
@@ -184,7 +230,7 @@ jobs:
         with:
           toolchain: gcc
           variant: +cuda
-          solver: ${{ matrix.solver }}
+          linear-solver: ${{ matrix.solver }}
 
   test-x64-gcc-openmp:
     needs: [filter, build-x64-gcc-openmp]
@@ -204,4 +250,4 @@ jobs:
         with:
           toolchain: gcc
           variant: "+openmp+int64"
-          solver: ${{ matrix.solver }}
+          linear-solver: ${{ matrix.solver }}

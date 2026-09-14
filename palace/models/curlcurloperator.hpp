@@ -4,20 +4,27 @@
 #ifndef PALACE_MODELS_CURL_CURL_OPERATOR_HPP
 #define PALACE_MODELS_CURL_CURL_OPERATOR_HPP
 
+#include <deque>
+#include <map>
 #include <memory>
 #include <vector>
 #include <mfem.hpp>
 #include "fem/fespace.hpp"
 #include "linalg/operator.hpp"
+#include "linalg/rap.hpp"
 #include "linalg/vector.hpp"
 #include "models/materialoperator.hpp"
+#include "models/surfacecurlsolver.hpp"
 #include "models/surfacecurrentoperator.hpp"
+#include "models/surfacefluxoperator.hpp"
 
 namespace palace
 {
 
 class IoData;
 class Mesh;
+template <ProblemType T>
+class PostOperator;
 
 namespace config
 {
@@ -44,6 +51,20 @@ private:
   mfem::Array<int> dbc_attr;
   std::vector<mfem::Array<int>> dbc_tdof_lists;
 
+  // Rolling two-entry cache of screened stiffness operators, tagged by shorted-attribute
+  // set. Steps that short the same ports are solved back-to-back, so equal keys are
+  // adjacent and matching the newest entry reuses its operator. Two entries bound memory to
+  // O(1) hierarchies while keeping the previously bound operator alive. std::deque never
+  // relocates elements, so the shallow tdof references ParOperator::SetEssentialTrueDofs
+  // holds stay valid.
+  struct ScreenedStiffnessCacheEntry
+  {
+    std::vector<int> key;
+    std::vector<mfem::Array<int>> dbc_tdof_lists;
+    std::unique_ptr<Operator> K;
+  };
+  std::deque<ScreenedStiffnessCacheEntry> screened_stiffness_cache;
+
   // Objects defining the finite element spaces for the magnetic vector potential
   // (Nedelec) and magnetic flux density (Raviart-Thomas) on the given mesh. The H1 spaces
   // are used for various purposes throughout the code including postprocessing.
@@ -61,8 +82,16 @@ private:
   // Operator for source current excitation.
   SurfaceCurrentOperator surf_j_op;
 
-  mfem::Array<int> SetUpBoundaryProperties(const config::PecBoundaryData &pec,
-                                           const mfem::ParMesh &mesh);
+  // Operator for flux loop excitation.
+  SurfaceFluxOperator surf_flux_op;
+
+  // Cached original matrix for flux loop boundary-interior coupling
+  mutable std::unique_ptr<ParOperator> K_orig_;
+
+  mfem::Array<int>
+  SetUpBoundaryProperties(const config::PecBoundaryData &pec,
+                          const std::map<int, config::FluxLoopData> &fluxloop,
+                          const mfem::ParMesh &mesh);
   void CheckBoundaryProperties();
 
 public:
@@ -77,6 +106,7 @@ public:
 
   // Access to underlying BC operator objects for postprocessing.
   const auto &GetSurfaceCurrentOp() const { return surf_j_op; }
+  const auto &GetSurfaceFluxOp() const { return surf_flux_op; }
 
   // Return the parallel finite element space objects.
   auto &GetNDSpaces() { return nd_fespaces; }
@@ -106,6 +136,19 @@ public:
   // Ampere's law.
   std::unique_ptr<Operator> GetStiffnessMatrix();
 
+  // Return the stiffness matrix with extra essential (PEC) attributes beyond those set at
+  // construction, without mutating base boundary state. Used in Short mode to treat
+  // inactive surface current ports as PEC for a single excitation step. The operator is
+  // cached and owned by this object, keyed on the shorted-attribute set, so repeated calls
+  // with the same set return a stable reference to one assembled operator rather than
+  // reassembling it.
+  const Operator &GetScreenedStiffnessMatrix(const mfem::Array<int> &extra_dbc_attr);
+
+  // Zero v on the merged essential set (base Dirichlet plus extra_dbc_attr), clearing the
+  // excitation on shorted inactive ports so DIAG_ONE elimination injects no spurious
+  // values.
+  void ZeroEssentialTrueDofs(const mfem::Array<int> &extra_dbc_attr, Vector &v) const;
+
   // Construct and return the discrete curl matrix.
   const Operator &GetCurlMatrix() const
   {
@@ -114,7 +157,23 @@ public:
 
   // Assemble the right-hand side source term vector for a current source applied on
   // specified excited boundaries.
-  void GetExcitationVector(int idx, Vector &RHS);
+  void GetCurrentExcitationVector(int idx, Vector &RHS);
+
+  // Assemble flux loop excitation vector for specified flux loop index
+  template <ProblemType T>
+  void GetFluxExcitationVector(int idx, Vector &RHS, PostOperator<T> &post_op);
+
+  template <ProblemType T>
+  void GetFluxExcitationVector(int idx, Vector &RHS, PostOperator<T> &post_op,
+                               Vector *boundary_values);
+
+  // Solve 2D surface curl problem for flux loop boundary conditions
+  template <ProblemType T>
+  Vector SolveSurfaceCurlProblem(int flux_loop_idx, PostOperator<T> &post_op) const;
+
+  template <ProblemType T>
+  void SolveSurfaceCurlProblem(int flux_loop_idx, PostOperator<T> &post_op,
+                               Vector &result) const;
 
   // Get the associated MPI communicator.
   MPI_Comm GetComm() const { return GetNDSpace().GetComm(); }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "waveportoperator.hpp"
+#include <limits>
 #include "fem/bilinearform.hpp"
 #include "linalg/amg.hpp"
 #include "linalg/ams.hpp"
@@ -18,6 +19,7 @@
 #include "fem/coefficient.hpp"
 #include "fem/integrator.hpp"
 #include "fem/interpolator.hpp"
+#include "fem/output_functionals.hpp"
 #include "linalg/amg.hpp"
 #include "linalg/ams.hpp"
 #include "linalg/arpack.hpp"
@@ -32,6 +34,7 @@
 #include "models/materialoperator.hpp"
 #include "models/surfaceconductivityoperator.hpp"
 #include "models/surfaceimpedanceoperator.hpp"
+#include "models/surfacerationalimpedanceoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/geodata.hpp"
 #include "utils/iodata.hpp"
@@ -232,7 +235,7 @@ public:
 };
 
 // Computes boundary mode n x H, where +n is the outward mesh normal: n x H =
-// -1/(iωμ) (ikₙ Eₜ + ∇ₜ Eₙ), using the tangential and normal electric field component grid
+// -1/(iωμ) (ik_n Eₜ + ∇ₜ Eₙ), using the tangential and normal electric field component grid
 // functions evaluated on the (single-sided) boundary element.
 template <ValueType Type>
 class BdrSubmeshHVectorCoefficient : public mfem::VectorCoefficient
@@ -322,7 +325,7 @@ public:
       return submesh.GetParent()->GetAttribute(iel1);
     }();
 
-    // Compute Re/Im{-1/i (ikₙ Eₜ + ∇ₜ Eₙ)} (t-gradient evaluated in boundary element).
+    // Compute Re/Im{-1/i (ik_n Eₜ + ∇ₜ Eₙ)} (t-gradient evaluated in boundary element).
     double U_data[3];
     mfem::Vector U(U_data, vdim);
     if constexpr (Type == ValueType::REAL)
@@ -363,7 +366,8 @@ WavePortData::WavePortData(const config::WavePortData &data,
                            mfem::ParFiniteElementSpace &nd_fespace,
                            mfem::ParFiniteElementSpace &h1_fespace,
                            const mfem::Array<int> &dbc_attr)
-  : mat_op(mat_op), excitation(data.excitation), active(data.active)
+  : mat_op(mat_op), excitation(data.excitation), active(data.active),
+    include_in_synthesis(data.include_in_synthesis)
 {
   mode_idx = data.mode_idx;
   d_offset = data.d_offset;
@@ -378,9 +382,10 @@ WavePortData::WavePortData(const config::WavePortData &data,
       mfem::ParSubMesh::CreateFromBoundary(mesh, attr_list));
 
   // Add internal boundary elements for edges where the port face intersects other boundary
-  // faces (PEC, impedance, conductivity, absorbing). ParSubMesh::CreateFromBoundary only
-  // creates boundary elements at the geometric boundary of the selected face region, but
-  // internal intersections need boundary elements for the 2D eigenvalue problem BCs.
+  // faces (PEC, impedance, conductivity, rational impedance, absorbing).
+  // ParSubMesh::CreateFromBoundary only creates boundary elements at the geometric boundary
+  // of the selected face region, but internal intersections need boundary elements for the
+  // 2D eigenvalue problem BCs.
   {
     std::vector<int> internal_bdr_attrs;
     for (auto a : boundaries.pec.attributes)
@@ -399,6 +404,13 @@ WavePortData::WavePortData(const config::WavePortData &data,
       }
     }
     for (const auto &d : boundaries.conductivity)
+    {
+      for (auto a : d.attributes)
+      {
+        internal_bdr_attrs.push_back(a);
+      }
+    }
+    for (const auto &d : boundaries.rational_impedance)
     {
       for (auto a : d.attributes)
       {
@@ -458,6 +470,9 @@ WavePortData::WavePortData(const config::WavePortData &data,
       boundaries.farfield, problem_type, *port_mat_op, mesh);
   port_surf_sigma_op = std::make_unique<SurfaceConductivityOperator>(
       boundaries.conductivity, problem_type, units, *port_mat_op, mesh);
+  port_surf_rz_op = std::make_unique<SurfaceRationalImpedanceOperator>(
+      boundaries.rational_impedance, boundaries.cracked_attributes, problem_type, units,
+      *port_mat_op, mesh);
 
   // Construct mapping from parent (boundary) element indices to submesh (domain)
   // elements.
@@ -493,13 +508,11 @@ WavePortData::WavePortData(const config::WavePortData &data,
   e0.SetSize(port_nd_fespace->GetTrueVSize() + port_h1_fespace->GetTrueVSize());
   e0.UseDevice(true);
 
-  // Set the shift-and-invert target as the maximum propagation constant.
-  double c_min = mat_op.GetLightSpeedMax().Min();
-  Mpi::GlobalMin(1, &c_min, nd_fespace.GetComm());
-  MFEM_VERIFY(c_min > 0.0 && c_min < mfem::infinity(),
-              "Invalid material speed of light detected in WavePortOperator!");
-  mu_eps_max = 1.0 / (c_min * c_min) * 1.1;  // Add a safety factor for maximum
-                                             // propagation constant possible
+  // Set the shift-and-invert target above the bulk propagation constants of materials
+  // present on this port. For anisotropic media the electric and magnetic polarizations
+  // can sample different material axes, so max(mu_r * epsilon_r) is not a safe bound;
+  // use max(mu_r) * max(epsilon_r) instead.
+  mu_eps_max = port_mat_op->GetMaxMuEpsilon() * 1.1;
 
   // Configure a communicator for the processes which have elements for this port.
   MPI_Comm comm = nd_fespace.GetComm();
@@ -520,13 +533,15 @@ WavePortData::WavePortData(const config::WavePortData &data,
   {
     mode_solver = std::make_unique<ModeEigenSolver>(
         *port_mat_op, &port_normal, *port_surf_z_op, *port_farfield_op, *port_surf_sigma_op,
-        *port_nd_fespace, *port_h1_fespace, port_dbc_tdof_list, mode_idx, data.max_size,
-        data.eig_tol, EigenvalueSolver::WhichType::LARGEST_REAL, linear, data.eigen_solver,
-        data.verbose, port_comm);
+        *port_surf_rz_op, *port_nd_fespace, *port_h1_fespace, port_dbc_tdof_list, mode_idx,
+        data.max_size, data.eig_tol, EigenvalueSolver::WhichType::LARGEST_REAL, linear,
+        data.eigen_solver, data.verbose, port_comm);
   }
 
   // Configure port mode sign convention: 1ᵀ Re{-n x H} >= 0 on the "upper-right quadrant"
-  // of the wave port boundary, in order to deal with symmetry effectively.
+  // of the wave port boundary, in order to deal with symmetry effectively. The user can
+  // override this convention by providing a VoltagePath; see the post-Normalize step in
+  // Initialize() which flips the mode sign such that ∫ E · dl > 0 along the path.
   {
     Vector bbmin, bbmax;
     mesh::GetAxisAlignedBoundingBox(*port_mesh, bbmin, bbmax);
@@ -588,7 +603,30 @@ WavePortData::WavePortData(const config::WavePortData &data,
       voltage_path.push_back(std::move(p));
     }
     voltage_n_samples = data.n_samples;
+
+    // Set up reverse transfer map (port submesh → parent mesh) and a parent-mesh
+    // GridFunction to receive the transferred mode field. This enables computing line
+    // integrals of the port mode E-field via GSLIB on the 3D parent mesh, since GSLIB
+    // requires SpaceDim == Dim and cannot work directly on the 2D-embedded port submesh.
+    parent_E0t = std::make_unique<GridFunction>(nd_fespace, true);
+    port_nd_transfer_reverse = std::make_unique<mfem::ParTransferMap>(
+        mfem::ParSubMesh::CreateTransferMap(port_E0t->Real(), parent_E0t->Real()));
+
+#if defined(MFEM_USE_GSLIB)
+    // Build the GSLIB point locator on the (fixed) parent mesh once here.
+    // GetExcitationVoltage reuses it for every line integral instead of rebuilding the
+    // spatial hash per call — the dominant cost when the mode is evaluated at many
+    // frequencies (e.g. synthesis fit).
+    auto &parent_mesh = *parent_E0t->Real().FESpace()->GetMesh();
+    voltage_gslib_op =
+        std::make_unique<mfem::FindPointsGSLIB>(parent_E0t->Real().ParFESpace()->GetComm());
+    fem::SetupInterpolator(*voltage_gslib_op, parent_mesh);
+#endif
   }
+
+  // Store polarity attributes [high, low]. The config parser enforces that this is
+  // mutually exclusive with VoltagePath, and zero means "not set".
+  polarity_attributes = data.polarity_attributes;
 }
 
 WavePortData::~WavePortData()
@@ -625,12 +663,12 @@ void WavePortData::Initialize(double omega)
   Mpi::Broadcast(1, &lambda, port_root, port_mesh->GetComm());
 
   // Extract the eigenmode solution and postprocess. The extracted eigenvalue is λ =
-  // 1 / (-kₙ² - σ).
+  // 1 / (-k_n² - σ).
   kn0 = std::sqrt(-sigma - 1.0 / lambda);
   omega0 = omega;
 
   // Separate the computed field out into eₜ and eₙ and transform back to the physical
-  // electric field variables Eₜ = eₜ and Eₙ = eₙ / (i·kₙ). Order: load raw eigenvector,
+  // electric field variables Eₜ = eₜ and Eₙ = eₙ / (i·k_n). Order: load raw eigenvector,
   // phase-normalize, then apply the shared VD back-transform.
   {
     if (port_comm != MPI_COMM_NULL)
@@ -691,7 +729,61 @@ void WavePortData::Initialize(double omega)
       port_si->UseDevice(true);
     }
     Normalize(*port_S0t, *port_E0t, *port_E0n, *port_sr, *port_si);
+
+    // If the user provided a VoltagePath, use it to fix the mode polarity such that
+    // V_exc = ∫ E_mode · dl is real-positive along the path. This ties the wave port
+    // mode polarity to a physically meaningful direction (the path direction, like a
+    // lumped port's Direction), enabling consistent S-parameter signs in mixed lumped
+    // + wave port simulations. PolarityAttributes provides a lightweight (no-GSLIB)
+    // alternative when only polarity is needed.
+    int sign = 0;
+    if (has_voltage_coords)
+    {
+      auto V_exc = GetExcitationVoltage();
+      sign = (V_exc.real() < 0.0) ? -1 : (V_exc.real() > 0.0 ? +1 : 0);
+    }
+    else if (polarity_attributes[0] != 0 && polarity_attributes[1] != 0)
+    {
+      sign = GetModePolaritySign(polarity_attributes[0], polarity_attributes[1]);
+    }
+    if (sign < 0)
+    {
+      ComplexVector::AXPBY(std::complex<double>(-1.0, 0.0), port_E0t->Real(),
+                           port_E0t->Imag(), 0.0, port_E0t->Real(), port_E0t->Imag());
+      ComplexVector::AXPBY(std::complex<double>(-1.0, 0.0), port_E0n->Real(),
+                           port_E0n->Imag(), 0.0, port_E0n->Real(), port_E0n->Imag());
+      ComplexVector::AXPBY(std::complex<double>(-1.0, 0.0), *port_sr, *port_si, 0.0,
+                           *port_sr, *port_si);
+    }
   }
+}
+
+std::complex<double> WavePortData::SolveKnComplex(std::complex<double> omega)
+{
+  // Complex-frequency propagation constant. Mirrors the EVP solve + recovery in
+  // Initialize() but skips all field reconstruction / normalization and does NOT touch
+  // the cached real-ω state (omega0, kn0, port_E0t/E0n). The spectral shift sigma stays
+  // REAL — it is a pure algebraic centering of the linearization (exact for any real
+  // sigma), so we derive it from the real part of the requested frequency. The
+  // cross-section EVP carries the full complex ω. Used by the eigenmode nonlinear
+  // solver to evaluate the wave-port BC at the genuinely complex eigenvalue.
+  const double omega_ref = omega.real();
+  const double sigma = -omega_ref * omega_ref * mu_eps_max;
+  std::complex<double> lambda;
+  {
+    const bool has_solver = (port_comm != MPI_COMM_NULL);
+    auto result = mode_solver->Solve(omega, sigma, has_solver ? &v0 : nullptr);
+    if (has_solver)
+    {
+      MFEM_VERIFY(result.num_converged >= mode_idx,
+                  "Wave port eigensolver did not converge in SolveKnComplex!");
+      lambda = mode_solver->GetEigenvalue(mode_idx - 1);
+    }
+  }
+  Mpi::Broadcast(1, &lambda, port_root, port_mesh->GetComm());
+  // k_n = √(−σ − 1/λ_evp). Principal branch gives Re(k_n) ≥ 0 (forward-propagating /
+  // forward-decaying sheet), which is the physical convention for the +z mode.
+  return std::sqrt(-sigma - 1.0 / lambda);
 }
 
 std::unique_ptr<mfem::VectorCoefficient>
@@ -741,15 +833,41 @@ double WavePortData::GetExcitationPower() const
 
 std::complex<double> WavePortData::GetPower(GridFunction &E, GridFunction &B) const
 {
-  // Compute port power, (E x H) ⋅ n = E ⋅ (-n x H), integrated over the port surface using
-  // the computed E and H = μ⁻¹ B fields, where +n is the outward mesh normal. The
-  // BdrSurfaceCurrentVectorCoefficient computes -n x H for the outward normal. The linear
-  // form is reconstructed from scratch each time due to changing H.
+  // Compute the stationary complex power on the port, E ⋅ (-n x H⋆), integrated over the
+  // port surface with +n the outward mesh normal. Use the libCEED surface functional path
+  // when supported to avoid per-call boundary LinearForm assembly in the legacy path.
   MFEM_VERIFY(E.HasImag() && B.HasImag(),
               "Wave ports expect complex-valued E and B fields in port power "
               "calculation!");
   auto &nd_fespace = *E.ParFESpace();
   const auto &mesh = *nd_fespace.GetParMesh();
+
+  // Set two_sided = true even on the exterior port surface so the QFunction uses the
+  // fixed outward normal directly (no x0-based reorientation).
+  if (!power_func)
+  {
+    int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
+    mfem::Array<int> attr_marker = mesh::AttrToMarker(bdr_attr_max, attr_list);
+    mfem::Vector x0(mesh.SpaceDimension());
+    x0 = 0.0;
+    power_func = std::make_unique<SurfaceFunctional>(
+        mat_op.GetMesh(), attr_marker, &nd_fespace, B.ParFESpace(), mat_op,
+        SurfaceFlux::POWER, /*two_sided*/ true, x0);
+  }
+  if (power_func && power_func->IsValid())
+  {
+    // EvalComplexPower returns the complex Poynting integral with the same normal
+    // convention as the legacy BdrSurfaceCurrentVectorCoefficient path (n x H for the
+    // outward normal, contributions negated), matching LumpedPortData::GetPower.
+    return power_func->EvalComplexPower(E, B);
+  }
+  if (mesh.Dimension() == 3 && mesh.SpaceDimension() == 3)
+  {
+    MFEM_VERIFY(power_func && power_func->IsValid(),
+                "libCEED wave-port power postprocessing could not assemble for a "
+                "supported 3D port surface!");
+  }
+
   BdrSurfaceCurrentVectorCoefficient nxHr_func(B.Real(), mat_op);
   BdrSurfaceCurrentVectorCoefficient nxHi_func(B.Imag(), mat_op);
   int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
@@ -792,6 +910,102 @@ std::complex<double> WavePortData::GetSParameter(GridFunction &E) const
   return dot;
 }
 
+int WavePortData::GetModePolaritySign(int high_attr, int low_attr) const
+{
+  // Without GSLIB, evaluate the modal E-field at the centroids of two port-submesh
+  // boundary elements — one with parent attribute high_attr (signal terminal) and one
+  // with low_attr (ground terminal) — and return the sign of
+  //   Re( E_avg · (c_low - c_high) ),
+  // i.e. positive when E points from the signal (high) terminal toward the ground (low)
+  // terminal, matching the lumped-port `+R Direction` convention and VoltagePath
+  // ordering. After RemapSubMeshBdrAttributes the submesh boundary element's attribute
+  // is the parent boundary attribute, so we can match directly against the user ints.
+  const auto &port_submesh = static_cast<const mfem::ParSubMesh &>(port_mesh->Get());
+  const int sdim = port_submesh.SpaceDimension();
+
+  // Local search: for each target attribute, record the first matching boundary
+  // element (lowest local index) and compute its centroid and the modal E vector at
+  // that centroid (evaluated through the adjacent 2D submesh element).
+  auto LocalFind = [&](int target_attr, mfem::Vector &face_centroid, mfem::Vector &E_re,
+                       mfem::Vector &E_im, int &found_rank)
+  {
+    found_rank = std::numeric_limits<int>::max();
+    face_centroid.SetSize(sdim);
+    E_re.SetSize(sdim);
+    E_im.SetSize(sdim);
+    face_centroid = 0.0;
+    E_re = 0.0;
+    E_im = 0.0;
+    for (int b = 0; b < port_submesh.GetNBE(); b++)
+    {
+      if (port_submesh.GetBdrAttribute(b) != target_attr)
+      {
+        continue;
+      }
+      mfem::FaceElementTransformations *FT =
+          const_cast<mfem::ParSubMesh &>(port_submesh).GetBdrFaceTransformations(b);
+      if (FT == nullptr)
+      {
+        continue;
+      }
+      // Use the boundary-face centroid (a physical point ON the terminal) as the
+      // direction reference, but evaluate E in the interior of the adjacent element
+      // since the modal tangential E vanishes on PEC boundaries.
+      mfem::IntegrationPoint ip_face;
+      ip_face.x = ip_face.y = ip_face.z = 0.5;
+      FT->SetAllIntPoints(&ip_face);
+      FT->Transform(ip_face, face_centroid);
+      mfem::ElementTransformation *T_elem = FT->Elem1;
+      mfem::Geometry::Type geom = T_elem->GetGeometryType();
+      const mfem::IntegrationPoint &ip_center = mfem::Geometries.GetCenter(geom);
+      T_elem->SetIntPoint(&ip_center);
+      port_E0t->Real().GetVectorValue(*T_elem, ip_center, E_re);
+      port_E0t->Imag().GetVectorValue(*T_elem, ip_center, E_im);
+      found_rank = Mpi::Rank(port_submesh.GetComm());
+      return;
+    }
+  };
+
+  mfem::Vector c_high(sdim), c_low(sdim), E_re_high(sdim), E_im_high(sdim);
+  mfem::Vector E_re_low(sdim), E_im_low(sdim);
+  int rank_high = 0, rank_low = 0;
+  LocalFind(high_attr, c_high, E_re_high, E_im_high, rank_high);
+  LocalFind(low_attr, c_low, E_re_low, E_im_low, rank_low);
+
+  // Pick the lowest-rank winner for each attribute deterministically, then broadcast
+  // its centroid + E values to all ranks.
+  MPI_Comm comm = port_submesh.GetComm();
+  Mpi::GlobalMin(1, &rank_high, comm);
+  Mpi::GlobalMin(1, &rank_low, comm);
+  if (rank_high >= Mpi::Size(comm) || rank_low >= Mpi::Size(comm))
+  {
+    Mpi::Warning(comm,
+                 "WavePort PolarityAttributes [{}, {}] not found on the port boundary; "
+                 "skipping polarity fix!\n",
+                 high_attr, low_attr);
+    return 0;
+  }
+  Mpi::Broadcast(sdim, c_high.GetData(), rank_high, comm);
+  Mpi::Broadcast(sdim, E_re_high.GetData(), rank_high, comm);
+  Mpi::Broadcast(sdim, E_im_high.GetData(), rank_high, comm);
+  Mpi::Broadcast(sdim, c_low.GetData(), rank_low, comm);
+  Mpi::Broadcast(sdim, E_re_low.GetData(), rank_low, comm);
+  Mpi::Broadcast(sdim, E_im_low.GetData(), rank_low, comm);
+
+  mfem::Vector dir(sdim);
+  for (int d = 0; d < sdim; d++)
+  {
+    dir(d) = c_low(d) - c_high(d);
+  }
+  // Sign of Re( ((E_high + E_low)/2) · dir ).
+  double dot_re = 0.0;
+  for (int d = 0; d < sdim; d++)
+  {
+    dot_re += 0.5 * (E_re_high(d) + E_re_low(d)) * dir(d);
+  }
+  return (dot_re < 0.0) ? -1 : (dot_re > 0.0 ? +1 : 0);
+}
+
 std::complex<double> WavePortData::GetVoltage(GridFunction &E) const
 {
   // Compute voltage V = ∫ E · dl along the configured path segments.
@@ -803,32 +1017,69 @@ std::complex<double> WavePortData::GetVoltage(GridFunction &E) const
   MFEM_VERIFY(E.HasImag(),
               "Wave ports expect complex-valued E field in port voltage calculation!");
   std::complex<double> V(0.0, 0.0);
+#if defined(MFEM_USE_GSLIB)
+  // Reuse the cached point locator: E lives on the same parent mesh the op was Setup on.
   for (std::size_t k = 0; k + 1 < voltage_path.size(); k++)
   {
-    V.real(V.real() + fem::ComputeLineIntegral(voltage_path[k], voltage_path[k + 1],
-                                               E.Real(), voltage_n_samples));
-    V.imag(V.imag() + fem::ComputeLineIntegral(voltage_path[k], voltage_path[k + 1],
-                                               E.Imag(), voltage_n_samples));
+    V.real(V.real() + fem::ComputeLineIntegral(*voltage_gslib_op, voltage_path[k],
+                                               voltage_path[k + 1], E.Real(),
+                                               voltage_n_samples));
+    V.imag(V.imag() + fem::ComputeLineIntegral(*voltage_gslib_op, voltage_path[k],
+                                               voltage_path[k + 1], E.Imag(),
+                                               voltage_n_samples));
   }
+#else
+  MFEM_ABORT("Wave port VoltagePath computation requires MFEM_USE_GSLIB!");
+#endif
   return V;
 }
 
 std::complex<double> WavePortData::GetExcitationVoltage() const
 {
-  // TODO: The port mode field (port_E0t) lives on the 2D port submesh, and GSLIB cannot
-  // find 3D points on a 2D submesh. To implement this, the port mode field must first be
-  // transferred back to the 3D parent mesh before calling ComputeLineIntegral.
-  Mpi::Warning("GetExcitationVoltage is not yet implemented for wave port boundaries!\n");
-  return 0.0;
+  if (!has_voltage_coords)
+  {
+    return 0.0;
+  }
+  // Transfer the port mode tangential E-field from the 2D port submesh back to the 3D
+  // parent mesh, then compute the line integral along the voltage path using GSLIB
+  // interpolation. Zero the parent field first since SubMeshToParent only writes the
+  // mapped DOFs (boundary face DOFs corresponding to the port submesh).
+  *parent_E0t = 0.0;
+  port_nd_transfer_reverse->Transfer(port_E0t->Real(), parent_E0t->Real());
+  port_nd_transfer_reverse->Transfer(port_E0t->Imag(), parent_E0t->Imag());
+  std::complex<double> V(0.0, 0.0);
+#if defined(MFEM_USE_GSLIB)
+  // Reuse the cached point locator (Setup once at construction) — the GSLIB spatial hash
+  // depends only on the parent mesh, not the transferred field values. (Line integrals
+  // require GSLIB regardless; the cached locator just avoids rebuilding the hash per call.)
+  for (std::size_t k = 0; k + 1 < voltage_path.size(); k++)
+  {
+    V.real(V.real() + fem::ComputeLineIntegral(*voltage_gslib_op, voltage_path[k],
+                                               voltage_path[k + 1], parent_E0t->Real(),
+                                               voltage_n_samples));
+    V.imag(V.imag() + fem::ComputeLineIntegral(*voltage_gslib_op, voltage_path[k],
+                                               voltage_path[k + 1], parent_E0t->Imag(),
+                                               voltage_n_samples));
+  }
+#else
+  MFEM_ABORT("Wave port VoltagePath computation requires MFEM_USE_GSLIB!");
+#endif
+  return V;
 }
 
 std::complex<double> WavePortData::GetCharacteristicImpedance() const
 {
-  // TODO: Same limitation as GetExcitationVoltage — the port mode field lives on the 2D
-  // submesh. Requires transfer to parent mesh before GSLIB interpolation can work.
-  Mpi::Warning(
-      "GetCharacteristicImpedance is not yet implemented for wave port boundaries!\n");
-  return 0.0;
+  // Z_PV = (V·V*) / P_mode, where P_mode = ∫(E_mode × H_mode*)·n dS is the full
+  // complex Poynting integral of the mode field over the port boundary. The driven
+  // solver's Normalize() function normalizes the mode so that |P_mode| = 1, with the
+  // mode polarity fixed (via VoltagePath when configured) so that P_mode is real-
+  // positive for a propagating mode. Therefore P_mode = 1 and Z_PV reduces to V·V*.
+  auto V = GetExcitationVoltage();
+  if (std::abs(V) == 0.0)
+  {
+    return 0.0;
+  }
+  return V * std::conj(V);
 }
 
 WavePortOperator::WavePortOperator(const config::BoundaryData &boundaries,
@@ -1055,8 +1306,17 @@ void WavePortOperator::Initialize(double omega)
                    "  H1: {:d}, ND: {:d}\n",
                    idx, data.GlobalTrueH1Size(), data.GlobalTrueNDSize());
       }
-      Mpi::Print(" Port {:d}, mode {:d}: kₙ = {:.3e}{:+.3e}i m⁻¹\n", idx, data.mode_idx,
-                 data.kn0.real() * kc, data.kn0.imag() * kc);
+      if (data.HasVoltageCoords())
+      {
+        auto Z_pv = data.GetCharacteristicImpedance().real() * electromagnetics::Z0_;
+        Mpi::Print(" Port {:d}, mode {:d}: kₙ = {:.3e}{:+.3e}i m⁻¹, Z_PV = {:.3e} Ω\n", idx,
+                   data.mode_idx, data.kn0.real() * kc, data.kn0.imag() * kc, Z_pv);
+      }
+      else
+      {
+        Mpi::Print(" Port {:d}, mode {:d}: kₙ = {:.3e}{:+.3e}i m⁻¹\n", idx, data.mode_idx,
+                   data.kn0.real() * kc, data.kn0.imag() * kc);
+      }
     }
   }
 }
@@ -1065,10 +1325,13 @@ void WavePortOperator::AddExtraSystemBdrCoefficients(double omega,
                                                      MaterialPropertyCoefficient &fbr,
                                                      MaterialPropertyCoefficient &fbi)
 {
-  // Add wave port boundaries to the bilinear form. This looks a lot like the lumped port
-  // boundary, except the iω / Z_s coefficient goes to ikₙ / μ where kₙ is specific to the
-  // port mode at the given operating frequency (note only the real part of the propagation
-  // constant contributes).
+  // Real-ω wave-port BC (driven / boundary-mode path). The contribution looks a lot like
+  // the lumped port boundary, except the iω / Z_s coefficient goes to i·k_n / μ where k_n
+  // is specific to the port mode at the operating frequency. Only the real (propagating)
+  // part of k_n is used here: a real-ω driven/boundary-mode solve models a lossless,
+  // energy- carrying port line, so the line-attenuation Im(k_n) is intentionally dropped.
+  // (The eigenmode nonlinear solve uses the full complex k_n via the complex overload
+  // below.)
   Initialize(omega);
   for (const auto &[idx, data] : ports)
   {
@@ -1076,16 +1339,82 @@ void WavePortOperator::AddExtraSystemBdrCoefficients(double omega,
     {
       continue;
     }
-    const MaterialOperator &mat_op = data.mat_op;
-    MaterialPropertyCoefficient muinv_func(mat_op.GetBdrAttributeToMaterial(),
-                                           mat_op.GetInvPermeability());
-    muinv_func.RestrictCoefficient(mat_op.GetCeedBdrAttributes(data.GetAttrList()));
-    // fbr.AddCoefficient(muinv_func.GetAttributeToMaterial(),
-    //                    muinv_func.GetMaterialProperties(),
-    //                    -data.kn0.imag());
-    fbi.AddCoefficient(muinv_func.GetAttributeToMaterial(),
-                       muinv_func.GetMaterialProperties(), data.kn0.real());
+    AddBoundaryMassBdrCoefficients(idx, fbi, data.kn0.real());
   }
+}
+
+void WavePortOperator::AddExtraSystemBdrCoefficients(std::complex<double> omega,
+                                                     MaterialPropertyCoefficient &fbr,
+                                                     MaterialPropertyCoefficient &fbi)
+{
+  // Complex-ω wave-port BC for the eigenmode nonlinear solve. The system contribution is
+  // A2_wp = i·k_n(ω)·M_{μ⁻¹,p} with the EXACT complex k_n(ω) from the cross-section EVP
+  // solved at the genuinely complex eigenvalue (ω = -i·λ). For k_n = β + iα, expanding
+  // i·(β + iα) = −α + iβ puts the line-attenuation term −α·M on the real slot (fbr) and
+  // the propagating term β·M on the imaginary slot (fbi). SolveKnComplex is
+  // side-effect-free (does NOT cache, leaving omega0/kn0/port_E0t untouched), so the real-ω
+  // driven/postpro state is preserved. For real ω (imag = 0, α from cross-section loss)
+  // this matches the physics of the double overload but additionally carries the
+  // attenuation on fbr.
+  for (auto &[idx, data] : ports)
+  {
+    if (!data.active)
+    {
+      continue;
+    }
+    const std::complex<double> kn = data.SolveKnComplex(omega);
+    AddBoundaryMassBdrCoefficients(idx, fbr, -kn.imag());
+    AddBoundaryMassBdrCoefficients(idx, fbi, kn.real());
+  }
+}
+
+void WavePortOperator::AddBoundaryMassBdrCoefficients(int port_idx,
+                                                      MaterialPropertyCoefficient &fb) const
+{
+  AddBoundaryMassBdrCoefficients(port_idx, fb, 1.0);
+}
+
+void WavePortOperator::AddBoundaryMassBdrCoefficients(int port_idx,
+                                                      MaterialPropertyCoefficient &fb,
+                                                      double scale) const
+{
+  // Per-port μ⁻¹ boundary mass coefficient with optional scalar scaling. Pulling this out
+  // of AddExtraSystemBdrCoefficients gives the reduced-order model access to the
+  // ω-independent operator separately from its per-ω scaling k_n(ω).
+  auto it = ports.find(port_idx);
+  if (it == ports.end())
+  {
+    return;
+  }
+  // This helper exposes the unit boundary mass independently of whether the Robin
+  // termination is active. AddExtraSystemBdrCoefficients performs the Active check before
+  // calling it, while circuit synthesis also needs the mass of an inactive-but-included
+  // port to normalize its node and compute reference data.
+  const auto &data = it->second;
+  const MaterialOperator &mat_op = data.mat_op;
+  MaterialPropertyCoefficient muinv_func(mat_op.GetBdrAttributeToMaterial(),
+                                         mat_op.GetInvPermeability());
+  muinv_func.RestrictCoefficient(mat_op.GetCeedBdrAttributes(data.GetAttrList()));
+  fb.AddCoefficient(muinv_func.GetAttributeToMaterial(), muinv_func.GetMaterialProperties(),
+                    scale);
+}
+
+double WavePortOperator::GetWavePortKn(int port_idx, double omega)
+{
+  auto it = ports.find(port_idx);
+  MFEM_VERIFY(it != ports.end(),
+              "GetWavePortKn called with unknown port index " << port_idx << "!");
+  it->second.Initialize(omega);
+  return it->second.kn0.real();
+}
+
+std::complex<double> WavePortOperator::GetWavePortKnComplex(int port_idx,
+                                                            std::complex<double> omega)
+{
+  auto it = ports.find(port_idx);
+  MFEM_VERIFY(it != ports.end(),
+              "GetWavePortKnComplex called with unknown port index " << port_idx << "!");
+  return it->second.SolveKnComplex(omega);
 }
 
 void WavePortOperator::AddExcitationBdrCoefficients(int excitation_idx, double omega,

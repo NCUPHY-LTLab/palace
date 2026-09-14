@@ -16,6 +16,7 @@
 #include "linalg/jacobi.hpp"
 #include "linalg/ksp.hpp"
 #include "linalg/rap.hpp"
+#include "models/floquetportoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/geodata.hpp"
 #include "utils/iodata.hpp"
@@ -56,11 +57,16 @@ SpaceOperator::SpaceOperator(const config::SolverData &solver,
     surf_sigma_op(boundaries.conductivity, problem_type, units, mat_op, *mesh.back()),
     surf_z_op(boundaries.impedance, boundaries.cracked_attributes, units, mat_op,
               *mesh.back()),
+    surf_rz_op(boundaries.rational_impedance, boundaries.cracked_attributes, problem_type,
+               units, mat_op, *mesh.back()),
     lumped_port_op(boundaries.lumpedport, units, mat_op, *mesh.back()),
     wave_port_op(boundaries, domains, solver, problem_type, units, mat_op, GetNDSpace(),
                  GetH1Space()),
+    floquet_port_op(boundaries.floquetport, boundaries.periodic, problem_type, units,
+                    mat_op, GetNDSpace().Get()),
     surf_j_op(boundaries.current, *mesh.back()),
-    port_excitation_helper(lumped_port_op, wave_port_op, surf_j_op, current_dipole_op)
+    port_excitation_helper(lumped_port_op, wave_port_op, floquet_port_op, surf_j_op,
+                           current_dipole_op)
 {
   // In 2D, curl maps H(curl) → L2 (scalar), so we need an L2 FE space for B = curl E.
   // Must use INTEGRAL map type so the discrete interpolator recognizes this as the curl
@@ -178,19 +184,22 @@ void SpaceOperator::CheckBoundaryProperties()
       mesh::AttrToMarker(bdr_attr_max, surf_sigma_op.GetAttrList());
   const auto surf_z_Rs_marker = mesh::AttrToMarker(bdr_attr_max, surf_z_op.GetRsAttrList());
   const auto surf_z_Ls_marker = mesh::AttrToMarker(bdr_attr_max, surf_z_op.GetLsAttrList());
+  const auto surf_rz_marker = mesh::AttrToMarker(bdr_attr_max, surf_rz_op.GetAttrList());
   const auto lumped_port_Rs_marker =
       mesh::AttrToMarker(bdr_attr_max, lumped_port_op.GetRsAttrList());
   const auto lumped_port_Ls_marker =
       mesh::AttrToMarker(bdr_attr_max, lumped_port_op.GetLsAttrList());
   const auto wave_port_marker =
       mesh::AttrToMarker(bdr_attr_max, wave_port_op.GetAttrList());
+  const auto floquet_port_marker =
+      mesh::AttrToMarker(bdr_attr_max, floquet_port_op.GetAttrList());
   mfem::Array<int> aux_bdr_marker(dbc_marker.Size());
   for (int i = 0; i < dbc_marker.Size(); i++)
   {
-    aux_bdr_marker[i] =
-        (dbc_marker[i] || farfield_marker[i] || surf_sigma_marker[i] ||
-         surf_z_Rs_marker[i] || surf_z_Ls_marker[i] || lumped_port_Rs_marker[i] ||
-         lumped_port_Ls_marker[i] || wave_port_marker[i]);
+    aux_bdr_marker[i] = (dbc_marker[i] || farfield_marker[i] || surf_sigma_marker[i] ||
+                         surf_z_Rs_marker[i] || surf_rz_marker[i] || surf_z_Ls_marker[i] ||
+                         lumped_port_Rs_marker[i] || lumped_port_Ls_marker[i] ||
+                         wave_port_marker[i] || floquet_port_marker[i]);
     if (aux_bdr_marker[i])
     {
       aux_bdr_attr.Append(i + 1);
@@ -213,8 +222,8 @@ void SpaceOperator::CheckBoundaryProperties()
   for (int i = 0; i < dbc_marker.Size(); i++)
   {
     MFEM_VERIFY(dbc_marker[i] + farfield_marker[i] + surf_sigma_marker[i] +
-                        surf_z_marker[i] + lumped_port_marker[i] + wave_port_marker[i] +
-                        surf_j_marker[i] <=
+                        surf_z_marker[i] + surf_rz_marker[i] + lumped_port_marker[i] +
+                        wave_port_marker[i] + floquet_port_marker[i] + surf_j_marker[i] <=
                     1,
                 "Boundary attributes should not be specified with multiple BC!");
   }
@@ -257,38 +266,59 @@ void PrintHeader(const mfem::ParFiniteElementSpace &h1_fespace,
   print_hdr = false;
 }
 
-void AddIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *df,
-                    const MaterialPropertyCoefficient *f,
-                    const MaterialPropertyCoefficient *dfb,
-                    const MaterialPropertyCoefficient *fb,
-                    const MaterialPropertyCoefficient *fp, bool assemble_q_data = false)
+const MaterialPropertyCoefficient *
+ActiveCoefficient(const MaterialPropertyCoefficient *coeff)
 {
-  if (df && !df->empty() && f && !f->empty())
+  return (coeff && !coeff->IsExactlyZero()) ? coeff : nullptr;
+}
+
+template <typename... CoeffType>
+bool AreExactlyZero(const CoeffType &...coeff)
+{
+  return (... && coeff.IsExactlyZero());
+}
+
+// Add every configured (non-empty) term, including terms whose current value is exactly
+// zero. This storage-based selection is used only for coarse preconditioner assembly below;
+// normal operator assembly uses AddIntegrators and filters exact zeros.
+void AddConfiguredIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *df,
+                              const MaterialPropertyCoefficient *f,
+                              const MaterialPropertyCoefficient *dfb,
+                              const MaterialPropertyCoefficient *fb,
+                              const MaterialPropertyCoefficient *fp,
+                              bool assemble_q_data = false)
+{
+  const bool has_df = df && !df->empty();
+  const bool has_f = f && !f->empty();
+  if (has_df && has_f)
   {
     a.AddDomainIntegrator<CurlCurlMassIntegrator>(*df, *f);
   }
   else
   {
-    if (df && !df->empty())
+    if (has_df)
     {
       a.AddDomainIntegrator<CurlCurlIntegrator>(*df);
     }
-    if (f && !f->empty())
+    if (has_f)
     {
       a.AddDomainIntegrator<VectorFEMassIntegrator>(*f);
     }
   }
-  if (dfb && !dfb->empty() && fb && !fb->empty())
+
+  const bool has_dfb = dfb && !dfb->empty();
+  const bool has_fb = fb && !fb->empty();
+  if (has_dfb && has_fb)
   {
     a.AddBoundaryIntegrator<CurlCurlMassIntegrator>(*dfb, *fb);
   }
   else
   {
-    if (dfb && !dfb->empty())
+    if (has_dfb)
     {
       a.AddBoundaryIntegrator<CurlCurlIntegrator>(*dfb);
     }
-    if (fb && !fb->empty())
+    if (has_fb)
     {
       a.AddBoundaryIntegrator<VectorFEMassIntegrator>(*fb);
     }
@@ -304,8 +334,20 @@ void AddIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *df,
   }
 }
 
-void AddAuxIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *f,
-                       const MaterialPropertyCoefficient *fb, bool assemble_q_data = false)
+void AddIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *df,
+                    const MaterialPropertyCoefficient *f,
+                    const MaterialPropertyCoefficient *dfb,
+                    const MaterialPropertyCoefficient *fb,
+                    const MaterialPropertyCoefficient *fp, bool assemble_q_data = false)
+{
+  AddConfiguredIntegrators(a, ActiveCoefficient(df), ActiveCoefficient(f),
+                           ActiveCoefficient(dfb), ActiveCoefficient(fb),
+                           ActiveCoefficient(fp), assemble_q_data);
+}
+
+void AddConfiguredAuxIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *f,
+                                 const MaterialPropertyCoefficient *fb,
+                                 bool assemble_q_data = false)
 {
   if (f && !f->empty())
   {
@@ -319,6 +361,13 @@ void AddAuxIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *f,
   {
     a.AssembleQuadratureData();
   }
+}
+
+void AddAuxIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *f,
+                       const MaterialPropertyCoefficient *fb, bool assemble_q_data = false)
+{
+  AddConfiguredAuxIntegrators(a, ActiveCoefficient(f), ActiveCoefficient(fb),
+                              assemble_q_data);
 }
 
 auto AssembleOperator(const FiniteElementSpace &fespace,
@@ -340,21 +389,55 @@ auto AssembleOperators(const FiniteElementSpaceHierarchy &fespaces,
                        const MaterialPropertyCoefficient *dfb,
                        const MaterialPropertyCoefficient *fb,
                        const MaterialPropertyCoefficient *fp, bool skip_zeros = false,
-                       bool assemble_q_data = false, std::size_t l0 = 0)
+                       bool assemble_q_data = false)
 {
-  BilinearForm a(fespaces.GetFinestFESpace());
-  AddIntegrators(a, df, f, dfb, fb, fp, assemble_q_data);
-  return a.Assemble(fespaces, skip_zeros, l0);
+  // Keep configured coefficient support on the coarse sparse level. This is required for
+  // an exact-complex coarse solve: a nonlinear eigenvalue seed λ = iω has Im(λ²) = 0, but
+  // the corresponding full-domain imaginary mass term becomes nonzero once Re(λ) != 0.
+  // Its off-diagonal block graph must exist before the first symbolic factorization. Use
+  // the same rule for real-approximate coarse solves to keep this hierarchy assembly
+  // independent of the chosen sparse-solver representation. Fine partial-assembly levels
+  // have no symbolic structure to preserve, so exact-zero terms are omitted there.
+  BilinearForm coarse(fespaces.GetFESpaceAtLevel(0));
+  AddConfiguredIntegrators(coarse, df, f, dfb, fb, fp, assemble_q_data);
+  std::vector<std::unique_ptr<Operator>> ops;
+  ops.reserve(fespaces.GetNumLevels());
+  ops.push_back(coarse.Assemble(skip_zeros));
+  if (fespaces.GetNumLevels() > 1)
+  {
+    BilinearForm fine(fespaces.GetFinestFESpace());
+    AddIntegrators(fine, df, f, dfb, fb, fp, assemble_q_data);
+    auto fine_ops = fine.Assemble(fespaces, skip_zeros, 1);
+    for (auto &op : fine_ops)
+    {
+      ops.push_back(std::move(op));
+    }
+  }
+  return ops;
 }
 
 auto AssembleAuxOperators(const FiniteElementSpaceHierarchy &fespaces,
                           const MaterialPropertyCoefficient *f,
                           const MaterialPropertyCoefficient *fb, bool skip_zeros = false,
-                          bool assemble_q_data = false, std::size_t l0 = 0)
+                          bool assemble_q_data = false)
 {
-  BilinearForm a(fespaces.GetFinestFESpace());
-  AddAuxIntegrators(a, f, fb, assemble_q_data);
-  return a.Assemble(fespaces, skip_zeros, l0);
+  // Match the configured coarse-support policy of the primary hierarchy above.
+  BilinearForm coarse(fespaces.GetFESpaceAtLevel(0));
+  AddConfiguredAuxIntegrators(coarse, f, fb, assemble_q_data);
+  std::vector<std::unique_ptr<Operator>> ops;
+  ops.reserve(fespaces.GetNumLevels());
+  ops.push_back(coarse.Assemble(skip_zeros));
+  if (fespaces.GetNumLevels() > 1)
+  {
+    BilinearForm fine(fespaces.GetFinestFESpace());
+    AddAuxIntegrators(fine, f, fb, assemble_q_data);
+    auto fine_ops = fine.Assemble(fespaces, skip_zeros, 1);
+    for (auto &op : fine_ops)
+    {
+      ops.push_back(std::move(op));
+    }
+  }
+  return ops;
 }
 
 }  // namespace
@@ -368,9 +451,12 @@ SpaceOperator::GetStiffnessMatrix(Operator::DiagonalPolicy diag_policy)
       fb(mat_op.MaxCeedBdrAttribute()), fc(mat_op.MaxCeedAttribute());
   AddStiffnessCoefficients(1.0, df, f);
   AddStiffnessBdrCoefficients(1.0, fb);
-  AddRealPeriodicCoefficients(1.0, f);
-  AddImagPeriodicCoefficients(1.0, fc);
-  int empty[2] = {(df.empty() && f.empty() && fb.empty()), (fc.empty())};
+  if (!mat_op.HasFloquetFrequencyScaling())
+  {
+    AddRealPeriodicCoefficients(1.0, f);
+    AddImagPeriodicCoefficients(1.0, fc);
+  }
+  int empty[2] = {AreExactlyZero(df, f, fb), fc.IsExactlyZero()};
   Mpi::GlobalMin(2, empty, GetComm());
   if (empty[0] && empty[1])
   {
@@ -410,16 +496,21 @@ SpaceOperator::GetDampingMatrix(Operator::DiagonalPolicy diag_policy)
   PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
   MaterialPropertyCoefficient f(mat_op.MaxCeedAttribute()),
       fb(mat_op.MaxCeedBdrAttribute());
+  MaterialPropertyCoefficient fp(mat_op.MaxCeedAttribute());
   AddDampingCoefficients(1.0, f);
   AddDampingBdrCoefficients(1.0, fb);
-  int empty = (f.empty() && fb.empty());
+  if (mat_op.HasFloquetFrequencyScaling())
+  {
+    AddImagPeriodicCoefficients(1.0, fp);
+  }
+  int empty = AreExactlyZero(f, fb, fp);
   Mpi::GlobalMin(1, &empty, GetComm());
   if (empty)
   {
     return {};
   }
   constexpr bool skip_zeros = false;
-  auto c = AssembleOperator(GetNDSpace(), nullptr, &f, nullptr, &fb, nullptr, skip_zeros);
+  auto c = AssembleOperator(GetNDSpace(), nullptr, &f, nullptr, &fb, &fp, skip_zeros);
   if constexpr (std::is_same<OperType, ComplexOperator>::value)
   {
     auto C = std::make_unique<ComplexParOperator>(std::move(c), nullptr, GetNDSpace());
@@ -442,11 +533,15 @@ std::unique_ptr<OperType> SpaceOperator::GetMassMatrix(Operator::DiagonalPolicy 
       fbr(mat_op.MaxCeedBdrAttribute()), fbi(mat_op.MaxCeedBdrAttribute());
   AddRealMassCoefficients(1.0, fr);
   AddRealMassBdrCoefficients(1.0, fbr);
+  if (mat_op.HasFloquetFrequencyScaling())
+  {
+    AddRealPeriodicCoefficients(-1.0, fr);
+  }
   if constexpr (std::is_same<OperType, ComplexOperator>::value)
   {
     AddImagMassCoefficients(1.0, fi);
   }
-  int empty[2] = {(fr.empty() && fbr.empty()), (fi.empty() && fbi.empty())};
+  int empty[2] = {AreExactlyZero(fr, fbr), AreExactlyZero(fi, fbi)};
   Mpi::GlobalMin(2, empty, GetComm());
   if (empty[0] && empty[1])
   {
@@ -481,12 +576,20 @@ template <typename OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetExtraSystemMatrix(double omega, Operator::DiagonalPolicy diag_policy)
 {
+  return GetExtraSystemMatrix<OperType>(omega, diag_policy, /*include_wave_ports=*/true);
+}
+
+template <typename OperType>
+std::unique_ptr<OperType>
+SpaceOperator::GetExtraSystemMatrix(double omega, Operator::DiagonalPolicy diag_policy,
+                                    bool include_wave_ports)
+{
   PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
   MaterialPropertyCoefficient dfbr(mat_op.MaxCeedBdrAttribute()),
       dfbi(mat_op.MaxCeedBdrAttribute()), fbr(mat_op.MaxCeedBdrAttribute()),
       fbi(mat_op.MaxCeedBdrAttribute());
-  AddExtraSystemBdrCoefficients(omega, dfbr, dfbi, fbr, fbi);
-  int empty[2] = {(dfbr.empty() && fbr.empty()), (dfbi.empty() && fbi.empty())};
+  AddExtraSystemBdrCoefficients(omega, dfbr, dfbi, fbr, fbi, include_wave_ports);
+  int empty[2] = {AreExactlyZero(dfbr, fbr), AreExactlyZero(dfbi, fbi)};
   Mpi::GlobalMin(2, empty, GetComm());
   if (empty[0] && empty[1])
   {
@@ -518,13 +621,276 @@ SpaceOperator::GetExtraSystemMatrix(double omega, Operator::DiagonalPolicy diag_
   }
 }
 
+std::unique_ptr<ComplexOperator>
+SpaceOperator::GetExtraSystemMatrix(std::complex<double> omega,
+                                    Operator::DiagonalPolicy diag_policy)
+{
+  // Complex-ω A2(λ) for the eigenmode nonlinear solve: identical assembly to the real-ω
+  // overload but the frequency-dependent boundary terms (2nd-order ABC, surface
+  // conductivity, rational impedance, numeric wave ports) are evaluated at the genuinely
+  // complex frequency (ω = -i·λ). Always returns a ComplexOperator since these terms
+  // carry a real-slot contribution at complex ω.
+  PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
+  MaterialPropertyCoefficient dfbr(mat_op.MaxCeedBdrAttribute()),
+      dfbi(mat_op.MaxCeedBdrAttribute()), fbr(mat_op.MaxCeedBdrAttribute()),
+      fbi(mat_op.MaxCeedBdrAttribute());
+  AddExtraSystemBdrCoefficients(omega, dfbr, dfbi, fbr, fbi);
+  int empty[2] = {AreExactlyZero(dfbr, fbr), AreExactlyZero(dfbi, fbi)};
+  Mpi::GlobalMin(2, empty, GetComm());
+  if (empty[0] && empty[1])
+  {
+    return {};
+  }
+  constexpr bool skip_zeros = false;
+  std::unique_ptr<Operator> ar, ai;
+  if (!empty[0])
+  {
+    ar = AssembleOperator(GetNDSpace(), nullptr, nullptr, &dfbr, &fbr, nullptr, skip_zeros);
+  }
+  if (!empty[1])
+  {
+    ai = AssembleOperator(GetNDSpace(), nullptr, nullptr, &dfbi, &fbi, nullptr, skip_zeros);
+  }
+  auto A = std::make_unique<ComplexParOperator>(std::move(ar), std::move(ai), GetNDSpace());
+  A->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+  return A;
+}
+
+template <typename OperType>
+std::unique_ptr<OperType>
+SpaceOperator::GetWavePortBoundaryMassMatrix(int port_idx,
+                                             Operator::DiagonalPolicy diag_policy)
+{
+  // Per-port μ⁻¹ boundary mass matrix, ω-independent — see
+  // WavePortOperator::AddBoundaryMassBdrCoefficients. Pure imaginary part of A2(ω) when
+  // the per-ω scalar i·k_n(ω) is reattached.
+  PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
+  MaterialPropertyCoefficient fb(mat_op.MaxCeedBdrAttribute());
+  wave_port_op.AddBoundaryMassBdrCoefficients(port_idx, fb);
+  int empty = fb.IsExactlyZero();
+  Mpi::GlobalMin(1, &empty, GetComm());
+  if (empty)
+  {
+    return {};
+  }
+  constexpr bool skip_zeros = false;
+  auto m =
+      AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
+  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  {
+    auto M_op = std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+  else
+  {
+    auto M_op = std::make_unique<ParOperator>(std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+}
+
+template <typename OperType>
+std::unique_ptr<OperType>
+SpaceOperator::GetFarfieldBoundaryCurlCurlMatrix(Operator::DiagonalPolicy diag_policy,
+                                                 bool imag_slot)
+{
+  // ω-independent boundary curl-curl matrix M_ff for the 2nd-order farfield ABC, with unit
+  // coefficient. By default stored on the REAL slot of the resulting ComplexParOperator so
+  // that downstream BuildParSumOperator can scale it by an arbitrary complex coefficient
+  // (the real-ω path uses i·(0.5/ω); the complex-λ path uses -0.5/λ). With imag_slot=true
+  // it is placed on the IMAGINARY slot, matching the wave-port boundary-mass convention
+  // (the i in i·f(ω)·M baked in) so circuit synthesis can fold it in uniformly. Returns
+  // null if the farfield ABC order < 2 or it contributes no DoFs on any rank (the check is
+  // collective, so the null contract is rank-uniform).
+  PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
+  MaterialPropertyCoefficient df(mat_op.MaxCeedBdrAttribute());
+  farfield_op.AddExtraSystemBoundaryCurlCurlBdrCoefficients(1.0, df);
+  int empty = df.IsExactlyZero();
+  Mpi::GlobalMin(1, &empty, GetComm());
+  if (empty)
+  {
+    return {};
+  }
+  constexpr bool skip_zeros = false;
+  auto m =
+      AssembleOperator(GetNDSpace(), nullptr, nullptr, &df, nullptr, nullptr, skip_zeros);
+  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  {
+    auto M_op =
+        imag_slot
+            ? std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace())
+            : std::make_unique<ComplexParOperator>(std::move(m), nullptr, GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+  else
+  {
+    MFEM_VERIFY(!imag_slot,
+                "imag_slot is only meaningful for the ComplexOperator instantiation of "
+                "GetFarfieldBoundaryCurlCurlMatrix!");
+    auto M_op = std::make_unique<ParOperator>(std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+}
+
+template <typename OperType>
+std::unique_ptr<OperType>
+SpaceOperator::GetSurfaceConductivityBoundaryMatrix(int group_idx,
+                                                    Operator::DiagonalPolicy diag_policy)
+{
+  // ω-independent unit-coefficient boundary mass A_σ for surface-conductivity group
+  // group_idx, on the IMAGINARY slot (matching the wave-port convention). The full A2
+  // contribution at frequency ω is (i·ω/Z_g(ω))·A_σ; circuit synthesis factors out A_σ here
+  // and applies the scalar via a dispersion fit. Returns null if the group contributes no
+  // DoFs on any rank (the check is collective, so the null contract is rank-uniform).
+  PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
+  MaterialPropertyCoefficient fb(mat_op.MaxCeedBdrAttribute());
+  surf_sigma_op.AddBoundaryMassBdrCoefficients(static_cast<std::size_t>(group_idx), fb);
+  int empty = fb.IsExactlyZero();
+  Mpi::GlobalMin(1, &empty, GetComm());
+  if (empty)
+  {
+    return {};
+  }
+  constexpr bool skip_zeros = false;
+  auto m =
+      AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
+  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  {
+    auto M_op = std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+  else
+  {
+    auto M_op = std::make_unique<ParOperator>(std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+}
+
+template <typename OperType>
+std::unique_ptr<OperType> SpaceOperator::GetRationalImpedanceBoundaryMassMatrix(
+    int idx, Operator::DiagonalPolicy diag_policy, bool imag_slot)
+{
+  // λ-independent boundary mass matrix M_b for rational impedance boundary idx, with unit
+  // coefficient (including crack scaling). By default stored on the REAL slot so that
+  // downstream BuildParSumOperator can scale it by the arbitrary complex Robin coefficient
+  // g(λ) from GetRationalImpedanceOp().EvalRobinCoefficient(idx, λ) (the NLEPS HYBRID
+  // fit-or-freeze seed strategy). With imag_slot=true it is placed on the IMAGINARY slot,
+  // matching the wave-port boundary-mass convention (the i in i·f(ω)·M baked in, with
+  // f(ω) = g(iω)/i) so circuit synthesis can fold it in uniformly. Returns null if the
+  // boundary contributes no DoFs on any rank (the check is collective, so the null contract
+  // is rank-uniform).
+  PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
+  MaterialPropertyCoefficient fb(mat_op.MaxCeedBdrAttribute());
+  surf_rz_op.AddUnitBdrCoefficients(idx, fb);
+  int empty = fb.IsExactlyZero();
+  Mpi::GlobalMin(1, &empty, GetComm());
+  if (empty)
+  {
+    return {};
+  }
+  constexpr bool skip_zeros = false;
+  auto m =
+      AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
+  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  {
+    auto M_op =
+        imag_slot
+            ? std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace())
+            : std::make_unique<ComplexParOperator>(std::move(m), nullptr, GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+  else
+  {
+    MFEM_VERIFY(!imag_slot,
+                "imag_slot is only meaningful for the ComplexOperator instantiation of "
+                "GetRationalImpedanceBoundaryMassMatrix!");
+    auto M_op = std::make_unique<ParOperator>(std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+}
+
+template <typename OperType>
+std::unique_ptr<OperType>
+SpaceOperator::GetFloquetRobinBoundaryMassMatrix(int port_idx,
+                                                 Operator::DiagonalPolicy diag_policy)
+{
+  // ω-independent µ⁻¹ boundary mass for a single Floquet port's Robin BC, on the
+  // IMAGINARY slot (matching the wave-port / farfield convention: the i in i·γ₀·M is baked
+  // in). The full online contribution is i·γ₀(ω)·M_floquet, with γ₀ the specular (0,0)
+  // propagation constant. Returns null if the port contributes no DoFs on any rank (the
+  // check is collective, so the null contract is rank-uniform).
+  PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
+  const auto &port = floquet_port_op.GetPort(port_idx);
+  MaterialPropertyCoefficient fb(mat_op.MaxCeedBdrAttribute());
+  MaterialPropertyCoefficient muinv_func(mat_op.GetBdrAttributeToMaterial(),
+                                         mat_op.GetInvPermeability());
+  muinv_func.RestrictCoefficient(mat_op.GetCeedBdrAttributes(port.GetAttrList()));
+  fb.AddCoefficient(muinv_func.GetAttributeToMaterial(), muinv_func.GetMaterialProperties(),
+                    1.0);
+  int empty = fb.IsExactlyZero();
+  Mpi::GlobalMin(1, &empty, GetComm());
+  if (empty)
+  {
+    return {};
+  }
+  constexpr bool skip_zeros = false;
+  auto m =
+      AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
+  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  {
+    auto M_op = std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+  else
+  {
+    auto M_op = std::make_unique<ParOperator>(std::move(m), GetNDSpace());
+    M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
+    return M_op;
+  }
+}
+
 template <typename OperType, typename ScalarType>
 std::unique_ptr<OperType>
 SpaceOperator::GetSystemMatrix(ScalarType a0, ScalarType a1, ScalarType a2,
                                const OperType *K, const OperType *C, const OperType *M,
                                const OperType *A2)
 {
+  // When A2 is an abstract ComplexOperator (not a sparse ComplexParOperator), it cannot
+  // participate in BuildParSumOperator. Build the sparse KCM sum separately and add A2 via
+  // a non-owning SumComplexOperator.
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
+  {
+    if (A2 && !dynamic_cast<const ComplexParOperator *>(A2))
+    {
+      auto A_KCM = BuildParSumOperator({a0, a1, a2}, {K, C, M});
+      return std::make_unique<SumComplexOperator>(std::move(A_KCM), *A2);
+    }
+  }
   return BuildParSumOperator({a0, a1, a2, ScalarType{1}}, {K, C, M, A2});
+}
+
+std::unique_ptr<ComplexOperator>
+SpaceOperator::GetExtraSystemOperator(double omega, Operator::DiagonalPolicy diag_policy)
+{
+  auto A2 = GetExtraSystemMatrix<ComplexOperator>(omega, diag_policy);
+  auto F = floquet_port_op.GetExtraSystemOperator(omega);
+  if (A2 && F)
+  {
+    return std::make_unique<SumComplexOperator>(std::move(A2), std::move(F));
+  }
+  if (A2)
+  {
+    return A2;
+  }
+  return F;
 }
 
 std::unique_ptr<Operator> SpaceOperator::GetInnerProductMatrix(double a0, double a2,
@@ -592,7 +958,7 @@ void ProjectBdrCoefficientViaMassSolve(SumVectorCoefficient &fb, const LumpedPor
     fb_mass.AddMaterialProperty(mat_op.GetCeedBdrAttributes(elem->GetAttrList()), 1.0);
   }
   BilinearForm m_bdr(nd_fespace);
-  if (!fb_mass.empty())
+  if (!fb_mass.IsExactlyZero())
   {
     m_bdr.AddBoundaryIntegrator<VectorFEMassIntegrator>(fb_mass);
   }
@@ -650,8 +1016,9 @@ void ProjectBdrCoefficientViaMassSolve(SumVectorCoefficient &fb, const LumpedPor
 
 }  // namespace
 
+template <typename A3Type>
 void SpaceOperator::AssemblePreconditioner(
-    std::complex<double> a0, std::complex<double> a1, std::complex<double> a2, double a3,
+    std::complex<double> a0, std::complex<double> a1, std::complex<double> a2, A3Type a3,
     std::vector<std::unique_ptr<Operator>> &br_vec,
     std::vector<std::unique_ptr<Operator>> &br_aux_vec,
     std::vector<std::unique_ptr<Operator>> &bi_vec,
@@ -679,10 +1046,21 @@ void SpaceOperator::AssemblePreconditioner(
   AddImagMassCoefficients(a2.real(), fi);
   AddImagMassCoefficients(-a2.imag(), fr);
   AddExtraSystemBdrCoefficients(a3, dfbr, dfbi, fbr, fbi);
-  AddRealPeriodicCoefficients(a0.real(), fr);
-  AddRealPeriodicCoefficients(a0.imag(), fi);
-  AddImagPeriodicCoefficients(a0.real(), fpi);
-  AddImagPeriodicCoefficients(-a0.imag(), fpr);
+  if (mat_op.HasFloquetFrequencyScaling())
+  {
+    // k₀-based tensors: cross terms scale with a1, mass term with a2.
+    AddImagPeriodicCoefficients(a1.imag(), fpi);
+    AddImagPeriodicCoefficients(a1.real(), fpr);
+    AddRealPeriodicCoefficients(-a2.real(), fr);
+    AddRealPeriodicCoefficients(-a2.imag(), fi);
+  }
+  else
+  {
+    AddRealPeriodicCoefficients(a0.real(), fr);
+    AddRealPeriodicCoefficients(a0.imag(), fi);
+    AddImagPeriodicCoefficients(a0.real(), fpi);
+    AddImagPeriodicCoefficients(-a0.imag(), fpr);
+  }
   int empty[2] = {
       (dfr.empty() && fr.empty() && dfbr.empty() && fbr.empty() && fpr.empty()),
       (dfi.empty() && fi.empty() && dfbi.empty() && fbi.empty() && fpi.empty())};
@@ -703,8 +1081,9 @@ void SpaceOperator::AssemblePreconditioner(
   }
 }
 
+template <typename A3Type>
 void SpaceOperator::AssemblePreconditioner(
-    std::complex<double> a0, std::complex<double> a1, std::complex<double> a2, double a3,
+    std::complex<double> a0, std::complex<double> a1, std::complex<double> a2, A3Type a3,
     std::vector<std::unique_ptr<Operator>> &br_vec,
     std::vector<std::unique_ptr<Operator>> &br_aux_vec)
 {
@@ -718,7 +1097,14 @@ void SpaceOperator::AssemblePreconditioner(
   AddAbsMassCoefficients(pc_mat_shifted ? std::abs(a2.real()) : a2.real(), fr);
   AddRealMassBdrCoefficients(pc_mat_shifted ? std::abs(a2.real()) : a2.real(), fbr);
   AddExtraSystemBdrCoefficients(a3, dfbr, dfbr, fbr, fbr);
-  AddRealPeriodicCoefficients(a0.real(), fr);
+  if (mat_op.HasFloquetFrequencyScaling())
+  {
+    AddRealPeriodicCoefficients(-(pc_mat_shifted ? std::abs(a2.real()) : a2.real()), fr);
+  }
+  else
+  {
+    AddRealPeriodicCoefficients(a0.real(), fr);
+  }
   int empty = (dfr.empty() && fr.empty() && dfbr.empty() && fbr.empty());
   Mpi::GlobalMin(1, &empty, GetComm());
   if (!empty)
@@ -745,7 +1131,14 @@ void SpaceOperator::AssemblePreconditioner(
   AddAbsMassCoefficients(pc_mat_shifted ? std::abs(a2) : a2, fr);
   AddRealMassBdrCoefficients(pc_mat_shifted ? std::abs(a2) : a2, fbr);
   AddExtraSystemBdrCoefficients(a3, dfbr, dfbr, fbr, fbr);
-  AddRealPeriodicCoefficients(a0, fr);
+  if (mat_op.HasFloquetFrequencyScaling())
+  {
+    AddRealPeriodicCoefficients(-(pc_mat_shifted ? std::abs(a2) : a2), fr);
+  }
+  else
+  {
+    AddRealPeriodicCoefficients(a0, fr);
+  }
   int empty = (dfr.empty() && fr.empty() && dfbr.empty() && fbr.empty());
   Mpi::GlobalMin(1, &empty, GetComm());
   if (!empty)
@@ -757,10 +1150,10 @@ void SpaceOperator::AssemblePreconditioner(
   }
 }
 
-template <typename OperType, typename ScalarType>
+template <typename OperType, typename ScalarType, typename A3Type>
 std::unique_ptr<OperType> SpaceOperator::GetPreconditionerMatrix(ScalarType a0,
                                                                  ScalarType a1,
-                                                                 ScalarType a2, double a3)
+                                                                 ScalarType a2, A3Type a3)
 {
   // When partially assembled, the coarse operators can reuse the fine operator quadrature
   // data if the spaces correspond to the same mesh. When appropriate, we build the
@@ -905,13 +1298,41 @@ void SpaceOperator::AddExtraSystemBdrCoefficients(double omega,
                                                   MaterialPropertyCoefficient &dfbr,
                                                   MaterialPropertyCoefficient &dfbi,
                                                   MaterialPropertyCoefficient &fbr,
-                                                  MaterialPropertyCoefficient &fbi)
+                                                  MaterialPropertyCoefficient &fbi,
+                                                  bool include_wave_ports)
 {
   // Contribution for second-order farfield boundaries and finite conductivity boundaries.
   farfield_op.AddExtraSystemBdrCoefficients(omega, dfbr, dfbi);
   surf_sigma_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
+  surf_rz_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
 
-  // Contribution for numeric wave ports.
+  // Contribution for numeric wave ports. Skipped when the caller will apply the wave-port
+  // contribution separately via per-port operators (see GetWavePortBoundaryMassMatrix).
+  if (include_wave_ports)
+  {
+    wave_port_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
+  }
+
+  // Contribution for Floquet ports (Robin BC).
+  floquet_port_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
+}
+
+void SpaceOperator::AddExtraSystemBdrCoefficients(std::complex<double> omega,
+                                                  MaterialPropertyCoefficient &dfbr,
+                                                  MaterialPropertyCoefficient &dfbi,
+                                                  MaterialPropertyCoefficient &fbr,
+                                                  MaterialPropertyCoefficient &fbi)
+{
+  // Complex-ω overload for the eigenmode nonlinear solve and its matching preconditioner:
+  // all frequency-dependent boundary terms (2nd-order farfield ABC, surface conductivity,
+  // rational surface impedance, numeric wave ports) are evaluated at the genuinely complex
+  // frequency (ω = -i·λ) so the assembled A2(λ) is the exact analytic continuation. For
+  // real ω the operators' complex overloads reduce to their double overloads, except the
+  // wave-port term, which additionally carries the line attenuation -Im(k_n)·M on the
+  // real slot (the real-ω overload intentionally stamps only Re(k_n)).
+  farfield_op.AddExtraSystemBdrCoefficients(omega, dfbr, dfbi);
+  surf_sigma_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
+  surf_rz_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
   wave_port_op.AddExtraSystemBdrCoefficients(omega, fbr, fbi);
 }
 
@@ -961,8 +1382,7 @@ bool SpaceOperator::GetExcitationVector(int excitation_idx, double omega,
 }
 
 void SpaceOperator::GetLumpedPortExcitationVectorPrimaryEt(int port_idx,
-                                                           ComplexVector &Et_primary,
-                                                           bool zero_metal)
+                                                           ComplexVector &Et_primary)
 {
   const auto &data = GetLumpedPortOp().GetPort(port_idx);
 
@@ -984,15 +1404,11 @@ void SpaceOperator::GetLumpedPortExcitationVectorPrimaryEt(int port_idx,
   ProjectBdrCoefficientViaMassSolve(fb, data, mat_op, GetNDSpace(), GetComm(),
                                     Et_primary.Real());
 
-  if (zero_metal)
-  {
-    linalg::SetSubVector(Et_primary.Real(), GetNDDbcTDofLists().back(), 0.0);
-  }
+  linalg::SetSubVector(Et_primary.Real(), GetNDDbcTDofLists().back(), 0.0);
 }
 
 void SpaceOperator::GetLumpedPortExcitationVectorPrimaryHtcn(int port_idx,
-                                                             ComplexVector &Htcn_primary,
-                                                             bool zero_metal)
+                                                             ComplexVector &Htcn_primary)
 {
   const auto &data = lumped_port_op.GetPort(port_idx);
 
@@ -1014,10 +1430,46 @@ void SpaceOperator::GetLumpedPortExcitationVectorPrimaryHtcn(int port_idx,
   ProjectBdrCoefficientViaMassSolve(fb, data, mat_op, GetNDSpace(), GetComm(),
                                     Htcn_primary.Real());
 
-  if (zero_metal)
+  linalg::SetSubVector(Htcn_primary.Real(), GetNDDbcTDofLists().back(), 0.0);
+}
+
+void SpaceOperator::GetWavePortFieldVectorPrimaryEt(int port_idx, double omega_ref,
+                                                    ComplexVector &Et_primary)
+{
+  // Trigger (or refresh) the cross-section EVP at omega_ref. WavePortData::Initialize
+  // caches by omega so calling this is cheap if already initialised.
+  wave_port_op.GetWavePortKn(port_idx, omega_ref);
+  const auto &data = wave_port_op.GetPort(port_idx);
+
+  // Project the modal tangential E-field onto the parent ND space, restricted to the
+  // port boundary attributes. Real and imaginary parts are projected separately, since
+  // the full waveport mode is generally complex.
+  Et_primary.SetSize(GetNDSpace().GetTrueVSize());
+  Et_primary.UseDevice(true);
+  Et_primary = 0.0;
+
+  const auto &mesh = GetNDSpace().GetParMesh();
+  int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
+  mfem::Array<int> attr_marker;
+  mesh::AttrToMarker(bdr_attr_max, data.GetAttrList(), attr_marker);
+
+  GridFunction rhs_re(GetNDSpace());
+  GridFunction rhs_im(GetNDSpace());
+  rhs_re = 0.0;
+  rhs_im = 0.0;
   {
-    linalg::SetSubVector(Htcn_primary.Real(), GetNDDbcTDofLists().back(), 0.0);
+    auto fb_re = data.GetModeFieldCoefficientReal(1.0);
+    rhs_re.Real().ProjectBdrCoefficientTangent(*fb_re, attr_marker);
   }
+  {
+    auto fb_im = data.GetModeFieldCoefficientImag(1.0);
+    rhs_im.Real().ProjectBdrCoefficientTangent(*fb_im, attr_marker);
+  }
+  GetNDSpace().GetRestrictionMatrix()->Mult(rhs_re.Real(), Et_primary.Real());
+  GetNDSpace().GetRestrictionMatrix()->Mult(rhs_im.Real(), Et_primary.Imag());
+
+  linalg::SetSubVector(Et_primary.Real(), GetNDDbcTDofLists().back(), 0.0);
+  linalg::SetSubVector(Et_primary.Imag(), GetNDDbcTDofLists().back(), 0.0);
 }
 
 bool SpaceOperator::GetExcitationVector1(int excitation_idx, ComplexVector &RHS1)
@@ -1066,7 +1518,7 @@ bool SpaceOperator::AddExcitationVector1Internal(int excitation_idx, Vector &RHS
     return false;
   }
 
-  mfem::LinearForm rhs1(&GetNDSpace().Get());
+  mfem::ParLinearForm rhs1(&GetNDSpace().Get());
 
   // Add boundary integrators
   if (!empty[0])
@@ -1095,13 +1547,16 @@ bool SpaceOperator::AddExcitationVector2Internal(int excitation_idx, double omeg
   // the specified frequency.
   MFEM_VERIFY(RHS2.Size() == GetNDSpace().GetTrueVSize(),
               "Invalid T-vector size for AddExcitationVector2Internal!");
+  // Floquet port excitation: directly adds to RHS (not via boundary linear form).
+  bool nnz_floquet = floquet_port_op.AddExcitationVector(excitation_idx, omega, RHS2);
+
   SumVectorCoefficient fbr(GetMesh().SpaceDimension()), fbi(GetMesh().SpaceDimension());
   wave_port_op.AddExcitationBdrCoefficients(excitation_idx, omega, fbr, fbi);
   int empty = (fbr.empty() && fbi.empty());
   Mpi::GlobalMin(1, &empty, GetComm());
   if (empty)
   {
-    return false;
+    return nnz_floquet;
   }
   {
     mfem::LinearForm rhs2(&GetNDSpace().Get());
@@ -1160,6 +1615,36 @@ template std::unique_ptr<ComplexOperator>
 SpaceOperator::GetExtraSystemMatrix(double, Operator::DiagonalPolicy);
 
 template std::unique_ptr<Operator>
+SpaceOperator::GetExtraSystemMatrix(double, Operator::DiagonalPolicy, bool);
+template std::unique_ptr<ComplexOperator>
+SpaceOperator::GetExtraSystemMatrix(double, Operator::DiagonalPolicy, bool);
+
+template std::unique_ptr<Operator>
+SpaceOperator::GetWavePortBoundaryMassMatrix(int, Operator::DiagonalPolicy);
+template std::unique_ptr<ComplexOperator>
+SpaceOperator::GetWavePortBoundaryMassMatrix(int, Operator::DiagonalPolicy);
+
+template std::unique_ptr<Operator>
+SpaceOperator::GetFarfieldBoundaryCurlCurlMatrix(Operator::DiagonalPolicy, bool);
+template std::unique_ptr<ComplexOperator>
+SpaceOperator::GetFarfieldBoundaryCurlCurlMatrix(Operator::DiagonalPolicy, bool);
+
+template std::unique_ptr<Operator>
+SpaceOperator::GetSurfaceConductivityBoundaryMatrix(int, Operator::DiagonalPolicy);
+template std::unique_ptr<ComplexOperator>
+SpaceOperator::GetSurfaceConductivityBoundaryMatrix(int, Operator::DiagonalPolicy);
+
+template std::unique_ptr<Operator>
+SpaceOperator::GetRationalImpedanceBoundaryMassMatrix(int, Operator::DiagonalPolicy, bool);
+template std::unique_ptr<ComplexOperator>
+SpaceOperator::GetRationalImpedanceBoundaryMassMatrix(int, Operator::DiagonalPolicy, bool);
+
+template std::unique_ptr<Operator>
+SpaceOperator::GetFloquetRobinBoundaryMassMatrix(int, Operator::DiagonalPolicy);
+template std::unique_ptr<ComplexOperator>
+SpaceOperator::GetFloquetRobinBoundaryMassMatrix(int, Operator::DiagonalPolicy);
+
+template std::unique_ptr<Operator>
 SpaceOperator::GetSystemMatrix<Operator, double>(double, double, double, const Operator *,
                                                  const Operator *, const Operator *,
                                                  const Operator *);
@@ -1170,9 +1655,16 @@ SpaceOperator::GetSystemMatrix<ComplexOperator, std::complex<double>>(
     const ComplexOperator *);
 
 template std::unique_ptr<Operator>
-SpaceOperator::GetPreconditionerMatrix<Operator, double>(double, double, double, double);
+SpaceOperator::GetPreconditionerMatrix<Operator, double, double>(double, double, double,
+                                                                 double);
 template std::unique_ptr<ComplexOperator>
-SpaceOperator::GetPreconditionerMatrix<ComplexOperator, std::complex<double>>(
+SpaceOperator::GetPreconditionerMatrix<ComplexOperator, std::complex<double>, double>(
     std::complex<double>, std::complex<double>, std::complex<double>, double);
+template std::unique_ptr<ComplexOperator>
+    SpaceOperator::GetPreconditionerMatrix<ComplexOperator, std::complex<double>,
+                                           std::complex<double>>(std::complex<double>,
+                                                                 std::complex<double>,
+                                                                 std::complex<double>,
+                                                                 std::complex<double>);
 
 }  // namespace palace

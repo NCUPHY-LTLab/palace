@@ -7,6 +7,19 @@ SPDX-License-Identifier: Apache-2.0
 
 # Reference
 
+*Palace* calculates solutions of Maxwell's equation for six different "Problem Types":
+
+  - Electrostatics: time-independent voltage sources,
+  - Magnetostatics: time-independent current sources,
+  - Driven: monochromatic excitations ``\bm{U}^{inc}(f)``,
+  - Eigenmode: resonances of the system,
+  - Transient: time-dependent excitations ``\bm{U}^{inc}(t)``,
+  - Boundary mode: guided modes on a waveguide cross section.
+
+Here, we will summarize the mathematics of each, provide a description of boundary conditions, and
+specify convention choices. This should be read in conjunction with the [User
+Guide](guide/guide.md) and [Configuration File](config/config.md) documentation.
+
 ## Mathematical background
 
 The solver computes a finite element approximation to the three-dimensional, time-harmonic
@@ -170,62 +183,115 @@ The eigenmodes are normalized such that they have unit norm and their mean phase
 
 ## Lumped ports and wave ports
 
-For lumped port boundaries, the surface impedance can be related to an equivalent circuit
-impedance, ``Z``. There are two common cases:
+Ports have two effects. First, they impose a boundary condition that relates the electric and
+magnetic fields on the surface. Second, for the driven and transient solver, they can excite the
+system with an incident field.
 
- 1. *Rectangular ports*: ``Z = Z_s l / w``, where ``l`` and ``w`` are the length and width
-    of the port, respectively (length here is defined as the distance between the two
-    conductors).
+For lumped ports, the boundary condition is an impedance condition as described above — tangential
+fields satisfy ``\bm{E}_t = Z_s \bm{H}_t \times \bm{n}``. Here ``Z_s`` is the physical surface
+impedance (per square) and ``\bm{n}`` the port normal. The excitation modes ``\bm{E}^{inc}`` are
+analytically specified.
 
- 2. *Coaxial ports*: ``Z = Z_s \ln(b/a) / 2\pi``, where ``a`` and ``b`` denote the inner and
-    outer radii of the port, respectively.
+For wave ports, a solver performs eigenmode simulations on the boundary to find supported modes of a
+transmission line with the wave-port cross section. The boundary modes will be used to relate
+``\bm{E}`` and ``\bm{H}``, which will only be impedance-like for TEM, TE or TM modes. Additionally,
+users can choose which of the found modes to excite.
 
-A lumped parallel RLC circuit boundary has a circuit impedance
+We normalize port fields so the total power flow is ``\vert P^{inc} \vert = 1~\mathrm{W}``, where
 
-```math
-\frac{1}{Z} = \frac{1}{R}+\frac{1}{i\omega L}+i\omega C \,.
-```
-
-Thus, the relationships between the circuit and surface element parameters for the user to
-specify are given by ``R_s = \alpha R``, ``L_s = \alpha L``, and ``C_s = C/\alpha``, where
-``\alpha = w/l`` for a rectangular port or ``\alpha = 2\pi / \ln(b/a)`` for a coaxial
-port.
-
-For multielement lumped ports, the effective circuit impedance is given by
+*Palace* uses peak phasors for this convention, so ``P^{inc}`` is twice the time-averaged power for
+a propagating mode.
 
 ```math
-\frac{1}{Z} = \sum_k \frac{1}{Z_k} \,.
+P^{inc} = V^{inc} [I^{inc}]^*  = \sum_e \int_{\Gamma_e} dS_e \,  \bm{n}_e \cdot (\bm{E}_e^{inc} \times [\bm{H}_e^{inc}]^*).
 ```
 
-That is, the circuit impedances of each port contributing to the multielement port add in
-parallel. For the specific case of a two element multielement port with two identical
-lumped elements, we have ``Z = (1/Z_1 + 1/Z_2)^{-1} = Z_k / 2``, where ``Z_k`` is the
-circuit impedance of a single port element.
+Here we have allowed for the possibility that a port can be made of disjoint surface elements ``e``,
+which separately contribute to the Poynting vector.
+
+There is an additional normalization related to voltages and currents. For AC simulations of
+microwave networks, circuit ``V`` and ``I`` are not generally well defined and have to be fixed by
+convention [[11, 12]](#References). This is tantamount to relating the circuit characteristic impedance
+
+```math
+Z = \frac{V^{inc}}{I^{inc}} = \frac{\vert V^{inc} \vert^2}{[P^{inc}]^*},
+```
+
+to the physical surface (wave) impedance ``Z_s``. We discuss this for each port type below.
+
+### Lumped Ports
+
+Lumped ports in *Palace* can be composed of two types of elements:
+
+ 1. *Rectangular*: The incident field is ``\bm{E}^{inc} = E_0 \, \hat{\bm{l}}``. Here ``E_0`` is a
+    normalization constant and ``\hat{\bm{l}}`` is the user-defined polarization direction, which
+    should point between two conductors. We denote the length of the port along the polarization as
+    ``l`` and the perpendicular width as ``w``.
+
+ 2. *Coaxial*: ``\bm{E}^{inc} = {E_0 r_0} \hat{\bm{r}} / {r}``, where ``E_0 r_0`` is a
+    normalization constant, ``r`` is the distance from the port center, and ``\hat{\bm{r}}`` is the
+    unit radial vector. We denote the inner and outer radii as ``a`` and ``b``.
+
+We define the voltage across each element as averages over the area, rather than line integrals. For
+an electric field ``\bm{E}``, the voltage across element ``e`` is:
+
+ 1. *Rectangular*: ``V_{e} = \int_{\Gamma_e}dS\, \bm{E} \cdot\hat{\bm{l}}_e / w_e``,
+
+ 2. *Coaxial*: ``V_{e} = \int_{\Gamma_e}dS\, \bm{E} \cdot\hat{\bm{r}}_e / (2 \pi r)``.
+
+This is a convention choice. For electrostatics or for TEM and TM transmission lines, the voltage in
+the port plane is path-independent between different conductors; in general, it is not.
+
+The power normalization and voltage convention now fix the coefficients ``E_0, r_0`` in the port
+definition and relate the physical surface impedance to the circuit impedance. For each element:
+
+ 1. *Rectangular*: ``Z = Z_s l / w``,
+
+ 2. *Coaxial*: ``Z = Z_s \ln(b/a) / (2\pi)``,
+
+which we also write as ``Z = Z_s / \alpha``  where ``\alpha = w/l`` or ``\alpha = 2\pi / \ln(b/a)``
+respectively. If ``Z`` is a combination of LRC responses, these add in parallel
+
+```math
+\frac{1}{Z} = \frac{1}{R}+\frac{1}{i\omega L}+i\omega C.
+```
+
+Specifically, ``R_s = \alpha R``, ``L_s = \alpha L``, and ``C_s = C/\alpha``.
+
+In the configuration file, a user specifies either ``L``, ``R``, ``C``, corresponding to ``Z``, or
+``L_s``, ``R_s``, ``C_s`` corresponding to ``Z_s``. For a single-element port, these will just be
+converted using the single scale factor ``\alpha``. For a multi-element port, we require impedances
+to add in parallel ``{1}/{Z} = \sum_e {1}/{Z_e}``, so that each element sees the same voltage.
+Specifying a lumped ``Z`` in the config means that each element ``e`` can have a different physical
+surface impedance depending on their shape ``\alpha_e``:
+
+```math
+Z_{s, e} = n_\mathrm{elem} \alpha_{e} Z.
+```
+
+Conversely, specifying ``Z_s`` means elements of different shape will have different ``Z_e``.
 
 The source term ``\bm{U}^{inc}`` in a driven frequency-response problem is related to the
-incident field at an excited port boundary by
+tangential component of the incident field at an excited port boundary by
 
 ```math
-\bm{U}^{inc} = -2\gamma(\bm{n}\times\bm{E}^{inc})\times\bm{n}
+\bm{U}^{inc} = -2\gamma_{exc}(\bm{n}\times\bm{E}^{inc})\times\bm{n} \,, \qquad
+\gamma_{exc} = \frac{i\omega}{R_{ref}}
 ```
 
 where ``(\bm{n}\times\bm{E}^{inc})\times\bm{n}`` is just the projection of the excitation
-field onto the port surface. The incident fields for lumped ports depend on the port
-shape:
+field onto the port surface, and ``R_{ref}`` is the real reference resistance of the
+excited port: the port resistance ``R`` when ``R > 0``, or the impedance of free space
+``Z_0`` for a purely reactive port with ``R = 0`` (see the discussion of reactive port
+excitation below). The excitation coefficient ``\gamma_{exc}`` is in general distinct from
+the termination coefficient ``\gamma = i\omega/Z_s`` appearing in the Robin boundary
+condition, and the two coincide for a purely resistive port. The excitation amplitude is
+fixed at the unit-power mode normalization described above, ``1~\mathrm{W}``.
 
- 1. *Rectangular ports*: ``\bm{E}^{inc} = E_0 \, \hat{\bm{l}}``, where ``E_0`` is a uniform
-    constant field strength and ``\hat{\bm{l}}`` a unit vector defining the direction of
-    polarization on the port (typically should be the direction between the two conductors).
-
- 2. *Coaxial ports*: ``\bm{E}^{inc} = \frac{E_0 r_0}{r} \, \hat{\bm{r}}``, where ``E_0`` is
-    again a uniform constant field strength, ``r_0`` is a characteristic length for the
-    port, ``r`` is the distance from the port center, and ``\hat{\bm{r}}`` a unit vector
-    specifying the port radial direction.
-
-In the time domain formulation, the source term ``\bm{U}^{inc}`` appears as
+In the time-domain formulation, the source term ``\bm{U}^{inc}`` appears as
 
 ```math
-\bm{U}^{inc} = -2 Z_s^{-1}\left(\bm{n}\times\frac{\partial\bm{E}^{inc}}{\partial t}\right)
+\bm{U}^{inc} = -2 R_{ref}^{-1}\left(\bm{n}\times\frac{\partial\bm{E}^{inc}}{\partial t}\right)
     \times\bm{n} \,.
 ```
 
@@ -235,9 +301,99 @@ The incident field ``\bm{E}^{inc}(\bm{x},t)`` is
 \bm{E}^{inc}(\bm{x},t) = p(t)\bm{E}^{inc}(\bm{x})
 ```
 
-where ``\bm{E}^{inc}(\bm{x})`` is identical to the spatial excitation in the frequency
-domain formulation, and ``p(t)`` describes the temporal shape of the excitation. Possible
-options include a sinusoidal, Gaussian, modulated Gaussian, or step excitation.
+where ``\bm{E}^{inc}(\bm{x})`` is identical to the spatial excitation in the frequency domain
+formulation, and ``p(t)`` describes the temporal shape of the excitation. Possible options for
+[`config["Solver"]["Transient"]["Excitation"]`](config/reference.md#config-solver-transient-excitation)
+include a sinusoidal, Gaussian, modulated Gaussian, or step excitation.
+
+For AC simulations, a surface-current source and a resistive lumped port with the same geometry
+produce right-hand-side source terms with the same spatial form, up to an overall normalization. A
+surface-current source is normalized to unit current and only drives the right-hand side: it
+prescribes no boundary condition and provides no termination or dissipation. A lumped port is
+normalized to the unit incident power described above and also imposes its impedance (Robin)
+boundary condition, so a nonzero resistance allows energy to leave the model through the port. Thus,
+surface current should be used for an ideal nondissipative drive and a lumped port when a terminating
+impedance is part of the physical model.
+
+### Wave ports
+
+Numeric wave ports assume a field with known normal-direction dependence
+``\bm{E}(\bm{x}) = \bm{e}(\bm{x}_t)e^{ik_n x_n}`` where ``k_n`` is the propagation constant. For each operating
+frequency ``\omega``, a two-dimensional eigenvalue problem is solved on the port yielding the mode
+shapes ``\bm{e}_m`` and associated propagation constants ``k_{n,m}``. These are used in the full 3D
+model where the Robin port boundary condition has coefficient
+``\gamma = i\text{Re}\{k_{n,m}\}/\mu_r`` and the computed mode is used to compute the incident field in the
+source term ``\bm{U}^{inc}`` at excited ports.
+
+For more information on the implementation of numeric wave ports, see [[3]](#References).
+
+For a general waveguide mode, the circuit quantities ``V``, ``I``, and ``Z`` are not uniquely
+determined by the electromagnetic fields and must be fixed by convention [[11, 12]](#References). In contrast
+to lumped ports, where the voltage is defined as an area-averaged integral with a specific analytic
+form, wave port ``V`` and ``I`` are obtained from line integrals on the port cross-section. The
+wave port configuration uses [`"VoltagePath"`](config/reference.md#config-boundaries-waveport-voltagepath) for
+``V`` and mode polarity, while
+[boundary-mode impedance postprocessing](config/reference.md#config-boundaries-postprocessing-impedance)
+can additionally define a current path for ``I``.
+
+**Voltage.** The mode voltage is defined as a path integral of the electric field:
+
+```math
+V = \int_\mathcal{C} \bm{E} \cdot d\bm{l}
+```
+
+where ``\mathcal{C}`` is a user-specified path between two conductors on the port cross-section. For
+TEM and TM modes, this integral depends only on the endpoints and not on the path between them; for
+TE and hybrid modes, it is path-dependent [[11]](#References).
+
+**Current.** The mode current is defined as a closed-loop path integral of the in-plane magnetic
+field:
+
+```math
+I = \oint_\mathcal{L} \bm{H}_t \cdot d\bm{l}
+```
+
+where ``\mathcal{L}`` is a user-specified closed contour encircling one conductor. The in-plane
+magnetic field ``\bm{H}_t = \mu_r^{-1}\bm{B}_t`` is obtained from the mode fields via
+
+```math
+\bm{B}_t = -\frac{k_n}{\omega}(\hat{\bm{n}}\times\bm{E}_t)
+    + \frac{1}{i\omega}(\nabla_t E_n \times\hat{\bm{n}})
+```
+
+where ``\hat{\bm{n}}`` is the port normal (propagation direction), ``k_n`` is the propagation
+constant, ``\bm{E}_t`` the transverse electric field, and ``E_n`` the normal (longitudinal) electric
+field component on the port.
+
+**Impedance.** The *power-voltage* characteristic impedance is defined as
+
+```math
+Z_{PV} = \frac{|V|^2}{P}
+```
+
+where ``P = \int_\Gamma\text{Re}\{(\bm{E}\times\bm{H}^*)\cdot\hat{\bm{n}}\}\,dS`` is the
+peak-phasor power flux through the port cross-section, equal to twice the time-averaged power. For
+TEM modes with a voltage path between the two conductors, ``Z_{PV}`` reduces to the conventional TEM
+characteristic impedance. For wave ports, ``Z_{PV}`` is reported when `"VoltagePath"` is
+specified.
+
+As a diagnostic, boundary-mode impedance postprocessing also reports the *voltage-current*
+impedance magnitude when a current path is specified:
+
+```math
+Z_{VI} = |V| / |I|
+```
+
+where ``V`` and ``I`` are computed independently from different paths. Note that independently
+specifying both voltage and current does not in general define a valid characteristic impedance [[11]](#References).
+For TEM modes ``Z_{VI} = Z_{PV}``; for other modes they will generally differ.
+
+The normal convention ``+\hat{\bm{n}}`` is the outward mesh normal. The mode eigenvalue gives
+``\text{Re}\{k_n\}\ge 0``, corresponding to forward propagation in the ``+\hat{\bm{n}}`` direction.
+De-embedding ``\tilde{S}_{ij} = S_{ij}e^{ik_{n,i}d_i}e^{ik_{n,j}d_j}`` uses positive ``d`` to shift
+the reference plane toward the device (removing waveguide), consistent with [[12]](#References).
+
+### Scattering Parameters
 
 In the frequency domain, the scattering parameters can be postprocessed from the computed
 electric field for each lumped port with boundary ``\Gamma_i`` as
@@ -247,26 +403,172 @@ S_{ij} = \frac{\displaystyle\int_{\Gamma_i}\bm{E}\cdot\bm{E}^{inc}_i\,dS}
     {\displaystyle\int_{\Gamma_i}\bm{E}^{inc}_i\cdot\bm{E}^{inc}_i\,dS} - \delta_{ij} \,.
 ```
 
+For a resistive excited port, the incident field ``\bm{E}^{inc}`` is normalized so that the
+power integrated over the port boundary is unity, referenced to the port resistance
+``R = R_{ref}``, and the excitation and termination coefficients coincide. A lumped port
+with nonzero inductance and/or capacitance may also be excited. In that case the port's
+full ``R``, ``L``, and ``C`` still enter the system matrix as a physical parallel
+termination through ``\gamma = i\omega/Z_s`` with the complex ``Z_s(\omega)``, while the
+source term is assembled with the real ``\gamma_{exc} = i\omega/R_{ref}`` defined above
+(``R_{ref} = Z_0 \approx 376.7~\Omega`` for a purely reactive port with ``R = 0``); the
+port reactance therefore acts on the solution through the termination, not through the
+drive normalization. The
+scattering parameters at resistive ports (observation or drive) retain their standard power-wave
+interpretation. For a purely reactive drive port (``R = 0``), the reported ``S_{ii}`` is related
+to the loaded port impedance by
+
+```math
+S_{ii} + 1 = \frac{2\,Z_{\text{loaded}}}{Z_0}
+```
+
+where ``Z_{\text{loaded}} = Z_p \parallel Z_{\text{struct}}`` is the parallel combination of
+the port impedance ``Z_p = (1/R + 1/(i\omega L) + i\omega C)^{-1}`` (zero-valued branches
+are omitted from the sum: the ``1/R`` term is dropped when ``R = 0``, and likewise for
+``L`` and ``C``) and the structure's input impedance at the port plane. This is a
+reciprocal, frequency-dependent quantity — but it is not bounded by unity and should not
+be interpreted as a power reflection coefficient. Transmission parameters ``S_{ji}``
+(``j \ne i``) between a reactive drive and a resistive observation port are
+real-reference-normalized transmission amplitudes: each side is normalized to its own real
+reference (``Z_0`` at the reactive drive, ``R_j`` at the resistive observation port), so a
+fixed ``\sqrt{R_j/Z_0}`` conversion factor separates them from a voltage-transfer ratio.
+They satisfy reciprocity (``S_{ji} = S_{ij}``). The same unit-reference projection applies
+to *passive* purely reactive lumped ports (``R = 0`` with ``L`` and/or ``C``) appearing as
+observation ports: their S-parameter rows are finite and referenced to ``Z_0``, rather
+than identically zero. Likewise, the incident voltage and current columns of the port
+postprocessing output (``V^{inc}``, ``I^{inc}``) at a purely reactive excited port are
+finite and referenced to ``Z_0`` — like the S-parameter row, they are bookkeeping
+quantities consistent with the assembled drive normalization, not physical incident
+waves (an ``R = 0`` port supports no incident traveling wave).
+
 In the time domain, the time histories of the port voltages can be Fourier-transformed to
 get their frequency domain representation for scattering parameter calculation.
 
-Numeric wave ports assume a field with known normal-direction dependence
-``\bm{E}(\bm{x}) = \bm{e}(\bm{x}_t)e^{ik_n x_n}`` where ``k_n`` is the propagation constant.
-For each operating frequency ``\omega``, a two-dimensional eigenvalue problem is solved on
-the port yielding the mode shapes ``\bm{e}_m`` and associated propagation constants
-``k_{n,m}``. These are used in the full 3D model where the Robin port boundary condition has
-coefficient ``\gamma = i\text{Re}\{k_{n,m}\}/\mu_r`` and the computed mode is used to
-compute the incident field in the source term ``\bm{U}^{inc}`` at excited ports. Scattering
-parameter postprocessing takes the same form as the lumped port counterpart using the
-computed modal solutions. Since the propagation constants are known for each wave port,
-scattering parameter de-embedding can be performed by specifying an offset distance ``d``
-for each port:
+For wave ports, since the propagation constants are known, we allow additional de-embedding by
+specifying an offset distance ``d`` for each wave port:
 
 ```math
 \tilde{S}_{ij} = S_{ij}e^{ik_{n,i}d_i}e^{ik_{n,j}d_j} \,.
 ```
 
-For more information on the implementation of numeric wave ports, see [[3]](#References).
+## Adaptive driven solver and reduced-order modeling
+
+The driven solver assembles a frequency-dependent linear system of the form
+
+```math
+\bm{A}(\omega)\bm{x} =
+\left[\bm{K} + i\omega\bm{C} - \omega^2\bm{M} + \bm{A}_2(\omega)\right]\bm{x}
+= i\omega\bm{b} + \bm{b}_2(\omega),
+```
+
+where ``\bm{x}`` contains the finite-element electric-field degrees of freedom.
+The matrices ``\bm{K}``, ``\bm{M}``, and ``\bm{C}`` represent the discretized curl-curl,
+displacement, and dissipative terms, respectively. The additional terms
+``\bm{A}_2(\omega)`` and ``\bm{b}_2(\omega)`` account for boundary conditions that are not
+quadratic in frequency, such as numeric wave ports or far-field boundaries.
+
+The adaptive driven solver constructs a projection-based reduced-order model (PROM) for this
+system. It seeks a real basis ``\bm{Q}\in\mathbb{R}^{N\times n}``, with ``n \ll N``, and
+projects the high-dimensional system onto that basis:
+
+```math
+\left[\bm{K}_r + i\omega\bm{C}_r - \omega^2\bm{M}_r\right]\bm{x}_r
+= i\omega\bm{b}_r,
+```
+
+with, for example, ``\bm{K}_r = \bm{Q}^T\bm{K}\bm{Q}`` and
+``\bm{b}_r = \bm{Q}^T\bm{b}``. Once the reduced system is solved, the high-dimensional field
+is recovered as ``\bm{x}\approx\bm{Q}\bm{x}_r``. The expensive part is the offline
+construction of ``\bm{Q}``; the online evaluation of the reduced system is cheap for many
+output frequencies. This follows the standard projection-based model-order-reduction
+framework [[7]](#References), [[8]](#References).
+
+The PROM basis is built from full high-dimensional model (HDM) solutions at selected
+internal sample frequencies. For each complex HDM solution ``\bm{x}^*``, *Palace* adds the
+orthogonalized real and imaginary components, ``\mathrm{Re}(\bm{x}^*)`` and
+``\mathrm{Im}(\bm{x}^*)``, as separate real basis vectors. The Gram-Schmidt
+orthogonalization variant is controlled by
+[`config["Solver"]["Driven"]["AdaptiveGSOrthogonalization"]`](config/reference.md#config-solver-driven),
+though most users should not need to change it.
+
+### Internal sample selection
+
+The remaining question is how to choose the internal sample frequencies. *Palace* uses a
+greedy sampling strategy based on minimal rational interpolation, following Pradovera
+[[9]](#References), [[10]](#References). For a linearized state ``\bm{u}(\omega)``, the
+interpolation has the barycentric form
+
+```math
+\bm{u}(\omega) =
+\frac{\sum_i w_i \bm{u}(\omega_i) / (\omega - \omega_i)}
+     {\sum_i w_i / (\omega - \omega_i)},
+```
+
+where ``\omega_i`` are already-sampled frequencies and ``w_i`` are fitted weights. For the
+quadratic ``KCM`` part of the driven system, *Palace* uses the linearized state
+``\bm{u}^T = (\bm{x}^T, i\omega\bm{x}^T)``. This is analogous to rewriting a second-order
+time system as a first-order system with twice as many state variables.
+
+Each excitation pattern gets its own rational interpolation for selecting future samples.
+The initial samples are the frequency-domain endpoints and any user-requested samples with
+[`"AddToPROM": true`](config/reference.md#config-solver-driven-samples). After
+that, the interpolation suggests the next sample from an error indicator that can be
+evaluated without another HDM solve. The selected HDM solution is then added to the shared
+PROM basis.
+
+### Convergence criterion
+
+At a proposed sample frequency ``f^*``, *Palace* compares the HDM solution against the PROM
+solution using
+
+```math
+\varepsilon =
+\frac{\|\bm{x}_\mathrm{HDM}(f^*) - \bm{x}_\mathrm{ROM}(f^*)\|}
+     {\|\bm{x}_\mathrm{HDM}(f^*)\|}.
+```
+
+Convergence is declared when this quantity is below
+[`config["Solver"]["Driven"]["AdaptiveTol"]`](config/reference.md#config-solver-driven) for
+[`config["Solver"]["Driven"]["AdaptiveConvergenceMemory"]`](config/reference.md#config-solver-driven)
+consecutive samples. The norm here is the finite-element coefficient-space L2 norm. It is
+related to, but not the same as, a physical energy norm such as
+``\int \bm{E}^*(\bm{r})\cdot\bm{E}(\bm{r})\,d^3r``. Consequently, the adaptive tolerance is
+not a strict relative-error bound for every derived quantity, such as S-parameters or domain
+energies.
+
+The indicator is also not a mathematical certificate of the maximum error over the entire
+frequency interval. The convergence memory mitigates accidental early termination when one
+suggested sample happens to fall below tolerance before the broader approximation has fully
+settled.
+
+### Multi-excitation simulations
+
+For multi-excitation driven simulations, *Palace* constructs a separate rational
+interpolation for each excitation, but the PROM basis ``\bm{Q}`` is shared across all
+excitations. Samples selected for earlier excitations can therefore improve the basis used
+for later excitations. `"AdaptiveMaxSamples"` is interpreted per excitation.
+
+### Non-quadratic boundary terms
+
+When non-quadratic frequency terms ``\bm{A}_2(\omega)`` are present, the HDM samples still
+include the full operator and the projected reduced problem uses the projected
+``\bm{A}_{2,r}(\omega)`` during online evaluation. This is more expensive than the purely
+quadratic case because the projected non-quadratic contribution has to be updated at output
+frequencies.
+
+The sample-selection interpolation is based on the quadratic linearization and does not
+fully represent arbitrary non-quadratic frequency dependence. If the non-quadratic
+contribution is large compared with the ``KCM`` part of the operator, the selected samples
+can be less effective and the adaptive solve may require tighter tolerances, more samples,
+or additional validation against a uniform sweep.
+
+### Finite-precision effects
+
+The rational interpolation assumes that the sampled HDM solutions are accurate. In practice,
+they inherit the error of the linear solver. If
+[`config["Solver"]["Linear"]["Tol"]`](config/reference.md#config-solver-linear) is too close
+to `"AdaptiveTol"`, the interpolation can become ill-conditioned and *Palace* may warn
+about rank-deficient minimal rational interpolation matrices. In that case, tighten the
+linear solver tolerance, loosen the adaptive tolerance, or validate with a uniform solve.
 
 ## Other boundary conditions
 
@@ -425,7 +727,7 @@ quality factor for interface ``j`` is given by
 where ``\bm{E}_n`` denotes the normal field to the interface and
 ``\bm{E}_t = \bm{E}-\bm{E}_n`` denotes the tangential field.
 
-## Lumped parameter extraction
+## Electrostatic Simulations
 
 For electrostatic simulations, the Maxwell capacitance matrix is computed in the following
 manner. First, the Laplace equation subject to Dirichlet boundary conditions is solved for
@@ -452,6 +754,8 @@ capacitance matrix, ``\bm{C}``, are given by
 ```math
 \bm{C}_{ij} = \mathcal{E}(V_i+V_j)-\frac{1}{2}(\bm{C}_{ii}+\bm{C}_{jj}) \,.
 ```
+
+## Magnetostatic Simulations
 
 Magnetostatic problems for inductance matrix extraction are based on the magnetic vector
 potential formulation:
@@ -598,15 +902,28 @@ previous section and implemented in *Palace*.
 
 ## References
 
-[1] J.-M. Jin, _The Finite Element Method in Electromagnetics_, Wiley-IEEE Press, Hoboken,
+[1] J.-M. Jin, *The Finite Element Method in Electromagnetics*, Wiley-IEEE Press, Hoboken,
 NJ, Third edition, 2014.\
-[2] P. Monk, _Finite Element Methods for Maxwell's Equations_, Oxford University Press,
+[2] P. Monk, *Finite Element Methods for Maxwell's Equations*, Oxford University Press,
 Oxford, 2003.\
 [3] L. Vardapetyan and L. Demkowicz, Full-wave analysis of dielectric waveguides at a given
-frequency, _Mathematics of Computation_ 72 (2003) 105-129.\
+frequency, *Mathematics of Computation* 72 (2003) 105-129.\
 [4] J. Wenner, R. Barends, R. C. Bialczak, et al., Surface loss of superconducting coplanar
-waveguide resonators, _Applied Physics Letters_ 99, 113513 (2011).\
-[5] S. Nicaise, On Zienkiewicz-Zhu error estimators for Maxwell’s equations, _Comptes Rendus
-Mathematique_ 340 (2005) 697-702.\
+waveguide resonators, *Applied Physics Letters* 99, 113513 (2011).\
+[5] S. Nicaise, On Zienkiewicz-Zhu error estimators for Maxwell’s equations, *Comptes Rendus Mathematique* 340 (2005) 697-702.\
 [6] J. A, Stratton and L. J. Chu, Diffraction theory of Electromagnetic
-Waves, _Physical Review_, 56, 1, (1939), 99-107.
+Waves, *Physical Review*, 56, 1, (1939), 99-107.\
+[7] P. Benner, D. C. Sorensen, and V. Mehrmann, Eds., _Dimension Reduction of
+Large-Scale Systems_, Lecture Notes in Computational Science and Engineering,
+vol. 45, Springer, 2005. doi: [10.1007/3-540-27909-1](https://doi.org/10.1007/3-540-27909-1).\
+[8] A. C. Antoulas, _Approximation of Large-Scale Dynamical Systems_, SIAM, (2005). doi:
+[10.1137/1.9780898718713](https://doi.org/10.1137/1.9780898718713).\
+[9] D. Pradovera, Toward a certified greedy Loewner framework with minimal
+sampling, _Advances in Computational Mathematics_ 49, 92 (2023). doi:
+[10.1007/s10444-023-10091-7](https://doi.org/10.1007/s10444-023-10091-7).\
+[10] D. Pradovera, Interpolatory rational model order reduction of parametric
+problems lacking uniform inf-sup stability, _SIAM Journal on Numerical
+Analysis_ 58 (2020) 2265-2293. doi:
+[10.1137/19M1269695](https://doi.org/10.1137/19M1269695).\
+[11] R. B. Marks and D. F. Williams, A general waveguide circuit theory, *J. Res. Natl. Inst. Stan.* 97, 533 (1992).\
+[12] D. M. Pozar, *Microwave engineering*, Fourth edition. John Wiley & Sons, Hoboken, NJ, 2012.
