@@ -21,8 +21,9 @@ Preparation records the delivered Git revision and tree separately from a manife
 The prepared bootstrap store is fixed at `preparations/<id>/spack-cache/bootstrap` and
 remains part of the immutable preparation. Each build job receives a separate writable
 cache at `versions/<id>/spack-cache/<slurm-job-id>`; Spack's source cache resolves below
-that job cache. The build receipt records all three effective paths without freezing
-the writable cache contents.
+that job cache, and its only build stage is the sibling `stage` directory. The build
+receipt records the effective user cache, source cache, build stage, and bootstrap
+root without freezing the writable cache contents.
 
 Preparation also requires the exact owner-provided Xmon archive through `CASE_BUNDLE`. It retains the archive unchanged, extracts only the verified configuration and mesh for execution, prepares four one-pointer comparison configurations, and copies the small public `cavity2d` eigenmode, electrostatic, driven, and transient examples. `cases/CASES.json` and the generated `cases/run-one.sh` are an unexecuted phase-2 harness, not durable tests.
 

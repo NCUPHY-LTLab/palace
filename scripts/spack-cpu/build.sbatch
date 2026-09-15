@@ -129,6 +129,7 @@ mkdir "$job_cache"
 export SPACK_USER_CACHE_PATH="$job_cache"
 bootstrap_root="$PREPARATION/spack-cache/bootstrap"
 source_cache="$job_cache/source"
+build_stage="$job_cache/stage"
 
 spack=$(find "$PREPARATION/spack-unpack" -mindepth 3 -maxdepth 3 -path '*/bin/spack' -type f -print -quit)
 [[ -x $spack ]] || fail "prepared Spack executable missing"
@@ -140,11 +141,14 @@ mkdir -p "$logs" "$version/stages"
 actual_user_cache=$("$python" "$spack" python -c 'import spack.paths; print(spack.paths.user_cache_path)')
 actual_source_cache=$("$python" "$spack" python -c 'import spack.caches; print(spack.caches.fetch_cache_location())')
 actual_bootstrap_root=$("$python" "$spack" bootstrap root)
+actual_build_stages=$("$python" "$spack" python -c 'import json, spack.config, spack.stage; value = spack.config.get("config:build_stage"); value = [value] if isinstance(value, str) else value; print(json.dumps(spack.stage._resolve_paths(value), separators=(",", ":")))')
 [[ $actual_user_cache == "$job_cache" ]] || fail "effective Spack user cache differs"
 [[ $actual_source_cache == "$source_cache" ]] || fail "effective Spack source cache differs"
 [[ $actual_bootstrap_root == "$bootstrap_root" ]] || fail "effective Spack bootstrap root differs"
-printf 'spack_user_cache_path=%s\nsource_cache=%s\nbootstrap_root=%s\n' \
-  "$actual_user_cache" "$actual_source_cache" "$actual_bootstrap_root" > "$logs/cache-paths-$SLURM_JOB_ID.txt"
+[[ $actual_build_stages == "[\"$build_stage\"]" ]] || fail "effective Spack build stages differ"
+printf 'spack_user_cache_path=%s\nsource_cache=%s\nbuild_stage=%s\nbootstrap_root=%s\n' \
+  "$actual_user_cache" "$actual_source_cache" "$build_stage" "$actual_bootstrap_root" \
+  > "$logs/cache-paths-$SLURM_JOB_ID.txt"
 chmod 0444 "$logs/cache-paths-$SLURM_JOB_ID.txt"
 phase=offline_verification
 "$python" "$spack" bootstrap status > "$logs/bootstrap-status.txt"
@@ -204,9 +208,9 @@ phase=install_manifest
 find "$version/store" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$completion_tmp/INSTALL-MANIFEST.sha256"
 find "$version/store" -type l -printf '%p -> %l\n' | LC_ALL=C sort | sha256sum > "$completion_tmp/INSTALL-LINKS.sha256"
 binary_sha=$(sha256sum "$binary" | awk '{print $1}')
-"$python" - "$completion_tmp/BUILD-RECEIPT.json" "$revision" "$site" "$SLURM_JOB_ID" "$SLURM_CPUS_PER_TASK" "$version/store" "$prefix" "$binary" "$binary_sha" "$ldd_sha" "$jit" "$libceed_prefix" "$openmpi_prefix" "$mpirun" "$prrte_prefix" "$pmix_prefix" "$gcc_prefix" "$job_cache" "$source_cache" "$bootstrap_root" "$PREPARATION" "$prepared_receipt_sha" "$prepared_plan_key" "$prepared_python_compatibility" "$build_python" "$python_log" "$python_log_sha" <<'PY'
+"$python" - "$completion_tmp/BUILD-RECEIPT.json" "$revision" "$site" "$SLURM_JOB_ID" "$SLURM_CPUS_PER_TASK" "$version/store" "$prefix" "$binary" "$binary_sha" "$ldd_sha" "$jit" "$libceed_prefix" "$openmpi_prefix" "$mpirun" "$prrte_prefix" "$pmix_prefix" "$gcc_prefix" "$job_cache" "$source_cache" "$build_stage" "$bootstrap_root" "$PREPARATION" "$prepared_receipt_sha" "$prepared_plan_key" "$prepared_python_compatibility" "$build_python" "$python_log" "$python_log_sha" <<'PY'
 import json, sys
-keys = ("preparation_revision", "site", "slurm_job_id", "slurm_cpus_per_task", "install_store", "palace_prefix", "palace_binary", "palace_binary_sha256", "ldd_sha256", "libceed_jit_source", "libceed_prefix", "openmpi_prefix", "mpirun", "prrte_prefix", "pmix_prefix", "gcc_prefix", "spack_user_cache_path", "source_cache", "bootstrap_root", "preparation", "prepared_receipt_sha256", "prepared_plan_key", "prepared_python_compatibility", "build_python", "build_python_log", "build_python_log_sha256")
+keys = ("preparation_revision", "site", "slurm_job_id", "slurm_cpus_per_task", "install_store", "palace_prefix", "palace_binary", "palace_binary_sha256", "ldd_sha256", "libceed_jit_source", "libceed_prefix", "openmpi_prefix", "mpirun", "prrte_prefix", "pmix_prefix", "gcc_prefix", "spack_user_cache_path", "source_cache", "build_stage", "bootstrap_root", "preparation", "prepared_receipt_sha256", "prepared_plan_key", "prepared_python_compatibility", "build_python", "build_python_log", "build_python_log_sha256")
 record = {"schema": 2, "state": "BUILD_COMPLETE", "semantic_state": "CONVERGING", "openmp_num_threads": 1, "openblas_num_threads": 1, "omp_proc_bind": "close", "omp_places": "cores"}
 record.update(dict(zip(keys, sys.argv[2:])))
 record["prepared_python_compatibility"] = json.loads(record["prepared_python_compatibility"])

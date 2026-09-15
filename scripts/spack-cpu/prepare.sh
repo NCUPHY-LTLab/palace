@@ -168,6 +168,8 @@ EOF
 cat > "$SPACK_USER_CONFIG_PATH/config.yaml" <<'EOF'
 config:
   source_cache: '$user_cache_path/source'
+  build_stage::
+  - '$user_cache_path/stage'
 EOF
 cat > "$SPACK_USER_CONFIG_PATH/bootstrap.yaml" <<EOF
 bootstrap:

@@ -166,7 +166,10 @@ def verify_preparation_cache_config(preparation, receipt):
     if configured != [str(bootstrap_root)]:
         raise RuntimeError("prepared bootstrap root configuration differs")
     source_cache = (preparation / "spack-config" / "config.yaml").read_text()
-    expected = "config:\n  source_cache: '$user_cache_path/source'\n"
+    expected = ("config:\n"
+                "  source_cache: '$user_cache_path/source'\n"
+                "  build_stage::\n"
+                "  - '$user_cache_path/stage'\n")
     if source_cache != expected:
         raise RuntimeError("prepared writable source-cache configuration differs")
 
@@ -311,6 +314,8 @@ def verify_built_artifacts(preparation, require_complete=False):
         raise RuntimeError("build writable cache identity differs")
     if receipt.get("source_cache") != str(job_cache / "source"):
         raise RuntimeError("build source-cache identity differs")
+    if receipt.get("build_stage") != str(job_cache / "stage"):
+        raise RuntimeError("build stage identity differs")
     if receipt.get("bootstrap_root") != prepared["bootstrap_root"]:
         raise RuntimeError("build bootstrap root identity differs")
     jit = Path(receipt["libceed_jit_source"])
