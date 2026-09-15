@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=palace-spack-build
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 : "${SLURM_JOB_ID:?submit this script with sbatch}"
 : "${SLURM_CPUS_PER_TASK:?SLURM_CPUS_PER_TASK is required}"
@@ -21,12 +22,40 @@ if json.load(open(sys.argv[1])).get("schema") != 2:
 PY
 logs="$PREPARATION/build-logs"
 mkdir -p "$logs"
+failure_receipt="$logs/failure-$SLURM_JOB_ID.tsv"
+[[ ! -e $failure_receipt ]] || { echo "build failure receipt already exists: $failure_receipt" >&2; exit 1; }
+phase=python_identity
+record_failure() {
+  local status=$1 line=$2
+  trap - ERR
+  set +e
+  umask 077
+  {
+    printf 'state\tBUILD_FAILED\n'
+    printf 'semantic_state\tCONVERGING\n'
+    printf 'slurm_job_id\t%s\n' "$SLURM_JOB_ID"
+    printf 'phase\t%s\n' "$phase"
+    printf 'line\t%s\n' "$line"
+    printf 'exit_status\t%s\n' "$status"
+    printf 'preparation\t%s\n' "$PREPARATION"
+    printf 'recorded_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$failure_receipt.tmp"
+  mv "$failure_receipt.tmp" "$failure_receipt"
+  chmod 0444 "$failure_receipt"
+  exit "$status"
+}
+trap 'status=$?; record_failure "$status" "$LINENO"' ERR
+fail() {
+  echo "$1" >&2
+  return "${2:-1}"
+}
 python_log="$logs/python-$SLURM_JOB_ID.json"
-[[ ! -e $python_log ]] || { echo "current Python log already exists: $python_log" >&2; exit 1; }
+[[ ! -e $python_log ]] || fail "current Python log already exists: $python_log"
 "$python" "$verify" python-identity > "$python_log"
 build_python=$(cat "$python_log")
 python_log_sha=$(sha256sum "$python_log" | awk '{print $1}')
 chmod 0444 "$python_log"
+phase=prepared_verification
 "$python" "$verify" prepared "$PREPARATION"
 
 readarray -t fields < <("$python" - "$PREPARATION/PREPARED.json" <<'PY'
@@ -61,6 +90,7 @@ else
 fi
 
 if [[ -f $version/BUILD-COMPLETE.sha256 ]]; then
+  phase=existing_build_verification
   "$python" "$verify" build "$PREPARATION"
   echo "verified existing complete build: $version"
   exit 0
@@ -69,16 +99,20 @@ lock_dir=$version/.build-writer
 if ! mkdir "$lock_dir" 2>/dev/null; then
   echo "another build owns this version; owner follows:" >&2
   cat "$lock_dir/owner.txt" >&2 2>/dev/null || true
-  exit 1
+  fail "build writer lock is unavailable"
 fi
 completion_tmp=$version/.completion.$SLURM_JOB_ID
+completion_marker=$version/.BUILD-COMPLETE.$SLURM_JOB_ID
 cleanup() {
   [[ ! -d $completion_tmp ]] || rm -rf -- "$completion_tmp"
   if [[ ! -f $version/BUILD-COMPLETE.sha256 ]]; then
     rm -f -- "$version/run-env.sh" "$version/ldd.txt" "$version/INSTALL-MANIFEST.sha256" \
-      "$version/INSTALL-LINKS.sha256" "$version/BUILD-RECEIPT.json"
+      "$version/INSTALL-LINKS.sha256" "$version/BUILD-RECEIPT.json" "$completion_marker"
   fi
-  if [[ -f $lock_dir/owner.txt ]] && [[ $(cat "$lock_dir/owner.txt") == "$SLURM_JOB_ID" ]]; then rm "$lock_dir/owner.txt" && rmdir "$lock_dir"; fi
+  if [[ -f $lock_dir/owner.txt ]] && [[ $(cat "$lock_dir/owner.txt") == "$SLURM_JOB_ID" ]]; then
+    rm -f -- "$lock_dir/owner.txt" || true
+    rmdir "$lock_dir" || true
+  fi
 }
 trap cleanup EXIT
 printf '%s\n' "$SLURM_JOB_ID" > "$lock_dir/owner.txt"
@@ -87,14 +121,32 @@ if [[ ! -f $version/BUILD-COMPLETE.sha256 ]]; then
     "$version/INSTALL-LINKS.sha256" "$version/BUILD-RECEIPT.json"
 fi
 
+phase=cache_setup
+job_cache="$version/spack-cache/$SLURM_JOB_ID"
+[[ ! -e $job_cache ]] || fail "build cache already exists: $job_cache"
+mkdir -p "$(dirname "$job_cache")"
+mkdir "$job_cache"
+export SPACK_USER_CACHE_PATH="$job_cache"
+bootstrap_root="$PREPARATION/spack-cache/bootstrap"
+source_cache="$job_cache/source"
+
 spack=$(find "$PREPARATION/spack-unpack" -mindepth 3 -maxdepth 3 -path '*/bin/spack' -type f -print -quit)
-[[ -x $spack ]] || { echo "prepared Spack executable missing" >&2; exit 1; }
+[[ -x $spack ]] || fail "prepared Spack executable missing"
 export SPACK_USER_CONFIG_PATH="$PREPARATION/spack-config"
-export SPACK_USER_CACHE_PATH="$PREPARATION/spack-cache"
 export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ftp_proxy=http://127.0.0.1:9
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy FTP_PROXY=$ftp_proxy NO_PROXY= no_proxy=
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores
 mkdir -p "$logs" "$version/stages"
+actual_user_cache=$("$python" "$spack" python -c 'import spack.paths; print(spack.paths.user_cache_path)')
+actual_source_cache=$("$python" "$spack" python -c 'import spack.caches; print(spack.caches.fetch_cache_location())')
+actual_bootstrap_root=$("$python" "$spack" bootstrap root)
+[[ $actual_user_cache == "$job_cache" ]] || fail "effective Spack user cache differs"
+[[ $actual_source_cache == "$source_cache" ]] || fail "effective Spack source cache differs"
+[[ $actual_bootstrap_root == "$bootstrap_root" ]] || fail "effective Spack bootstrap root differs"
+printf 'spack_user_cache_path=%s\nsource_cache=%s\nbootstrap_root=%s\n' \
+  "$actual_user_cache" "$actual_source_cache" "$actual_bootstrap_root" > "$logs/cache-paths-$SLURM_JOB_ID.txt"
+chmod 0444 "$logs/cache-paths-$SLURM_JOB_ID.txt"
+phase=offline_verification
 "$python" "$spack" bootstrap status > "$logs/bootstrap-status.txt"
 "$python" "$spack" -e "$environment" config get mirrors --json > "$logs/mirrors.json"
 "$python" "$verify" mirrors "$logs/mirrors.json" "file://$PREPARATION/source-mirror"
@@ -107,25 +159,32 @@ stage() {
   "$python" "$spack" -e "$environment" find --format '{name} {version} {hash}' > "$logs/$name.verify.txt"
   sha256sum "$logs/$name.log" "$logs/$name.verify.txt" > "$version/stages/$name.complete"
 }
+phase=compiler
 stage compiler "$python" "$spack" -e "$environment" install --only-concrete --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'gcc@=15.2.0'
+phase=dependencies
 stage dependencies "$python" "$spack" -e "$environment" install --only-concrete --only dependencies --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'local.palace@=0.18.0-scq'
+phase=palace
 stage palace "$python" "$spack" -e "$environment" install --only-concrete --only package --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'local.palace@=0.18.0-scq'
 
+phase=installed_locations
 prefix=$("$python" "$spack" -e "$environment" location -i 'local.palace@=0.18.0-scq')
-binary="$prefix/bin/palace"
-[[ -x $binary ]] || binary="$prefix/bin/palace-x86_64.bin"
-[[ -x $binary ]] || { echo "installed Palace executable not found in $prefix/bin" >&2; exit 1; }
-binary=$(realpath "$binary")
+prefix=$(realpath "$prefix")
+binary_path="$prefix/bin/palace-x86_64.bin"
+[[ -x $binary_path ]] || fail "installed Palace executable not found in $prefix/bin"
+"$python" "$verify" elf "$binary_path"
+binary=$(realpath "$binary_path")
+[[ $binary == "$prefix"/* ]] || fail "installed Palace executable resolves outside its prefix"
 libceed_prefix=$("$python" "$spack" -e "$environment" location -i libceed)
 jit="$libceed_prefix/include/ceed/jit-source"
-[[ -d $jit ]] && find "$jit" -type f -print -quit | grep -q . || { echo "libCEED JIT headers missing" >&2; exit 1; }
+[[ -d $jit ]] && find "$jit" -type f -print -quit | grep -q . || fail "libCEED JIT headers missing"
 openmpi_prefix=$("$python" "$spack" -e "$environment" location -i openmpi)
 prrte_prefix=$("$python" "$spack" -e "$environment" location -i prrte)
 pmix_prefix=$("$python" "$spack" -e "$environment" location -i pmix)
 gcc_prefix=$("$python" "$spack" -e "$environment" location -i 'gcc@=15.2.0')
 mpirun=$(realpath "$openmpi_prefix/bin/mpirun")
 [[ -x $mpirun && -x $gcc_prefix/bin/gcc ]]
-[[ ! -e $completion_tmp ]] || { echo "completion staging path already exists" >&2; exit 1; }
+phase=runtime_artifacts
+[[ ! -e $completion_tmp ]] || fail "completion staging path already exists"
 mkdir "$completion_tmp"
 "$python" "$spack" -e "$environment" load --sh 'local.palace@=0.18.0-scq' > "$completion_tmp/run-env.sh"
 cat >> "$completion_tmp/run-env.sh" <<EOF
@@ -138,20 +197,23 @@ export OMP_PROC_BIND=close
 export OMP_PLACES=cores
 EOF
 ldd "$binary" > "$completion_tmp/ldd.txt"
-! grep -q 'not found' "$completion_tmp/ldd.txt" || { echo "unresolved shared library" >&2; exit 1; }
+! grep -q 'not found' "$completion_tmp/ldd.txt" || fail "unresolved shared library"
+ldd_sha=$(sha256sum "$completion_tmp/ldd.txt" | awk '{print $1}')
 
+phase=install_manifest
 find "$version/store" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$completion_tmp/INSTALL-MANIFEST.sha256"
 find "$version/store" -type l -printf '%p -> %l\n' | LC_ALL=C sort | sha256sum > "$completion_tmp/INSTALL-LINKS.sha256"
 binary_sha=$(sha256sum "$binary" | awk '{print $1}')
-"$python" - "$completion_tmp/BUILD-RECEIPT.json" "$revision" "$site" "$SLURM_JOB_ID" "$SLURM_CPUS_PER_TASK" "$version/store" "$prefix" "$binary" "$binary_sha" "$jit" "$libceed_prefix" "$openmpi_prefix" "$mpirun" "$prrte_prefix" "$pmix_prefix" "$gcc_prefix" "$PREPARATION" "$prepared_receipt_sha" "$prepared_plan_key" "$prepared_python_compatibility" "$build_python" "$python_log" "$python_log_sha" <<'PY'
+"$python" - "$completion_tmp/BUILD-RECEIPT.json" "$revision" "$site" "$SLURM_JOB_ID" "$SLURM_CPUS_PER_TASK" "$version/store" "$prefix" "$binary" "$binary_sha" "$ldd_sha" "$jit" "$libceed_prefix" "$openmpi_prefix" "$mpirun" "$prrte_prefix" "$pmix_prefix" "$gcc_prefix" "$job_cache" "$source_cache" "$bootstrap_root" "$PREPARATION" "$prepared_receipt_sha" "$prepared_plan_key" "$prepared_python_compatibility" "$build_python" "$python_log" "$python_log_sha" <<'PY'
 import json, sys
-keys = ("preparation_revision", "site", "slurm_job_id", "slurm_cpus_per_task", "install_store", "palace_prefix", "palace_binary", "palace_binary_sha256", "libceed_jit_source", "libceed_prefix", "openmpi_prefix", "mpirun", "prrte_prefix", "pmix_prefix", "gcc_prefix", "preparation", "prepared_receipt_sha256", "prepared_plan_key", "prepared_python_compatibility", "build_python", "build_python_log", "build_python_log_sha256")
+keys = ("preparation_revision", "site", "slurm_job_id", "slurm_cpus_per_task", "install_store", "palace_prefix", "palace_binary", "palace_binary_sha256", "ldd_sha256", "libceed_jit_source", "libceed_prefix", "openmpi_prefix", "mpirun", "prrte_prefix", "pmix_prefix", "gcc_prefix", "spack_user_cache_path", "source_cache", "bootstrap_root", "preparation", "prepared_receipt_sha256", "prepared_plan_key", "prepared_python_compatibility", "build_python", "build_python_log", "build_python_log_sha256")
 record = {"schema": 2, "state": "BUILD_COMPLETE", "semantic_state": "CONVERGING", "openmp_num_threads": 1, "openblas_num_threads": 1, "omp_proc_bind": "close", "omp_places": "cores"}
 record.update(dict(zip(keys, sys.argv[2:])))
 record["prepared_python_compatibility"] = json.loads(record["prepared_python_compatibility"])
 record["build_python"] = json.loads(record["build_python"])
 open(sys.argv[1], "w").write(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
+phase=staged_artifact_verification
 "$python" - "$completion_tmp/INSTALL-MANIFEST.sha256" "$completion_tmp/INSTALL-LINKS.sha256" "$version/store" <<'PY'
 import hashlib, os, sys
 from pathlib import Path
@@ -175,14 +237,17 @@ expected = links.read_text().split()[0]
 if hashlib.sha256("".join(actual).encode()).hexdigest() != expected:
     raise SystemExit("staged install symlink manifest mismatch")
 PY
+phase=publish_artifacts
 for name in run-env.sh ldd.txt INSTALL-MANIFEST.sha256 INSTALL-LINKS.sha256 BUILD-RECEIPT.json; do
-  [[ ! -e $version/$name ]] || { echo "incomplete completion artifact already exists: $version/$name" >&2; exit 1; }
+  [[ ! -e $version/$name ]] || fail "incomplete completion artifact already exists: $version/$name"
   mv "$completion_tmp/$name" "$version/$name"
 done
 chmod 0444 "$version/run-env.sh" "$version/ldd.txt" "$version/INSTALL-MANIFEST.sha256" "$version/INSTALL-LINKS.sha256" "$version/BUILD-RECEIPT.json"
+phase=final_artifact_verification
 "$python" "$verify" artifacts "$PREPARATION"
-sha256sum "$version/BUILD-RECEIPT.json" > "$completion_tmp/BUILD-COMPLETE.sha256"
-chmod 0444 "$completion_tmp/BUILD-COMPLETE.sha256"
-mv "$completion_tmp/BUILD-COMPLETE.sha256" "$version/BUILD-COMPLETE.sha256"
+phase=completion_publication
+[[ ! -e $completion_marker ]]
+sha256sum "$version/BUILD-RECEIPT.json" > "$completion_marker"
+chmod 0444 "$completion_marker"
 rmdir "$completion_tmp"
-echo "build complete: $binary"
+mv "$completion_marker" "$version/BUILD-COMPLETE.sha256"

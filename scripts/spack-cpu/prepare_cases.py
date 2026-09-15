@@ -150,6 +150,7 @@ def main():
     (args.destination / "CASES.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     harness = '''#!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 : "${SLURM_JOB_ID:?run inside an authorized Slurm allocation}"
 : "${SLURM_NTASKS:?SLURM_NTASKS is required}"
 : "${SLURM_CPUS_PER_TASK:?SLURM_CPUS_PER_TASK is required}"
@@ -183,6 +184,7 @@ version=$("$python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["ver
 build_receipt=$version/BUILD-RECEIPT.json
 build_receipt_sha=$(sha256sum "$build_receipt" | awk '{print $1}')
 binary_sha=$("$python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["palace_binary_sha256"])' "$build_receipt")
+binary_path=$("$python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["palace_binary"])' "$build_receipt")
 run_env=$version/run-env.sh
 [[ -f $run_env ]] || { echo "prepared build runtime activation missing" >&2; exit 1; }
 source_dir=$base/${selected[0]}
@@ -199,6 +201,8 @@ run_dir=$run_root/${SLURM_JOB_ID}-${case_id}
 mkdir -p "$run_dir"
 cp -a "$source_dir/." "$run_dir/"
 source "$run_env"
+[[ $PALACE_BIN == "$binary_path" ]] || { echo "runtime Palace executable differs from build receipt" >&2; exit 1; }
+"$python" "$verify" elf "$PALACE_BIN"
 while IFS= read -r name; do
   [[ $name =~ ^(OMPI_MCA_|PMIX_MCA_|PRTE_MCA_) ]] && unset "$name"
 done < <(compgen -e)

@@ -33,6 +33,23 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def verify_linux_x86_64_elf(path):
+    path = Path(path)
+    if platform.system() != "Linux":
+        raise RuntimeError("Palace executable verification requires Linux")
+    if path.is_symlink() or not path.is_file() or not os.access(str(path), os.X_OK):
+        raise RuntimeError("Palace executable must be an executable regular file")
+    with path.open("rb") as stream:
+        header = stream.read(20)
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        raise RuntimeError("Palace executable is not an ELF file")
+    elf_type = int.from_bytes(header[16:18], "little")
+    if (header[4] != 2 or header[5] != 1 or elf_type not in (2, 3) or
+            int.from_bytes(header[18:20], "little") != 62):
+        raise RuntimeError("Palace executable is not a little-endian x86-64 ELF")
+    return path
+
+
 def current_python_identity():
     if sys.implementation.name != "cpython":
         raise RuntimeError("CPython is required")
@@ -136,6 +153,24 @@ def verify_links(root, receipt):
         raise RuntimeError("symbolic-link manifest mismatch: {0}".format(root))
 
 
+def verify_preparation_cache_config(preparation, receipt):
+    bootstrap_root = preparation / "spack-cache" / "bootstrap"
+    if receipt.get("bootstrap_root") != str(bootstrap_root):
+        raise RuntimeError("prepared bootstrap root identity differs")
+    bootstrap_lines = (preparation / "spack-config" / "bootstrap.yaml").read_text().splitlines()
+    configured = []
+    for line in bootstrap_lines:
+        match = line.strip().split(":", 1)
+        if len(match) == 2 and match[0] == "root":
+            configured.append(match[1].strip().strip("'\""))
+    if configured != [str(bootstrap_root)]:
+        raise RuntimeError("prepared bootstrap root configuration differs")
+    source_cache = (preparation / "spack-config" / "config.yaml").read_text()
+    expected = "config:\n  source_cache: '$user_cache_path/source'\n"
+    if source_cache != expected:
+        raise RuntimeError("prepared writable source-cache configuration differs")
+
+
 def verify_prepared(preparation, plan_key=None):
     receipt_path = preparation / "PREPARED.json"
     receipt = json.loads(receipt_path.read_text())
@@ -154,6 +189,8 @@ def verify_prepared(preparation, plan_key=None):
         "source-mirror-links.sha256",
         "bootstrap-mirror-links.sha256",
         "identity/source-archive.tar.gz",
+        "spack-config/bootstrap.yaml",
+        "spack-config/config.yaml",
         "cases/CASES.json",
         "cases/run-one.sh",
     )
@@ -168,6 +205,7 @@ def verify_prepared(preparation, plan_key=None):
     verify_links(preparation / "bootstrap-mirror", preparation / "bootstrap-mirror-links.sha256")
     if sha256(preparation / "identity/source-archive.tar.gz") != receipt["source_archive_sha256"]:
         raise RuntimeError("source archive identity differs")
+    verify_preparation_cache_config(preparation, receipt)
     current = verify_python_compatibility(receipt["python_compatibility"])
     python = Path(receipt["python"]).resolve()
     if not python.is_file() or Path(current["executable"]) != python:
@@ -246,13 +284,39 @@ def verify_built_artifacts(preparation, require_complete=False):
     }
     if actual_files != manifest_files:
         raise RuntimeError("installed store regular-file set differs from manifest")
+    prefix = Path(receipt["palace_prefix"])
     binary = Path(receipt["palace_binary"])
-    if not binary.is_file() or sha256(binary) != receipt["palace_binary_sha256"]:
+    if prefix != prefix.resolve():
+        raise RuntimeError("Palace installed prefix is not canonical")
+    if binary != binary.resolve():
+        raise RuntimeError("Palace executable receipt path is not canonical")
+    expected_binary_path = prefix / "bin" / "palace-x86_64.bin"
+    verify_linux_x86_64_elf(expected_binary_path)
+    expected_binary = expected_binary_path.resolve()
+    if binary != expected_binary:
+        raise RuntimeError("Palace receipt does not name the direct installed ELF")
+    resolved_prefix = prefix.resolve()
+    if os.path.commonpath((str(resolved_prefix), str(binary))) != str(resolved_prefix):
+        raise RuntimeError("Palace executable resolves outside its installed prefix")
+    if sha256(binary) != receipt["palace_binary_sha256"]:
         raise RuntimeError("Palace executable identity differs")
+    ldd_path = version / "ldd.txt"
+    if receipt.get("ldd_sha256") != sha256(ldd_path):
+        raise RuntimeError("Palace ldd receipt identity differs")
+    if any("not found" in line for line in ldd_path.read_text().splitlines()):
+        raise RuntimeError("Palace ldd receipt has an unresolved shared library")
+    job_cache = Path(receipt["spack_user_cache_path"])
+    expected_cache = version / "spack-cache" / receipt["slurm_job_id"]
+    if job_cache != expected_cache or not job_cache.is_dir():
+        raise RuntimeError("build writable cache identity differs")
+    if receipt.get("source_cache") != str(job_cache / "source"):
+        raise RuntimeError("build source-cache identity differs")
+    if receipt.get("bootstrap_root") != prepared["bootstrap_root"]:
+        raise RuntimeError("build bootstrap root identity differs")
     jit = Path(receipt["libceed_jit_source"])
     if not jit.is_dir() or not any(jit.rglob("*")):
         raise RuntimeError("libCEED JIT source is missing")
-    for line in (version / "ldd.txt").read_text().splitlines():
+    for line in ldd_path.read_text().splitlines():
         words = line.replace("=>", " ").split()
         paths = [word for word in words if word.startswith("/")]
         if paths:
@@ -275,6 +339,8 @@ def main():
     mirrors = sub.add_parser("mirrors")
     mirrors.add_argument("configuration", type=Path)
     mirrors.add_argument("expected_url")
+    elf = sub.add_parser("elf")
+    elf.add_argument("path", type=Path)
     sub.add_parser("python-identity")
     args = parser.parse_args()
     if args.command is None:
@@ -287,6 +353,8 @@ def main():
         verify_build(args.preparation.resolve())
     elif args.command == "mirrors":
         verify_mirrors(args.configuration.resolve(), args.expected_url)
+    elif args.command == "elf":
+        verify_linux_x86_64_elf(args.path)
     else:
         verify_built_artifacts(args.preparation.resolve())
 

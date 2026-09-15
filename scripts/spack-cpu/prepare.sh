@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
   echo "Usage: CASE_BUNDLE=/absolute/archive $0 {f1|ltlab} [root]" >&2
@@ -164,8 +165,13 @@ repos:
   local: $work/generated/spack_repo/local
   builtin: $packages_root/repos/spack_repo/builtin
 EOF
+cat > "$SPACK_USER_CONFIG_PATH/config.yaml" <<'EOF'
+config:
+  source_cache: '$user_cache_path/source'
+EOF
 cat > "$SPACK_USER_CONFIG_PATH/bootstrap.yaml" <<EOF
 bootstrap:
+  root: $work/spack-cache/bootstrap
   trusted:
     spack-install: false
 EOF
@@ -230,9 +236,9 @@ record.update(dict(zip(keys, sys.argv[2:])))
 open(sys.argv[1], "w").write(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
 owner_sha=$(sha256sum "$version/OWNER.json" | awk '{print $1}')
-"$python" - "$work/PREPARED.json" "$plan_key" "$site" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$solver_manifest" "$source_sha" "$spack_commit" "$packages_commit" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$case_sha" "$work/generated/environment" "$version" "$owner_sha" <<'PY'
+"$python" - "$work/PREPARED.json" "$plan_key" "$site" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$solver_manifest" "$source_sha" "$spack_commit" "$packages_commit" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$case_sha" "$work/generated/environment" "$version" "$work/spack-cache/bootstrap" "$owner_sha" <<'PY'
 import json, sys
-keys = ("plan_key", "site", "preparation_revision", "preparation_tree", "workflow_tree", "recipe_blob", "lock_blob", "solver_content_manifest_sha256", "source_archive_sha256", "spack_commit", "packages_commit", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "seed_gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "case_archive_sha256", "environment", "version_root", "owner_sha256")
+keys = ("plan_key", "site", "preparation_revision", "preparation_tree", "workflow_tree", "recipe_blob", "lock_blob", "solver_content_manifest_sha256", "source_archive_sha256", "spack_commit", "packages_commit", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "seed_gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "case_archive_sha256", "environment", "version_root", "bootstrap_root", "owner_sha256")
 record = {"schema": 2, "state": "PREPARED", "semantic_state": "CONVERGING"}
 record.update(dict(zip(keys, sys.argv[2:])))
 identity = json.loads(record.pop("python_identity"))

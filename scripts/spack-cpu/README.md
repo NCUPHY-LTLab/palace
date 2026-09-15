@@ -1,6 +1,6 @@
 # Common CPU Spack preparation
 
-This workflow prepares one pinned Palace 0.18 CPU dependency graph for LT Lab and F1 while keeping each site's compiler, scheduler, filesystem, and Slurm launch details separate. It is **PREPARED / CONVERGING**: the package has not been compiled or run on either site, and the build and validation jobs require separate phase-2 authorization.
+This workflow prepares one pinned Palace 0.18 CPU dependency graph for LT Lab and F1 while keeping each site's compiler, scheduler, filesystem, and Slurm launch details separate. It is **CONVERGING**: preparation does not compile or run Palace, and the build and validation jobs require separate phase-2 authorization.
 
 The older `scripts/f1` workflow remains the historical fixed-`1ea14a84` lane. Do not use its prefix or receipts for this 0.18 build.
 
@@ -17,6 +17,12 @@ $HOME/opt/palace-spack/
 ```
 
 Preparation records the delivered Git revision and tree separately from a manifest hash of solver content that excludes the Spack workflow and recipe paths. A source archive and its SHA-256 remain the full build-source authority; the narrower manifest is additive. A matching completed preparation is verified and reused; conflicting or incomplete directories fail visibly.
+
+The prepared bootstrap store is fixed at `preparations/<id>/spack-cache/bootstrap` and
+remains part of the immutable preparation. Each build job receives a separate writable
+cache at `versions/<id>/spack-cache/<slurm-job-id>`; Spack's source cache resolves below
+that job cache. The build receipt records all three effective paths without freezing
+the writable cache contents.
 
 Preparation also requires the exact owner-provided Xmon archive through `CASE_BUNDLE`. It retains the archive unchanged, extracts only the verified configuration and mesh for execution, prepares four one-pointer comparison configurations, and copies the small public `cavity2d` eigenmode, electrostatic, driven, and transient examples. `cases/CASES.json` and the generated `cases/run-one.sh` are an unexecuted phase-2 harness, not durable tests.
 
@@ -63,6 +69,14 @@ Before checking or installing packages, each build writes an immutable per-job P
 identity log under the preparation's `build-logs` directory. A successful build receipt
 binds that runtime record to the exact preparation receipt, plan key, and prepared
 Python compatibility contract.
+
+The installed application identity is the regular Linux x86-64 ELF at
+`<palace-prefix>/bin/palace-x86_64.bin`. Launcher scripts and symlinks are not accepted
+as the executable authority. A package-stage install does not constitute a completed
+installation: the full installed-store manifests, direct ELF identity, dynamic-library
+record, runtime activation, and `BUILD-COMPLETE.sha256` must all verify. Failures after
+the build starts leave a phase, source line, and exit status receipt in the
+preparation's `build-logs` directory.
 
 A tentative F1 single-node preparation command is shown only as a resource example; its time and memory have not been measured. `ct112` provides 4308 MB per requested core and accepts 1--112 cores with a 96-hour limit. Do not add a conflicting `--mem` request.
 

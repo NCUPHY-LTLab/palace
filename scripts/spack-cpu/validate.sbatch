@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=palace-spack-validate
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 : "${SLURM_JOB_ID:?submit this script with sbatch}"
 : "${SLURM_NTASKS:?SLURM_NTASKS is required}"
@@ -14,8 +15,12 @@ python=$(awk -F'"' '$2 == "python" {print $4}' "$PREPARATION/PREPARED.json")
 [[ $python == /* && -x $python ]] || { echo "prepared Python interpreter missing" >&2; exit 1; }
 "$python" "$verify" build "$PREPARATION"
 version=$("$python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_root"])' "$PREPARATION/PREPARED.json")
+build_receipt="$version/BUILD-RECEIPT.json"
+recorded_binary=$("$python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["palace_binary"])' "$build_receipt")
 source "$version/run-env.sh"
 [[ -x $PALACE_BIN && -x $PALACE_MPIRUN && -d $CEED_JIT_SOURCE_ROOT ]]
+[[ $PALACE_BIN == "$recorded_binary" ]] || { echo "runtime Palace executable differs from build receipt" >&2; exit 1; }
+"$python" "$verify" elf "$PALACE_BIN"
 log_dir="$PREPARATION/validation-logs/$SLURM_JOB_ID"
 [[ ! -e $log_dir ]] || { echo "validation log directory already exists" >&2; exit 1; }
 mkdir -p "$log_dir"
