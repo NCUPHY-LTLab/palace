@@ -14,19 +14,42 @@ verify="$PREPARATION/source/palace/scripts/spack-cpu/verify.py"
 [[ -f $verify ]] || { echo "immutable preparation verifier missing" >&2; exit 1; }
 python=$(awk -F'"' '$2 == "python" {print $4}' "$PREPARATION/PREPARED.json")
 [[ $python == /* && -x $python ]] || { echo "prepared Python interpreter missing" >&2; exit 1; }
+"$python" - "$PREPARATION/PREPARED.json" <<'PY'
+import json, sys
+if json.load(open(sys.argv[1])).get("schema") != 2:
+    raise SystemExit("preparation schema is obsolete; create a new preparation with the current scripts")
+PY
+logs="$PREPARATION/build-logs"
+mkdir -p "$logs"
+python_log="$logs/python-$SLURM_JOB_ID.json"
+[[ ! -e $python_log ]] || { echo "current Python log already exists: $python_log" >&2; exit 1; }
+"$python" "$verify" python-identity > "$python_log"
+build_python=$(cat "$python_log")
+python_log_sha=$(sha256sum "$python_log" | awk '{print $1}')
+chmod 0444 "$python_log"
 "$python" "$verify" prepared "$PREPARATION"
 
 readarray -t fields < <("$python" - "$PREPARATION/PREPARED.json" <<'PY'
 import json, sys
 record = json.load(open(sys.argv[1]))
-for key in ("site", "preparation_revision", "environment", "version_root"):
-    print(record[key])
+for value in (
+    record["site"],
+    record["preparation_revision"],
+    record["environment"],
+    record["version_root"],
+    record["plan_key"],
+    json.dumps(record["python_compatibility"], sort_keys=True, separators=(",", ":")),
+):
+    print(value)
 PY
 )
 site=${fields[0]}
 revision=${fields[1]}
 environment=${fields[2]}
 version=${fields[3]}
+prepared_plan_key=${fields[4]}
+prepared_python_compatibility=${fields[5]}
+prepared_receipt_sha=$(sha256sum "$PREPARATION/PREPARED.json" | awk '{print $1}')
 [[ -d $environment && -d $version ]]
 if [[ $site == f1 ]]; then
   command -v module >/dev/null
@@ -71,7 +94,6 @@ export SPACK_USER_CACHE_PATH="$PREPARATION/spack-cache"
 export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ftp_proxy=http://127.0.0.1:9
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy FTP_PROXY=$ftp_proxy NO_PROXY= no_proxy=
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 OMP_PROC_BIND=close OMP_PLACES=cores
-logs="$PREPARATION/build-logs"
 mkdir -p "$logs" "$version/stages"
 "$python" "$spack" bootstrap status > "$logs/bootstrap-status.txt"
 "$python" "$spack" -e "$environment" config get mirrors --json > "$logs/mirrors.json"
@@ -121,11 +143,13 @@ ldd "$binary" > "$completion_tmp/ldd.txt"
 find "$version/store" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$completion_tmp/INSTALL-MANIFEST.sha256"
 find "$version/store" -type l -printf '%p -> %l\n' | LC_ALL=C sort | sha256sum > "$completion_tmp/INSTALL-LINKS.sha256"
 binary_sha=$(sha256sum "$binary" | awk '{print $1}')
-"$python" - "$completion_tmp/BUILD-RECEIPT.json" "$revision" "$site" "$SLURM_JOB_ID" "$SLURM_CPUS_PER_TASK" "$version/store" "$prefix" "$binary" "$binary_sha" "$jit" "$libceed_prefix" "$openmpi_prefix" "$mpirun" "$prrte_prefix" "$pmix_prefix" "$gcc_prefix" <<'PY'
+"$python" - "$completion_tmp/BUILD-RECEIPT.json" "$revision" "$site" "$SLURM_JOB_ID" "$SLURM_CPUS_PER_TASK" "$version/store" "$prefix" "$binary" "$binary_sha" "$jit" "$libceed_prefix" "$openmpi_prefix" "$mpirun" "$prrte_prefix" "$pmix_prefix" "$gcc_prefix" "$PREPARATION" "$prepared_receipt_sha" "$prepared_plan_key" "$prepared_python_compatibility" "$build_python" "$python_log" "$python_log_sha" <<'PY'
 import json, sys
-keys = ("preparation_revision", "site", "slurm_job_id", "slurm_cpus_per_task", "install_store", "palace_prefix", "palace_binary", "palace_binary_sha256", "libceed_jit_source", "libceed_prefix", "openmpi_prefix", "mpirun", "prrte_prefix", "pmix_prefix", "gcc_prefix")
-record = {"schema": 1, "state": "BUILD_COMPLETE", "semantic_state": "CONVERGING", "openmp_num_threads": 1, "openblas_num_threads": 1, "omp_proc_bind": "close", "omp_places": "cores"}
+keys = ("preparation_revision", "site", "slurm_job_id", "slurm_cpus_per_task", "install_store", "palace_prefix", "palace_binary", "palace_binary_sha256", "libceed_jit_source", "libceed_prefix", "openmpi_prefix", "mpirun", "prrte_prefix", "pmix_prefix", "gcc_prefix", "preparation", "prepared_receipt_sha256", "prepared_plan_key", "prepared_python_compatibility", "build_python", "build_python_log", "build_python_log_sha256")
+record = {"schema": 2, "state": "BUILD_COMPLETE", "semantic_state": "CONVERGING", "openmp_num_threads": 1, "openblas_num_threads": 1, "omp_proc_bind": "close", "omp_places": "cores"}
 record.update(dict(zip(keys, sys.argv[2:])))
+record["prepared_python_compatibility"] = json.loads(record["prepared_python_compatibility"])
+record["build_python"] = json.loads(record["build_python"])
 open(sys.argv[1], "w").write(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
 "$python" - "$completion_tmp/INSTALL-MANIFEST.sha256" "$completion_tmp/INSTALL-LINKS.sha256" "$version/store" <<'PY'

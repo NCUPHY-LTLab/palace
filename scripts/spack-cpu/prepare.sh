@@ -34,9 +34,17 @@ else
   python=$(realpath "$(command -v python3)")
 fi
 [[ -x $python ]] || { echo "required Python interpreter missing: $python" >&2; exit 1; }
-python_version=$($python -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')
-$python -c 'import sys; assert sys.version_info >= (3, 8)'
-python_sha=$(sha256sum "$python" | awk '{print $1}')
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+python_identity=$("$python" "$script_dir/verify.py" python-identity)
+readarray -t python_fields < <("$python" - "$python_identity" <<'PY'
+import json, sys
+record = json.loads(sys.argv[1])
+print(record["version"])
+print(record["executable_sha256"])
+PY
+)
+python_version=${python_fields[0]}
+python_sha=${python_fields[1]}
 actual_gcc=$(gcc -dumpfullversion)
 [[ $actual_gcc == "$expected_gcc" ]] || { echo "expected GCC $expected_gcc, found $actual_gcc" >&2; exit 1; }
 for tool in gcc g++ gfortran git curl sha256sum srun; do command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }; done
@@ -52,7 +60,6 @@ if not match or not runtime or match.groups()[:3] != runtime.groups():
     raise SystemExit("declared Spack Slurm version does not map to srun --version")
 PY
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 checkout=$(git -C "$script_dir" rev-parse --show-toplevel)
 [[ $checkout =~ ^/[A-Za-z0-9._/@+=-]+$ ]] || { echo "unsupported checkout path characters" >&2; exit 2; }
 [[ -z $(git -C "$checkout" status --porcelain) ]] || { echo "checkout must be clean" >&2; exit 1; }
@@ -71,9 +78,9 @@ gcc_sha=$(sha256sum "$gcc_path" | awk '{print $1}')
 gxx_sha=$(sha256sum "$gxx_path" | awk '{print $1}')
 gfortran_sha=$(sha256sum "$gfortran_path" | awk '{print $1}')
 slurm_sha=$(sha256sum "$slurm_command" | awk '{print $1}')
-plan_key=$("$python" - "$site" "$root" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$case_sha" <<'PY'
+plan_key=$("$python" - "$site" "$root" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$case_sha" <<'PY'
 import hashlib, json, sys
-keys = ("site", "root", "revision", "tree", "workflow_tree", "recipe_blob", "lock_blob", "gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "case_sha256")
+keys = ("site", "root", "revision", "tree", "workflow_tree", "recipe_blob", "lock_blob", "gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "case_sha256")
 payload = dict(zip(keys, sys.argv[1:]))
 print(hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 PY
@@ -208,6 +215,7 @@ find "$work/bootstrap-mirror" -type l -printf '%p -> %l\n' | LC_ALL=C sort | sha
   echo "python=$python"
   echo "python_version=$python_version"
   echo "python_sha256=$python_sha"
+  echo "python_identity=$python_identity"
   echo "srun=$slurm_command"
   echo "srun_sha256=$slurm_sha"
   echo "srun_version=$slurm_runtime"
@@ -222,11 +230,16 @@ record.update(dict(zip(keys, sys.argv[2:])))
 open(sys.argv[1], "w").write(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
 owner_sha=$(sha256sum "$version/OWNER.json" | awk '{print $1}')
-"$python" - "$work/PREPARED.json" "$plan_key" "$site" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$solver_manifest" "$source_sha" "$spack_commit" "$packages_commit" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$case_sha" "$work/generated/environment" "$version" "$owner_sha" <<'PY'
+"$python" - "$work/PREPARED.json" "$plan_key" "$site" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$solver_manifest" "$source_sha" "$spack_commit" "$packages_commit" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$case_sha" "$work/generated/environment" "$version" "$owner_sha" <<'PY'
 import json, sys
-keys = ("plan_key", "site", "preparation_revision", "preparation_tree", "workflow_tree", "recipe_blob", "lock_blob", "solver_content_manifest_sha256", "source_archive_sha256", "spack_commit", "packages_commit", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "seed_gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "case_archive_sha256", "environment", "version_root", "owner_sha256")
-record = {"schema": 1, "state": "PREPARED", "semantic_state": "CONVERGING"}
+keys = ("plan_key", "site", "preparation_revision", "preparation_tree", "workflow_tree", "recipe_blob", "lock_blob", "solver_content_manifest_sha256", "source_archive_sha256", "spack_commit", "packages_commit", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "seed_gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "case_archive_sha256", "environment", "version_root", "owner_sha256")
+record = {"schema": 2, "state": "PREPARED", "semantic_state": "CONVERGING"}
 record.update(dict(zip(keys, sys.argv[2:])))
+identity = json.loads(record.pop("python_identity"))
+record["python_compatibility"] = {
+    key: identity[key]
+    for key in ("implementation", "major_minor", "soabi", "ext_suffix", "machine", "exec_prefix")
+}
 open(sys.argv[1], "w").write(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
 find "$work" -type f ! -name PREPARED-MANIFEST.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$work/PREPARED-MANIFEST.sha256"

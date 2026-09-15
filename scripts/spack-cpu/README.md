@@ -23,10 +23,16 @@ Preparation also requires the exact owner-provided Xmon archive through `CASE_BU
 Each site must provide the exact external Slurm identity used by its `srun`. Spack is forbidden from building Slurm. The selected numerical graph is x86-64, GCC 15.2.0, Open MPI 5.0.10 with Fortran and explicit UCX/OFI and Slurm support, LP64 OpenBLAS 0.3.34 with pthreads and locking, Palace/MFEM/HYPRE/PETSc/SUNDIALS OpenMP, and SuperLU_DIST without OpenMP. Shared libraries include Palace, OpenBLAS, zlib, MFEM, libCEED, LIBXSMM, MUMPS, and SuperLU_DIST. Runtime uses one OpenMP and one OpenBLAS thread unless a later accepted run contract says otherwise.
 
 F1's candidate site profile loads `gcc/11.2.0`; its actual module and Slurm identities still require authenticated site verification. LT Lab requires GCC 11.4.0. `prepare.sh` records the compiler paths and versions it actually sees.
-The F1 profile consistently uses the already observed `/usr/bin/python3.8` (3.8.17),
-including Spack and generated helpers, and records its executable hash. It does not use
-F1's default Python 3.6 or install another interpreter. LT Lab records and reuses its
-selected Python 3.8-or-newer interpreter the same way.
+The F1 profile consistently uses `/usr/bin/python3.8`, including Spack and generated
+helpers. Python must be CPython 3.8 or newer and must retain the prepared major/minor,
+SOABI, extension suffix, architecture, and executable prefix. The running executable
+path and the required `ssl`, `sqlite3`, `ctypes`, `hashlib`, and `json` imports are
+checked on every build and validation node. The exact preparation and runtime Python
+versions and executable hashes remain provenance; a micro-version or byte difference
+does not by itself reject a compatible interpreter. The manifest-bound prepared
+clingo extension must import successfully and instantiate `clingo.Control` before any
+build work. Schema-1 preparations are diagnostic history and cannot be used for a new
+production build; rerun preparation with the current scripts.
 
 ## Prepare on a login node
 
@@ -52,6 +58,11 @@ F1 commands remain Human-operated. The F1 compute nodes have no external network
 ## Build under Slurm
 
 The script has no resource defaults and never submits itself. Create the scheduler output directory first, then supply the site's partition, account, time, and one `cpus-per-task` value to `sbatch`. The script uses `SLURM_CPUS_PER_TASK` as Spack's only build parallelism and forces one package build at a time. Compiler, dependency, and Palace stages are resumable through Spack's installed database; a completed version is checksum-verified and not overwritten.
+
+Before checking or installing packages, each build writes an immutable per-job Python
+identity log under the preparation's `build-logs` directory. A successful build receipt
+binds that runtime record to the exact preparation receipt, plan key, and prepared
+Python compatibility contract.
 
 A tentative F1 single-node preparation command is shown only as a resource example; its time and memory have not been measured. `ct112` provides 4308 MB per requested core and accepts 1--112 cores with a 96-hour limit. Do not add a conflicting `--mem` request.
 

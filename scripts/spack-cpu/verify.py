@@ -3,9 +3,26 @@
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
+import platform
+import sys
+import sysconfig
 from pathlib import Path
+
+
+sys.dont_write_bytecode = True
+MINIMUM_PYTHON = (3, 8)
+REQUIRED_PYTHON_MODULES = ("ssl", "sqlite3", "ctypes", "hashlib", "json")
+PYTHON_COMPATIBILITY_KEYS = (
+    "implementation",
+    "major_minor",
+    "soabi",
+    "ext_suffix",
+    "machine",
+    "exec_prefix",
+)
 
 
 def sha256(path):
@@ -16,9 +33,93 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def verify_manifest(path):
+def current_python_identity():
+    if sys.implementation.name != "cpython":
+        raise RuntimeError("CPython is required")
+    if sys.version_info[:2] < MINIMUM_PYTHON:
+        raise RuntimeError("Python 3.8 or newer is required")
+    modules = []
+    for name in REQUIRED_PYTHON_MODULES:
+        importlib.import_module(name)
+        modules.append(name)
+    executable = Path(sys.executable).resolve()
+    identity = {
+        "implementation": sys.implementation.name,
+        "version": ".".join(str(value) for value in sys.version_info[:3]),
+        "major_minor": list(sys.version_info[:2]),
+        "soabi": sysconfig.get_config_var("SOABI"),
+        "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
+        "machine": platform.machine(),
+        "exec_prefix": str(Path(sys.exec_prefix).resolve()),
+        "executable": str(executable),
+        "executable_sha256": sha256(executable),
+        "required_imports": modules,
+    }
+    if not identity["soabi"] or not identity["ext_suffix"]:
+        raise RuntimeError("Python SOABI and extension suffix are required")
+    return identity
+
+
+def python_compatibility(identity):
+    return {key: identity[key] for key in PYTHON_COMPATIBILITY_KEYS}
+
+
+def verify_python_compatibility(expected, current=None):
+    current = current or current_python_identity()
+    if current["implementation"] != "cpython":
+        raise RuntimeError("CPython is required")
+    if tuple(current["major_minor"]) < MINIMUM_PYTHON:
+        raise RuntimeError("Python 3.8 or newer is required")
+    if current["required_imports"] != list(REQUIRED_PYTHON_MODULES):
+        raise RuntimeError("required Python standard-library imports differ")
+    for key in PYTHON_COMPATIBILITY_KEYS:
+        if current.get(key) != expected.get(key):
+            raise RuntimeError("prepared Python compatibility differs: {0}".format(key))
+    return current
+
+
+def _manifest_entries(path):
+    entries = {}
     for line in path.read_text().splitlines():
         expected, name = line.split("  ", 1)
+        if name in entries:
+            raise RuntimeError("duplicate manifest path: {0}".format(name))
+        entries[name] = expected
+    return entries
+
+
+def verify_clingo_import(preparation, identity, manifest_path=None):
+    manifest_path = manifest_path or preparation / "PREPARED-MANIFEST.sha256"
+    pattern = "clingo{0}".format(identity["ext_suffix"])
+    candidates = [
+        path
+        for path in (preparation / "spack-cache" / "bootstrap" / "store").rglob(pattern)
+        if "site-packages" in path.parts and path.is_file()
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError("expected one prepared clingo extension, found {0}".format(len(candidates)))
+    extension = candidates[0]
+    entries = _manifest_entries(manifest_path)
+    expected_sha = entries.get(str(extension))
+    if expected_sha is None or sha256(extension) != expected_sha:
+        raise RuntimeError("prepared clingo extension is not manifest-bound")
+
+    site_packages = extension.parent
+    previous_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(site_packages))
+        importlib.invalidate_caches()
+        module = importlib.import_module("clingo")
+        if Path(module.__file__).resolve() != extension.resolve():
+            raise RuntimeError("clingo imported from outside the prepared bootstrap store")
+        module.Control()
+    finally:
+        sys.path[:] = previous_path
+    return {"path": str(extension), "sha256": expected_sha}
+
+
+def verify_manifest(path):
+    for name, expected in _manifest_entries(path).items():
         target = Path(name)
         if not target.is_file() or sha256(target) != expected:
             raise RuntimeError("manifest mismatch: {0}".format(target))
@@ -38,6 +139,8 @@ def verify_links(root, receipt):
 def verify_prepared(preparation, plan_key=None):
     receipt_path = preparation / "PREPARED.json"
     receipt = json.loads(receipt_path.read_text())
+    if receipt.get("schema") != 2:
+        raise RuntimeError("preparation schema is obsolete; create a new preparation with the current scripts")
     if receipt.get("state") != "PREPARED":
         raise RuntimeError("preparation is not complete")
     if plan_key is not None and receipt.get("plan_key") != plan_key:
@@ -65,9 +168,11 @@ def verify_prepared(preparation, plan_key=None):
     verify_links(preparation / "bootstrap-mirror", preparation / "bootstrap-mirror-links.sha256")
     if sha256(preparation / "identity/source-archive.tar.gz") != receipt["source_archive_sha256"]:
         raise RuntimeError("source archive identity differs")
-    python = Path(receipt["python"])
-    if not python.is_file() or sha256(python) != receipt["python_sha256"]:
-        raise RuntimeError("prepared Python interpreter identity differs")
+    current = verify_python_compatibility(receipt["python_compatibility"])
+    python = Path(receipt["python"]).resolve()
+    if not python.is_file() or Path(current["executable"]) != python:
+        raise RuntimeError("the running Python interpreter path differs from preparation")
+    verify_clingo_import(preparation, current)
     owner_path = Path(receipt["version_root"]) / "OWNER.json"
     owner = json.loads(owner_path.read_text())
     if owner.get("plan_key") != receipt["plan_key"] or owner.get("preparation") != str(preparation):
@@ -113,6 +218,22 @@ def verify_built_artifacts(preparation, require_complete=False):
         if len(complete) != 2 or sha256(receipt_path) != complete[0]:
             raise RuntimeError("build completion receipt mismatch")
     receipt = json.loads(receipt_path.read_text())
+    if receipt.get("schema") != 2:
+        raise RuntimeError("build receipt schema differs")
+    if receipt.get("preparation") != str(preparation):
+        raise RuntimeError("build receipt preparation path differs")
+    if receipt.get("prepared_receipt_sha256") != sha256(preparation / "PREPARED.json"):
+        raise RuntimeError("build receipt preparation identity differs")
+    if receipt.get("prepared_plan_key") != prepared["plan_key"]:
+        raise RuntimeError("build receipt plan identity differs")
+    if receipt.get("prepared_python_compatibility") != prepared["python_compatibility"]:
+        raise RuntimeError("build receipt prepared Python compatibility differs")
+    verify_python_compatibility(prepared["python_compatibility"], receipt["build_python"])
+    python_log = Path(receipt["build_python_log"])
+    if not python_log.is_file() or sha256(python_log) != receipt["build_python_log_sha256"]:
+        raise RuntimeError("build Python log identity differs")
+    if json.loads(python_log.read_text()) != receipt["build_python"]:
+        raise RuntimeError("build Python receipt differs from its early log")
     store = Path(receipt["install_store"])
     if store != version / "store" or not store.is_dir():
         raise RuntimeError("installed store identity differs")
@@ -154,10 +275,13 @@ def main():
     mirrors = sub.add_parser("mirrors")
     mirrors.add_argument("configuration", type=Path)
     mirrors.add_argument("expected_url")
+    sub.add_parser("python-identity")
     args = parser.parse_args()
     if args.command is None:
         parser.error("a verification command is required")
-    if args.command == "prepared":
+    if args.command == "python-identity":
+        print(json.dumps(current_python_identity(), sort_keys=True))
+    elif args.command == "prepared":
         verify_prepared(args.preparation.resolve(), args.plan_key)
     elif args.command == "build":
         verify_build(args.preparation.resolve())
