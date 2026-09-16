@@ -60,9 +60,10 @@ Finally, instructions for obtaining *Palace* and building from source can be fou
 process, most dependencies are downloaded and installed automatically and thus an internet
 connection is required.
 
-For the NCHC Forerunner 1 CPU environment, the repository also provides a locked
-[login preparation, offline compute build, and Slurm run guide](scripts/f1/README.md). This path
-stages every dependency before entering F1's network-isolated compute nodes.
+For reproducible CPU installations on NCHC Forerunner 1 and LT Lab, the repository also
+provides a locked [login preparation, offline compute build, validation, and Slurm run
+guide](scripts/spack-cpu/README.md). The older [`scripts/f1`](scripts/f1/README.md) path is
+retained for the historical fixed-`1ea14a84` installation only.
 
 System requirements:
 

@@ -4,7 +4,7 @@
     "upstream_commit": "b92aef83ecfe6d360c4b3d83e2122986297f6778",
     "upstream_tree": "1880ff0e0cc8d91efdae681ae8d5c1cefe36981b",
     "reviewed_native_tree": "babb784bc7241db98c7018a79951d4c002138686",
-    "solver_content_manifest_sha256": "e844c023caea8f4d780217372a921b74d3916b0e770e3464ce4e720321813d5e",
+    "solver_content_manifest_sha256": "59c2674a410ca4886a2b318184be756222df6ca07ef32c77ff39d0ac8eccde92",
     "solver_content_excludes": [
       "scripts/spack-cpu/",
       "spack_repo/"

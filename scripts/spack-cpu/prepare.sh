@@ -3,7 +3,7 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
-  echo "Usage: CASE_BUNDLE=/absolute/archive $0 {f1|ltlab} [root]" >&2
+  echo "Usage: [CASE_BUNDLE=/absolute/archive] $0 {f1|ltlab} [root]" >&2
   echo "Required: SLURM_PREFIX and SLURM_SPACK_SPEC (slurm@=YY-MM-PATCH-RELEASE)." >&2
   exit 2
 }
@@ -12,12 +12,21 @@ site=$1
 [[ $site == f1 || $site == ltlab ]] || usage
 root=${2:-${PALACE_SPACK_ROOT:-$HOME/opt/palace-spack}}
 [[ $root == /* ]] || { echo "installation root must be absolute" >&2; exit 2; }
-: "${CASE_BUNDLE:?set CASE_BUNDLE to the absolute owner-provided archive}"
 : "${SLURM_PREFIX:?set SLURM_PREFIX to the external site Slurm prefix}"
 : "${SLURM_SPACK_SPEC:?set SLURM_SPACK_SPEC to the exact external Spack Slurm spec}"
-[[ $CASE_BUNDLE == /* && -f $CASE_BUNDLE ]] || { echo "CASE_BUNDLE must be an existing absolute file" >&2; exit 2; }
 [[ $SLURM_PREFIX == /* && -d $SLURM_PREFIX ]] || { echo "SLURM_PREFIX must be an existing absolute directory" >&2; exit 2; }
-for path in "$root" "$CASE_BUNDLE" "$SLURM_PREFIX"; do
+case_bundle=${CASE_BUNDLE:-}
+case_mode=public-only
+case_identity=public-only
+if [[ -n $case_bundle ]]; then
+  [[ $case_bundle == /* && -f $case_bundle ]] || { echo "CASE_BUNDLE must be an existing absolute file" >&2; exit 2; }
+  case_mode=xmon-c73772d
+  case_identity=$(sha256sum "$case_bundle" | awk '{print $1}')
+  [[ $case_identity == c73772d1e8f739c3f174eecffb4a2b8bc5df7b2c622aa7302d4ea3adc09cdff6 ]] || { echo "CASE_BUNDLE checksum is not the supported Xmon archive" >&2; exit 2; }
+fi
+checked_paths=("$root" "$SLURM_PREFIX")
+[[ -z $case_bundle ]] || checked_paths+=("$case_bundle")
+for path in "${checked_paths[@]}"; do
   [[ $path =~ ^/[A-Za-z0-9._/@+=-]+$ ]] || { echo "unsupported path characters: $path" >&2; exit 2; }
 done
 [[ $SLURM_SPACK_SPEC =~ ^slurm@=[0-9]+-[0-9]{2}-[0-9]+-[0-9]+$ ]] || { echo "unsupported SLURM_SPACK_SPEC" >&2; exit 2; }
@@ -69,7 +78,6 @@ tree=$(git -C "$checkout" rev-parse HEAD^{tree})
 workflow_tree=$(git -C "$checkout" rev-parse "$revision:scripts/spack-cpu")
 recipe_blob=$(git -C "$checkout" rev-parse "$revision:spack_repo/local/packages/palace/package.py")
 lock_blob=$(git -C "$checkout" rev-parse "$revision:scripts/spack-cpu/lock.json")
-case_sha=$(sha256sum "$CASE_BUNDLE" | awk '{print $1}')
 gcc_path=$(realpath "$(command -v gcc)")
 gxx_path=$(realpath "$(command -v g++)")
 gfortran_path=$(realpath "$(command -v gfortran)")
@@ -79,9 +87,9 @@ gcc_sha=$(sha256sum "$gcc_path" | awk '{print $1}')
 gxx_sha=$(sha256sum "$gxx_path" | awk '{print $1}')
 gfortran_sha=$(sha256sum "$gfortran_path" | awk '{print $1}')
 slurm_sha=$(sha256sum "$slurm_command" | awk '{print $1}')
-plan_key=$("$python" - "$site" "$root" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$case_sha" <<'PY'
+plan_key=$("$python" - "$site" "$root" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$case_mode" "$case_identity" <<'PY'
 import hashlib, json, sys
-keys = ("site", "root", "revision", "tree", "workflow_tree", "recipe_blob", "lock_blob", "gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "case_sha256")
+keys = ("site", "root", "revision", "tree", "workflow_tree", "recipe_blob", "lock_blob", "gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "case_mode", "case_identity")
 payload = dict(zip(keys, sys.argv[1:]))
 print(hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 PY
@@ -155,7 +163,9 @@ PY
 )
 
 "$python" "$frozen_scripts/render.py" --checkout "$work/source/palace" --packages "$packages_root" --cache "$cache/downloads" --source-archive "$source_archive" --source-sha256 "$source_sha" --destination "$work/generated" --install-root "$version/store" --site "$site" --slurm-prefix "$slurm_prefix" --slurm-spec "$SLURM_SPACK_SPEC"
-"$python" "$frozen_scripts/prepare_cases.py" --source "$work/source/palace" --xmon-archive "$CASE_BUNDLE" --destination "$work/cases" --python "$python"
+case_args=(--source "$work/source/palace" --destination "$work/cases" --python "$python")
+[[ -z $case_bundle ]] || case_args+=(--xmon-archive "$case_bundle")
+"$python" "$frozen_scripts/prepare_cases.py" "${case_args[@]}"
 
 export SPACK_USER_CONFIG_PATH="$work/spack-config"
 export SPACK_USER_CACHE_PATH="$work/spack-cache"
@@ -238,11 +248,12 @@ record.update(dict(zip(keys, sys.argv[2:])))
 open(sys.argv[1], "w").write(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
 owner_sha=$(sha256sum "$version/OWNER.json" | awk '{print $1}')
-"$python" - "$work/PREPARED.json" "$plan_key" "$site" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$solver_manifest" "$source_sha" "$spack_commit" "$packages_commit" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$case_sha" "$work/generated/environment" "$version" "$work/spack-cache/bootstrap" "$owner_sha" <<'PY'
+"$python" - "$work/PREPARED.json" "$plan_key" "$site" "$revision" "$tree" "$workflow_tree" "$recipe_blob" "$lock_blob" "$solver_manifest" "$source_sha" "$spack_commit" "$packages_commit" "$SLURM_SPACK_SPEC" "$slurm_prefix" "$slurm_command" "$slurm_sha" "$slurm_runtime" "$actual_gcc" "$gcc_path" "$gcc_sha" "$gxx_path" "$gxx_sha" "$gfortran_path" "$gfortran_sha" "$python" "$python_version" "$python_sha" "$python_identity" "$case_mode" "$case_identity" "$work/generated/environment" "$version" "$work/spack-cache/bootstrap" "$owner_sha" <<'PY'
 import json, sys
-keys = ("plan_key", "site", "preparation_revision", "preparation_tree", "workflow_tree", "recipe_blob", "lock_blob", "solver_content_manifest_sha256", "source_archive_sha256", "spack_commit", "packages_commit", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "seed_gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "case_archive_sha256", "environment", "version_root", "bootstrap_root", "owner_sha256")
+keys = ("plan_key", "site", "preparation_revision", "preparation_tree", "workflow_tree", "recipe_blob", "lock_blob", "solver_content_manifest_sha256", "source_archive_sha256", "spack_commit", "packages_commit", "slurm_spec", "slurm_prefix", "srun", "srun_sha256", "srun_version", "seed_gcc_version", "gcc", "gcc_sha256", "gxx", "gxx_sha256", "gfortran", "gfortran_sha256", "python", "python_version", "python_sha256", "python_identity", "case_mode", "case_identity", "environment", "version_root", "bootstrap_root", "owner_sha256")
 record = {"schema": 2, "state": "PREPARED", "semantic_state": "CONVERGING"}
 record.update(dict(zip(keys, sys.argv[2:])))
+record["case_archive_sha256"] = (record["case_identity"] if record["case_mode"] != "public-only" else None)
 identity = json.loads(record.pop("python_identity"))
 record["python_compatibility"] = {
     key: identity[key]

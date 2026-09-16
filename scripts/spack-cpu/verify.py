@@ -174,6 +174,82 @@ def verify_preparation_cache_config(preparation, receipt):
         raise RuntimeError("prepared writable source-cache configuration differs")
 
 
+def verify_prepared_cases(preparation, receipt):
+    cases_path = preparation / "cases" / "CASES.json"
+    document = json.loads(cases_path.read_text())
+    if document.get("schema") != 1 or document.get("state") != "PREPARED_NOT_RUN":
+        raise RuntimeError("prepared case manifest contract differs")
+    cases = document.get("cases")
+    if not isinstance(cases, list):
+        raise RuntimeError("prepared case list is invalid")
+    by_id = {}
+    current_case_contract = "case_mode" in document
+    for case in cases:
+        case_id = case.get("id")
+        if not isinstance(case_id, str) or case_id in by_id:
+            raise RuntimeError("prepared case id is missing or duplicate")
+        directory = case.get("directory")
+        config = case.get("config")
+        files = case.get("files")
+        if not isinstance(directory, str) or not isinstance(config, str) or not isinstance(files, dict):
+            raise RuntimeError("prepared case entry is incomplete: {0}".format(case_id))
+        root = preparation / "cases" / directory
+        actual = {}
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise RuntimeError("prepared case contains a symbolic link: {0}".format(path))
+            if path.is_file():
+                actual[str(path.relative_to(root))] = sha256(path)
+        if actual != files or files.get(config) != case.get("config_sha256"):
+            raise RuntimeError("prepared case file identity differs: {0}".format(case_id))
+        input_manifest = case.get("input_manifest")
+        if current_case_contract:
+            expected_manifest = "manifests/{0}.sha256".format(case_id)
+            if input_manifest != expected_manifest:
+                raise RuntimeError("prepared case input manifest path differs: {0}".format(case_id))
+            manifest_path = preparation / "cases" / input_manifest
+            expected_lines = "".join("{0}  {1}\n".format(digest, name)
+                                     for name, digest in sorted(files.items()))
+            if not manifest_path.is_file() or manifest_path.read_text() != expected_lines:
+                raise RuntimeError("prepared case input manifest differs: {0}".format(case_id))
+        by_id[case_id] = case
+    public_ids = {
+        "cavity2d-eigenmode", "cavity2d-electrostatic",
+        "cavity2d-driven", "cavity2d-transient",
+    }
+    if not public_ids.issubset(by_id):
+        raise RuntimeError("prepared public cavity2d cases are incomplete")
+    mode = receipt.get("case_mode")
+    if mode is None:
+        # Schema-2 receipts produced before optional cases always contained the historical
+        # owner-provided archive and remain valid without rewriting.
+        mode = "xmon-c73772d" if receipt.get("case_archive_sha256") == (
+            "c73772d1e8f739c3f174eecffb4a2b8bc5df7b2c622aa7302d4ea3adc09cdff6"
+        ) else "public-only"
+    xmon_ids = {
+        "xmon-original", "xmon-eigen-slepc", "xmon-eigen-arpack",
+        "xmon-linear-superlu", "xmon-linear-mumps",
+    }
+    if mode == "public-only":
+        if (set(by_id) != public_ids or receipt.get("case_archive_sha256") is not None or
+                receipt.get("case_identity", "public-only") != "public-only"):
+            raise RuntimeError("public-only preparation contains owner-provided cases")
+    elif mode == "xmon-c73772d":
+        if set(by_id) != public_ids | xmon_ids:
+            raise RuntimeError("Xmon preparation case set differs")
+        expected = "c73772d1e8f739c3f174eecffb4a2b8bc5df7b2c622aa7302d4ea3adc09cdff6"
+        if (receipt.get("case_archive_sha256") != expected or
+                receipt.get("case_identity", expected) != expected):
+            raise RuntimeError("Xmon preparation archive identity differs")
+        archive = preparation / "cases" / "xmon" / "owner-provided.tar.gz"
+        if not archive.is_file() or sha256(archive) != expected:
+            raise RuntimeError("prepared Xmon archive identity differs")
+    else:
+        raise RuntimeError("unsupported prepared case mode: {0}".format(mode))
+    if document.get("case_mode", mode) != mode:
+        raise RuntimeError("prepared case manifest mode differs from receipt")
+
+
 def verify_prepared(preparation, plan_key=None):
     receipt_path = preparation / "PREPARED.json"
     receipt = json.loads(receipt_path.read_text())
@@ -208,6 +284,7 @@ def verify_prepared(preparation, plan_key=None):
     verify_links(preparation / "bootstrap-mirror", preparation / "bootstrap-mirror-links.sha256")
     if sha256(preparation / "identity/source-archive.tar.gz") != receipt["source_archive_sha256"]:
         raise RuntimeError("source archive identity differs")
+    verify_prepared_cases(preparation, receipt)
     verify_preparation_cache_config(preparation, receipt)
     current = verify_python_compatibility(receipt["python_compatibility"])
     python = Path(receipt["python"]).resolve()
