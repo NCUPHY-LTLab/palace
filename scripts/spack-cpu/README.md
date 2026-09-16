@@ -1,5 +1,71 @@
 # Common CPU Spack preparation
 
+## F1 quick start
+
+Preparation runs online on the login node. Compilation runs later inside an offline compute
+job. Use one clean checkout at the exact delivered revision:
+
+```bash
+git clone https://github.com/arfiligol/palace.git
+cd palace
+git fetch origin <delivered-revision>
+git switch --detach <delivered-revision>
+test -z "$(git status --porcelain)"
+```
+
+Prepare sources and the dependency lock on the login node. This downloads and verifies
+inputs but does not compile or submit a job:
+
+```bash
+SLURM_PREFIX=/usr SLURM_SPACK_SPEC=slurm@=22-05-8-1 \
+  scripts/spack-cpu/prepare.sh f1
+```
+
+Copy the [F1 build template](examples/f1-build.sbatch) and
+[F1 run template](examples/f1-run.sbatch) outside the clean checkout. Edit the build
+template's `--account` and `PREPARATION` lines using the path printed by `prepare.sh`, then
+submit it. It delegates first to the frozen build script and then to the frozen non-solving
+validation script in that preparation:
+
+```bash
+jobs=$HOME/palace-jobs
+mkdir -p "$jobs/logs"
+cp scripts/spack-cpu/examples/f1-build.sbatch "$jobs/my-palace-build.sbatch"
+cp scripts/spack-cpu/examples/f1-run.sbatch "$jobs/my-palace-run.sbatch"
+cd "$jobs"
+${EDITOR:-vi} my-palace-build.sbatch
+sbatch my-palace-build.sbatch
+```
+
+After the build completes, put a self-contained case outside the checkout and create its
+manifest beside it:
+
+```bash
+input=/absolute/path/to/input
+(cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
+  > /absolute/path/to/input.sha256
+```
+
+Edit the run template copied above: set its account, preparation, input, manifest,
+configuration, ranks, threads, and time, then submit it. The file delegates to the reviewed
+runner stored in the preparation; it does not contain another solver path.
+
+```bash
+jobs=$HOME/palace-jobs
+mkdir -p "$jobs/logs"
+cd "$jobs"
+${EDITOR:-vi} my-palace-run.sbatch
+sbatch my-palace-run.sbatch
+```
+
+Both templates fail visibly while any `EDIT` placeholder remains. They never submit a
+follow-up job. Slurm writes stdout and stderr under `$HOME/palace-jobs/logs`; submitting
+from that external job directory keeps logs and private run metadata out of the checkout.
+See [the detailed reference](#detailed-reference) for receipts, optional
+Xmon inputs, validation, resource changes, failure handling, and LT Lab usage.
+
+## Detailed reference
+
 This workflow prepares one pinned Palace 0.18 CPU dependency graph for LT Lab and F1 while keeping each site's compiler, scheduler, filesystem, and Slurm launch details separate. It is **CONVERGING**: preparation does not compile or run Palace, and the build and validation jobs require separate phase-2 authorization.
 
 The older `scripts/f1` workflow remains the historical fixed-`1ea14a84` lane. Do not use its prefix or receipts for this 0.18 build.
