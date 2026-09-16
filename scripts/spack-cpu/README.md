@@ -1,9 +1,99 @@
-# Common CPU Spack preparation
+# Palace CPU with Spack
 
-## F1 quick start
+Use the installed Palace CPU environment to run a case prepared by SCGSim, or
+follow the one-time installation path when a Palace version has not yet been
+installed at the target site. Preparation and installation remain separate
+from routine case submission.
 
-Preparation runs online on the login node. Compilation runs later inside an offline compute
-job. Use one clean checkout at the exact delivered revision:
+## Run a prepared SCGSim case on F1
+
+**Prerequisite:** the notebook's site setup must already select the installed
+Palace runtime and a compatible Python. SCGSim supports Python 3.12 for this
+handoff, but a compatible recorder Python has not yet been verified on F1; the
+known F1 Python 3.6 and 3.8 installations are insufficient. This target path is
+therefore not yet end-to-end validated on F1.
+
+### 1. Package the prepared case locally
+
+From the parent directory containing the newly prepared run folder and its
+unchanged sibling `<run>.tar.gz`, put both into one transport archive:
+
+```bash
+run_id=my-case  # replace with the fresh name used in the notebook
+tar -czf "${run_id}-submission.tar.gz" "$run_id" "${run_id}.tar.gz"
+```
+
+### 2. Transfer through the F1 DTN
+
+Create the destination through the login node, then transfer the one outer
+archive through the data-transfer endpoint. `scp -s` selects SFTP mode; it
+does not run a shell on the DTN.
+
+```bash
+ssh f1-login 'mkdir -p palace-runs'
+scp -s "${run_id}-submission.tar.gz" f1-dtn:palace-runs/
+```
+
+### 3. Extract and submit from the F1 login node
+
+Log in through `f1-login`, not the DTN:
+
+```bash
+ssh f1-login
+```
+
+At the F1 shell prompt:
+
+```bash
+cd palace-runs
+run_id=my-case  # the same fresh name used above
+tar -xzf "${run_id}-submission.tar.gz"
+cd "$run_id"
+sbatch run_palace.sbatch
+```
+
+Submit from the extracted run directory: the generated Slurm script uses
+`SLURM_SUBMIT_DIR` as that directory's runtime location.
+
+Keep the original sibling `<run>.tar.gz` beside the returned run directory when
+copying results back for SCGSim resolution.
+
+### SCGSim runtime and archive reference
+
+In the local notebook's handoff controls, select the F1 account and resources,
+the exact installed Palace executable and `mpirun`, and the versioned
+`run-env.sh`. Setup commands source `run-env.sh`, prepend a site-approved
+directory containing the selected compatible `python3` to `PATH`, and then
+restore `OMP_NUM_THREADS` from `PALACE_THREADS`. The installed Spack runtime
+does not need a manual compiler or MPI module load.
+
+`prepare_handoff()` writes the run directory and seals its sibling
+`<run>.tar.gz` before writing
+`metadata/palace_resource_record.json` into the directory. The manual outer
+archive must therefore contain the complete run directory, including that
+record, plus the unchanged sibling archive. The outer archive is transport
+packaging, while the sibling archive remains the integrity authority required
+for return and resolution. The package carries the case and recorder; it is
+not a relocatable Palace installation.
+
+At execution, SCGSim records observed executable provenance and runs Palace's
+native configuration dry-run. It does not repeat full Spack build/store
+verification, prove an expected runtime-hash match, or independently pin the
+Python interpreter identity.
+
+See the source-pinned SCGSim
+[execution profiles](https://github.com/OrPenStrike/scgsim/blob/b9a6b1da8c7f9c9ac83ff794cab16171b074549c/docs/execution-profiles.qmd),
+[Notebook handoff contract](https://github.com/OrPenStrike/scgsim/blob/b9a6b1da8c7f9c9ac83ff794cab16171b074549c/docs/notebook-ux.qmd),
+and [Palace handoff source](https://github.com/OrPenStrike/scgsim/blob/b9a6b1da8c7f9c9ac83ff794cab16171b074549c/src/scgsim/palace/handoff.py)
+for the exact controls and binding details. The
+[advanced manual runner](#advanced-run-a-non-scgsim-case-manually) below is a
+separate non-SCGSim entry point.
+
+## Install Palace once on F1
+
+Installation preparation runs online on the login node. Compilation runs later
+inside an offline compute job. Use one clean checkout at the exact delivered
+revision:
 
 ```bash
 git clone https://github.com/arfiligol/palace.git
@@ -21,48 +111,26 @@ SLURM_PREFIX=/usr SLURM_SPACK_SPEC=slurm@=22-05-8-1 \
   scripts/spack-cpu/prepare.sh f1
 ```
 
-Copy the [F1 build template](examples/f1-build.sbatch) and
-[F1 run template](examples/f1-run.sbatch) outside the clean checkout. Edit the build
-template's `--account` and `PREPARATION` lines using the path printed by `prepare.sh`, then
-submit it. It delegates first to the frozen build script and then to the frozen non-solving
-validation script in that preparation:
+Copy the [F1 build template](examples/f1-build.sbatch) outside the clean
+checkout. Edit its `--account` and `PREPARATION` lines using the path printed by
+`prepare.sh`, then submit it. It delegates first to the frozen build script and
+then to the frozen non-solving validation script in that preparation:
 
 ```bash
 jobs=$HOME/palace-jobs
 mkdir -p "$jobs/logs"
 cp scripts/spack-cpu/examples/f1-build.sbatch "$jobs/my-palace-build.sbatch"
-cp scripts/spack-cpu/examples/f1-run.sbatch "$jobs/my-palace-run.sbatch"
 cd "$jobs"
 ${EDITOR:-vi} my-palace-build.sbatch
 sbatch my-palace-build.sbatch
 ```
 
-After the build completes, put a self-contained case outside the checkout and create its
-manifest beside it:
-
-```bash
-input=/absolute/path/to/input
-(cd "$input" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
-  > /absolute/path/to/input.sha256
-```
-
-Edit the run template copied above: set its account, preparation, input, manifest,
-configuration, ranks, threads, and time, then submit it. The file delegates to the reviewed
-runner stored in the preparation; it does not contain another solver path.
-
-```bash
-jobs=$HOME/palace-jobs
-mkdir -p "$jobs/logs"
-cd "$jobs"
-${EDITOR:-vi} my-palace-run.sbatch
-sbatch my-palace-run.sbatch
-```
-
-Both templates fail visibly while any `EDIT` placeholder remains. They never submit a
-follow-up job. Slurm writes stdout and stderr under `$HOME/palace-jobs/logs`; submitting
-from that external job directory keeps logs and private run metadata out of the checkout.
-See [the detailed reference](#detailed-reference) for receipts, optional
-Xmon inputs, validation, resource changes, failure handling, and LT Lab usage.
+The build template fails visibly while any `EDIT` placeholder remains and never
+submits a follow-up job. The F1 bootstrap GCC module is installation-only; a
+prepared SCGSim case later activates the installed compiler and MPI runtime by
+sourcing the versioned `run-env.sh`. See the
+[detailed reference](#detailed-reference) for receipts, validation, resource
+changes, failure handling, optional comparison inputs, and LT Lab usage.
 
 ## Detailed reference
 
@@ -119,6 +187,20 @@ does not by itself reject a compatible interpreter. The manifest-bound prepared
 clingo extension must import successfully and instantiate `clingo.Control` before any
 build work. Schema-1 preparations are diagnostic history and cannot be used for a new
 production build; rerun preparation with the current scripts.
+
+The Python used for Spack preparation and generic Palace verification is not
+the Python contract for SCGSim's copied recorder. Source inspection establishes
+3.9 only as a technical floor, not a tested or supported configuration; the
+SCGSim package declares `~=3.12.0` and supports Python 3.12 for this handoff.
+That path has not been runtime-tested on F1, and availability of the
+interpreter there is not established. F1's
+current default `python3` is 3.6.8, and this preparation's
+`/usr/bin/python3.8` verifier is also insufficient. The notebook's site setup
+must prepend a site-approved directory containing the selected `python3` to
+`PATH`; pointing `PATH` at `/usr/bin` does not select a compatible interpreter.
+The recorder uses the standard library and is copied into the run, so remote
+SCGSim installation is unnecessary. Current receipts do not independently pin
+or record the selected interpreter identity.
 
 ## Prepare on a login node
 
@@ -213,12 +295,14 @@ acceptance remains unset while this scope is CONVERGING.
 
 For future numerical jobs, use the installed Open MPI `mpirun` inside the Slurm allocation, derive ranks and threads from `SLURM_NTASKS` and `SLURM_CPUS_PER_TASK`, bind to cores, and do not oversubscribe. Multinode resource requests remain proposals until measured and authorized.
 
-## Run an owner-supplied case
+## Advanced: run a non-SCGSim case manually
 
-`run-case.sbatch` accepts one sealed, self-contained input directory without changing its
-configuration bytes. Create a SHA-256 manifest outside that directory; it must list every
-regular input file exactly once. Symbolic links, unlisted files, duplicate names, absolute
-paths, and `..` paths fail before Palace starts.
+This generic runner is for a manually assembled case that was not prepared by
+SCGSim. `run-case.sbatch` accepts one sealed, self-contained input directory
+without changing its configuration bytes. Create a SHA-256 manifest outside
+that directory; it must list every regular input file exactly once. Symbolic
+links, unlisted files, duplicate names, absolute paths, and `..` paths fail
+before Palace starts.
 
 ```bash
 input=/absolute/path/to/input
