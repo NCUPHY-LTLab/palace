@@ -161,14 +161,12 @@ def main():
     }
     (args.destination / "CASES.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     harness = r'''#!/usr/bin/env bash
-#SBATCH --job-name=palace-prepared-case
-#SBATCH --signal=B:TERM@60
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
-[[ $# == 3 ]] || { echo "Usage: $0 CASES.json CASE_ID RUN_ROOT" >&2; exit 2; }
+[[ $# == 3 ]] || { echo "Usage: $0 CASES.json CASE_ID RUN_DIR" >&2; exit 2; }
 manifest=$1
 case_id=$2
-export RUN_ROOT=$3
+export RUN_DIR=$3
 python=@PALACE_PYTHON@
 [[ -x $python ]] || { echo "prepared Python interpreter missing: $python" >&2; exit 1; }
 base=$(cd -- "$(dirname -- "$manifest")" && pwd -P)
@@ -188,7 +186,7 @@ export INPUT_DIR=$base/${selected[0]}
 export CONFIG=${selected[1]}
 export INPUT_MANIFEST=$base/${selected[2]}
 export RUN_PACKAGE=$PREPARATION/source/palace/scripts/spack-cpu
-exec "$RUN_PACKAGE/run-case.sbatch"
+exec "$RUN_PACKAGE/run-case.sh"
 '''
     run_one = args.destination / "run-one.sh"
     run_one.write_text(harness.replace("@PALACE_PYTHON@", shlex.quote(str(args.python.resolve()))))

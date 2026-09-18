@@ -62,8 +62,8 @@ connection is required.
 
 For reproducible CPU installations on NCHC Forerunner 1 and LT Lab, the repository also
 provides a locked [clone, offline build/install, and bundled-case validation
-guide](scripts/spack-cpu/README.md). The older [`scripts/f1`](scripts/f1/README.md) path is
-retained for the historical fixed-`1ea14a84` installation only.
+guide](scripts/spack-cpu/README.md). The retired `scripts/f1` workflow remains available only in the
+[historical fixed-base tree](https://github.com/arfiligol/palace/tree/5168949c8312dde19cbc4c74cdd858b9ecff74e6/scripts/f1).
 
 System requirements:
 

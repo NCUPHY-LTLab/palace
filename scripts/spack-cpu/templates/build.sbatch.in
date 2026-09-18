@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=palace-build
+#SBATCH --account=@ACCOUNT@
+#SBATCH --partition=@PARTITION@
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=@BUILD_CPUS@
+#SBATCH --time=@BUILD_TIME@
+#SBATCH --output=@LOG_DIR@/%x-%j.out
+#SBATCH --error=@LOG_DIR@/%x-%j.err
+set -euo pipefail
+
+PREPARATION='@PREPARATION@'
+core="$PREPARATION/source/palace/scripts/spack-cpu/build.sh"
+[[ -x $core ]] || { echo "frozen build core is missing: $core" >&2; exit 1; }
+export PREPARATION
+exec "$core"

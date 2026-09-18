@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=palace-validate
+#SBATCH --account=@ACCOUNT@
+#SBATCH --partition=@PARTITION@
+#SBATCH --nodes=1
+#SBATCH --ntasks=@VALIDATE_RANKS@
+#SBATCH --cpus-per-task=@VALIDATE_THREADS@
+#SBATCH --time=@VALIDATE_TIME@
+#SBATCH --signal=B:TERM@60
+#SBATCH --output=@LOG_DIR@/%x-%j.out
+#SBATCH --error=@LOG_DIR@/%x-%j.err
+set -euo pipefail
+
+: "${SLURM_JOB_ID:?submit this script with sbatch}"
+PREPARATION='@PREPARATION@'
+VALIDATION_ROOT='@VALIDATION_ROOT@'
+VALIDATION_DIR="$VALIDATION_ROOT/$SLURM_JOB_ID"
+core="$PREPARATION/source/palace/scripts/spack-cpu/validate-public.sh"
+[[ -x $core ]] || { echo "frozen public validation core is missing: $core" >&2; exit 1; }
+[[ -d $VALIDATION_ROOT ]] || { echo "validation root is missing: $VALIDATION_ROOT" >&2; exit 1; }
+export PREPARATION VALIDATION_DIR
+exec "$core"

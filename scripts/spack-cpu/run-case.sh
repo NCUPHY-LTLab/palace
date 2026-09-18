@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=palace-case
-#SBATCH --signal=B:TERM@60
 set -euo pipefail
 umask 077
 export PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
@@ -13,19 +11,21 @@ unset PYTHONHOME PYTHONPATH
 : "${INPUT_DIR:?set INPUT_DIR to the sealed input directory}"
 : "${INPUT_MANIFEST:?set INPUT_MANIFEST to its SHA-256 manifest}"
 : "${CONFIG:?set CONFIG to its relative configuration path}"
-: "${RUN_ROOT:?set RUN_ROOT to an existing absolute output root}"
+: "${RUN_DIR:?set RUN_DIR to a new absolute output directory}"
 : "${RUN_PACKAGE:?set RUN_PACKAGE to the reviewed run-case package snapshot}"
 [[ $SLURM_NTASKS =~ ^[1-9][0-9]*$ && $SLURM_CPUS_PER_TASK =~ ^[1-9][0-9]*$ ]] || { echo "Slurm ranks and threads must be positive" >&2; exit 2; }
-for path in "$PREPARATION" "$INPUT_DIR" "$INPUT_MANIFEST" "$RUN_ROOT" "$RUN_PACKAGE"; do
+for path in "$PREPARATION" "$INPUT_DIR" "$INPUT_MANIFEST" "$RUN_DIR" "$RUN_PACKAGE"; do
   [[ $path == /* ]] || { echo "run paths must be absolute: $path" >&2; exit 2; }
 done
 [[ -d $INPUT_DIR && ! -L $INPUT_DIR && -f $INPUT_MANIFEST && ! -L $INPUT_MANIFEST ]] || { echo "input directory and manifest must be nonsymlink objects" >&2; exit 2; }
-[[ -d $RUN_ROOT && ! -L $RUN_ROOT ]] || { echo "RUN_ROOT must be an existing nonsymlink directory" >&2; exit 2; }
-run_root=$(realpath "$RUN_ROOT")
+[[ ! -e $RUN_DIR ]] || { echo "RUN_DIR already exists: $RUN_DIR" >&2; exit 1; }
+run_parent=$(dirname -- "$RUN_DIR")
+[[ -d $run_parent && ! -L $run_parent ]] || { echo "RUN_DIR parent must be an existing nonsymlink directory" >&2; exit 2; }
+run_dir=$RUN_DIR
 [[ -d $RUN_PACKAGE && ! -L $RUN_PACKAGE ]] || { echo "RUN_PACKAGE must be a nonsymlink directory" >&2; exit 2; }
 package=$(realpath "$RUN_PACKAGE")
 helper=$package/run_case.py
-canonical_script=$package/run-case.sbatch
+canonical_script=$package/run-case.sh
 [[ -f $helper && ! -L $helper && -f $canonical_script && ! -L $canonical_script ]] || { echo "reviewed run package is incomplete" >&2; exit 1; }
 cmp -s "$canonical_script" "${BASH_SOURCE[0]}" || { echo "submitted script differs from RUN_PACKAGE authority" >&2; exit 1; }
 expected_helper_sha=396985f36266e0f7c62e59e8721e9e39a51aef246f4a01abddc5a824817640ca
@@ -50,8 +50,6 @@ export PALACE_BIN PALACE_MPIRUN
 receipt_binary=$("$python" -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["palace_binary"])' "$BUILD_RECEIPT")
 [[ $PALACE_BIN == "$receipt_binary" ]] || { echo "runtime executable differs from build receipt" >&2; exit 1; }
 
-run_dir=$run_root/$SLURM_JOB_ID
-[[ ! -e $run_dir ]] || { echo "run directory already exists: $run_dir" >&2; exit 1; }
 mkdir "$run_dir"
 export CONFIG RUN_STARTED_UTC=$(date -u +%FT%TZ)
 phase=startup
@@ -88,7 +86,11 @@ on_signal() {
   [[ $phase == *-signal ]] || phase=${phase}-signal
   finalized=0
   if [[ -n ${child_pid:-} ]]; then
-    kill -TERM "$child_pid" 2>/dev/null || true
+    kill -s "$signal_name" "$child_pid" 2>/dev/null || true
+    # Bash starts asynchronous commands with SIGINT ignored. Forward INT for
+    # provenance, then use TERM to ensure the child is reaped; the outer
+    # status and receipt still preserve the observed INT as 130.
+    [[ $signal_name != INT ]] || kill -TERM "$child_pid" 2>/dev/null || true
   elif [[ $signal_name == TERM ]]; then
     exit 143
   else
