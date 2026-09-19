@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Custom single-case submission example. Bundled installation validation uses
+# the prepare-generated validate.sbatch instead.
 #SBATCH --job-name=palace-case
 #SBATCH --account=EDIT_ACCOUNT
 #SBATCH --partition=EDIT_PARTITION
