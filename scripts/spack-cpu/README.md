@@ -6,11 +6,11 @@ compute nodes. No step submits or retries a job for you.
 
 ## 1. Clone
 
-Clone the public CPU-install topic and keep the checkout clean. Preparation
+Clone the public `develop` branch and keep the checkout clean. Preparation
 records its exact commit.
 
 ```bash
-git clone --branch codex/palace-018-cpu-spack --single-branch \
+git clone --branch develop --single-branch \
   https://github.com/arfiligol/palace.git
 cd palace
 test -z "$(git status --porcelain)"
