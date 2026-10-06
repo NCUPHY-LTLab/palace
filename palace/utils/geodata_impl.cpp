@@ -250,6 +250,33 @@ BoundingBox BoundingBoxFromPointCloud(MPI_Comm comm,
     const Eigen::Vector3d origin = v_000;
     const Eigen::Vector3d n_1 = (v_111 - v_000).normalized();
 
+    auto EnclosePointCloud = [&](Eigen::Vector3d &center, Eigen::Vector3d (&axes)[3],
+                                 double minimum_half_width)
+    {
+      // The inferred axes need not be orthogonal: use frame coordinates, not projections.
+      Eigen::Matrix3d frame;
+      for (int i = 0; i < 3; i++)
+      {
+        frame.col(i) = axes[i].normalized();
+      }
+      const Eigen::Matrix3d inverse_frame = frame.inverse();
+      Eigen::Vector3d lower = inverse_frame * (vertices.front() - origin);
+      Eigen::Vector3d upper = lower;
+      for (const auto &v : vertices)
+      {
+        const Eigen::Vector3d local = inverse_frame * (v - origin);
+        lower = lower.cwiseMin(local);
+        upper = upper.cwiseMax(local);
+      }
+      center = origin + frame * (0.5 * (lower + upper));
+      Eigen::Vector3d half_lengths = 0.5 * (upper - lower);
+      half_lengths(1) = std::max(half_lengths(1), minimum_half_width);
+      for (int i = 0; i < 3; i++)
+      {
+        axes[i] = frame.col(i) * half_lengths(i);
+      }
+    };
+
     // Find the vertex furthest from the diagonal axis. We cannot know yet if this defines
     // (001) or (011). For collinear point sets (e.g. 1D boundary edges in 2D), the
     // perpendicular distance is zero for all points, so we handle that as a degenerate
@@ -267,9 +294,8 @@ BoundingBox BoundingBoxFromPointCloud(MPI_Comm comm,
     collinear = (max_perp_dist < rel_tol * diag_length);
     if (collinear)
     {
-      // Collinear case: all points lie on the same line. Build a bounding box with the
-      // primary axis along the line and a perpendicular second axis (zero length but
-      // defines the direction, needed for lumped port direction alignment in 2D).
+      // Preserve the collinear branch's synthetic transverse width for perpendicular
+      // lumped port excitation, while enclosing any actual transverse point offsets.
       box.planar = true;
       Eigen::Vector3d eig_center = 0.5 * (v_000 + v_111);
       Eigen::Vector3d eig_axis = 0.5 * (v_111 - v_000);
@@ -294,14 +320,23 @@ BoundingBox BoundingBoxFromPointCloud(MPI_Comm comm,
         perp.normalize();
         perp *= eig_axis.norm();
       }
+      else
+      {
+        // Complete only an undefined transverse direction; preserve every defined one.
+        perp = n_1.unitOrthogonal() * eig_axis.norm();
+      }
+      Eigen::Vector3d eig_axes[3] = {eig_axis, perp, n_1.cross(perp)};
+      EnclosePointCloud(eig_center, eig_axes, perp.norm());
       box.center.SetSize(3);
       box.axes.SetSize(3, 3);
       box.axes = 0.0;
       for (int i = 0; i < 3; i++)
       {
         box.center(i) = eig_center(i);
-        box.axes(i, 0) = eig_axis(i);
-        box.axes(i, 1) = perp(i);  // Zero-length perpendicular (direction only)
+        for (int j = 0; j < 3; j++)
+        {
+          box.axes(i, j) = eig_axes[j](i);
+        }
       }
     }
     if (!collinear)
@@ -428,21 +463,11 @@ BoundingBox BoundingBoxFromPointCloud(MPI_Comm comm,
 
         eig_axes[0] = e_0;
         eig_axes[1] = e_1;
-        eig_axes[2] = box.planar ? Eigen::Vector3d::Zero() : e_0.cross(e_1);
+        eig_axes[2] = e_0.cross(e_1);
       }
 
-      // Scale axes by length of the box in each direction.
-      std::array<double, 3> l = {0.0};
-      for (const auto &v : {v_000, v_001, v_011, v_111})
-      {
-        const auto v_0 = v - eig_center;
-        l[0] = std::max(l[0], std::abs(v_0.dot(eig_axes[0])));
-        l[1] = std::max(l[1], std::abs(v_0.dot(eig_axes[1])));
-        l[2] = std::max(l[2], std::abs(v_0.dot(eig_axes[2])));
-      }
-      eig_axes[0] *= l[0];
-      eig_axes[1] *= l[1];
-      eig_axes[2] *= l[2];
+      // Include all collected points, including transverse offsets classified as planar.
+      EnclosePointCloud(eig_center, eig_axes, 0.0);
 
       // Make sure the longest dimension comes first.
       std::sort(std::begin(eig_axes), std::end(eig_axes),
