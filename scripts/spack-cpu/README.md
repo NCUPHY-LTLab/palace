@@ -1,6 +1,7 @@
 # Install and validate Palace CPU with Spack
 
-This guide assumes you know how to edit, submit, and inspect Slurm jobs.
+This workflow installs the Palace 0.18.1 fork with its pinned dependencies.
+It assumes you know how to edit, submit, and inspect Slurm jobs.
 Preparation downloads on the login node; build and validation run offline on
 compute nodes. No step submits or retries a job for you.
 

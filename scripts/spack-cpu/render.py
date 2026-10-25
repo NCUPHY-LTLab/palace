@@ -62,7 +62,7 @@ def main():
     palace_recipe = repository / "packages/palace/package.py"
     add_version(
         palace_recipe,
-        '    version("0.18.0-scq", url="file://{0}", sha256="{1}")'.format(
+        '    version("0.18.1-scq", url="file://{0}", sha256="{1}")'.format(
             args.source_archive.resolve(), args.source_sha256
         ),
     )
@@ -100,7 +100,7 @@ def main():
   - group: palace
     needs: [compiler]
     matrix:
-    - [local.palace@=0.18.0-scq +shared +openmp +superlu-dist +mumps +slepc +arpack +sundials +gslib +libxsmm ~strumpack ~cuda ~rocm ~int64 build_type=Release cxxstd=17]
+    - [local.palace@=0.18.1-scq +shared +openmp +superlu-dist +mumps +slepc +arpack +sundials +gslib +libxsmm ~strumpack ~cuda ~rocm ~int64 build_type=Release cxxstd=17]
     - ["%c,cxx,fortran=gcc@15.2.0"]
   view: false
   concretizer:

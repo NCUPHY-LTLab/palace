@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "palace": {
-    "upstream_commit": "b92aef83ecfe6d360c4b3d83e2122986297f6778",
-    "upstream_tree": "1880ff0e0cc8d91efdae681ae8d5c1cefe36981b",
-    "reviewed_native_tree": "babb784bc7241db98c7018a79951d4c002138686",
-    "solver_content_manifest_sha256": "0a944d9f33327a98df24618a70ebef88440680318e0d38951f260050877c4a6d",
+    "upstream_commit": "0dc74cdf8c36c58b69b21c4a06e816048ec0b83f",
+    "upstream_tree": "efad2f182fd287691846132b9f5c3e3c1393ba2f",
+    "reviewed_native_tree": "3786f14411d0e14a8cca8f26c66e0b869fb010ce",
+    "solver_content_manifest_sha256": "3d8ed47b2a790fa802bbdd46c1605d4342a344efa744f7bb94423f084a3f8cdf",
     "solver_content_excludes": [
       "scripts/spack-cpu/",
       "spack_repo/"

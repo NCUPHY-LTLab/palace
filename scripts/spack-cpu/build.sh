@@ -158,12 +158,12 @@ stage() {
 set_phase compiler
 stage compiler "$python" "$spack" -e "$environment" install --only-concrete --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'gcc@=15.2.0'
 set_phase dependencies
-stage dependencies "$python" "$spack" -e "$environment" install --only-concrete --only dependencies --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'local.palace@=0.18.0-scq'
+stage dependencies "$python" "$spack" -e "$environment" install --only-concrete --only dependencies --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'local.palace@=0.18.1-scq'
 set_phase palace
-stage palace "$python" "$spack" -e "$environment" install --only-concrete --only package --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'local.palace@=0.18.0-scq'
+stage palace "$python" "$spack" -e "$environment" install --only-concrete --only package --fail-fast -p 1 -j "$SLURM_CPUS_PER_TASK" 'local.palace@=0.18.1-scq'
 
 set_phase installed_locations
-prefix=$("$python" "$spack" -e "$environment" location -i 'local.palace@=0.18.0-scq')
+prefix=$("$python" "$spack" -e "$environment" location -i 'local.palace@=0.18.1-scq')
 prefix=$(realpath "$prefix")
 binary_path="$prefix/bin/palace-x86_64.bin"
 [[ -x $binary_path ]] || fail "installed Palace executable not found in $prefix/bin"
@@ -182,7 +182,7 @@ mpirun=$(realpath "$openmpi_prefix/bin/mpirun")
 set_phase runtime_artifacts
 [[ ! -e $completion_tmp ]] || fail "completion staging path already exists"
 mkdir "$completion_tmp"
-"$python" "$spack" -e "$environment" load --sh 'local.palace@=0.18.0-scq' > "$completion_tmp/run-env.sh"
+"$python" "$spack" -e "$environment" load --sh 'local.palace@=0.18.1-scq' > "$completion_tmp/run-env.sh"
 cat >> "$completion_tmp/run-env.sh" <<EOF
 export PALACE_BIN='$binary'
 export PALACE_MPIRUN='$mpirun'
