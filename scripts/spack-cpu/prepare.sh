@@ -67,7 +67,7 @@ sitecheck() {
     --field slurm_spec "$SLURM_SPACK_SPEC" --field slurm_prefix "$slurm_prefix" --field srun "$slurm_command" \
     --field srun_sha256 "$slurm_sha" --field srun_version "$slurm_runtime" \
     --field case_mode "$case_mode" --field case_identity "$case_identity")
-  id="palace-0.18.1-${revision:0:12}-${site}-${plan_key:0:12}"
+  id="palace-main-${revision:0:12}-${site}-${plan_key:0:12}"
   prep="$root/preparations/$id"
   version="$root/versions/$id"
   cache="$root/cache"

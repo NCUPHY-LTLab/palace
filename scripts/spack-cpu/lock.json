@@ -1,14 +1,17 @@
 {
   "schema": 1,
   "palace": {
-    "upstream_commit": "0dc74cdf8c36c58b69b21c4a06e816048ec0b83f",
-    "upstream_tree": "efad2f182fd287691846132b9f5c3e3c1393ba2f",
-    "reviewed_native_tree": "3786f14411d0e14a8cca8f26c66e0b869fb010ce",
-    "solver_content_manifest_sha256": "3d8ed47b2a790fa802bbdd46c1605d4342a344efa744f7bb94423f084a3f8cdf",
+    "upstream_commit": "7d6b52486facb5717b3f29698a6fefc230033200",
+    "upstream_tree": "bc8f42285fb0ca78bbab1199d6e123faeb78c1f5",
+    "reviewed_native_tree": "6e1096cfba5695c51e47d3fe3b1e477648996cb0",
+    "solver_content_manifest_sha256": "c702267886e4b16d96b2ced5263d12f7e7cda1dc4236fa8881fd7764d2a88c5c",
     "solver_content_excludes": [
       "scripts/spack-cpu/",
       "spack_repo/"
-    ]
+    ],
+    "recipe_version": "0.19.0-scq",
+    "recipe_version_meaning": "Checksum-bound current-main fork snapshot selecting upstream @0.19 dependency rules; not an upstream release",
+    "native_project_version": "0.18.1"
   },
   "public_input": {
     "archive_sha256": "c73772d1e8f739c3f174eecffb4a2b8bc5df7b2c622aa7302d4ea3adc09cdff6",
@@ -25,70 +28,69 @@
     "sha256": "40ff134b1ac95441244ab62193acf3dffb7ce4387a74e052d89e2bad95b350e7"
   },
   "packages": {
-    "commit": "c3b260e171988c0ef05220174e8ada7efdbd6499",
-    "archive": "spack-packages-c3b260e171988c0ef05220174e8ada7efdbd6499.tar.gz",
-    "url": "https://codeload.github.com/spack/spack-packages/tar.gz/c3b260e171988c0ef05220174e8ada7efdbd6499",
-    "sha256": "9dceb69f93e0f8e2ada2f8b70559a4b73779a48fbb32770edbda390b192de73b"
+    "commit": "ef05700808eb32fe932a76de9254a3c4a5f94f2c",
+    "archive": "spack-packages-ef05700808eb32fe932a76de9254a3c4a5f94f2c.tar.gz",
+    "url": "https://codeload.github.com/spack/spack-packages/tar.gz/ef05700808eb32fe932a76de9254a3c4a5f94f2c",
+    "sha256": "8fd0f16e15643a93a20932597abcd01b6b429fac6239c7f6006addfe75e525fb"
   },
   "package_patches": [
     {
-      "file": "spack_repo/patches/pr4000_metis.diff",
-      "sha256": "ab632f08ea972ebba91d9ee08754497fb4e6099f95229ec9c9223b200a659299"
+      "file": "spack_repo/patches/pr5895_mfem_multi_cuda_arch.diff",
+      "sha256": "74a393f68f73fcf166d43e9c982b39b66ea9687cc447641f99ddab34bdba1e41"
     },
     {
-      "file": "spack_repo/patches/pr6246_openblas.diff",
-      "sha256": "e3b53f9167819f95433e900ad80301658529e8873f76b7c577d559523cfc158e"
+      "file": "spack_repo/patches/pr6425_libceed_o3.diff",
+      "sha256": "0793a99bfbf6e95601d827a7ef376c721d81e0c3bb4f34f299a55c69f98b48b8"
+    },
+    {
+      "file": "spack_repo/patches/pr6666_petsc_curand13_version.diff",
+      "sha256": "b63f390ada65f80559f8a7b63b41f23d8eefab12b5c143fd0a5f440bf7124c1f"
+    },
+    {
+      "file": "spack_repo/patches/pr6692_cuda_libxml2_soname.diff",
+      "sha256": "ff1e3afbe170617199feb47fc33ab07ba483f8fee2739a5f4a502d9d2d0df29d"
+    },
+    {
+      "file": "spack_repo/patches/pr6701_petsc_known_64bit_blas.diff",
+      "sha256": "f89896f9cbdb5388f09cc07354a76329e2515e80ddd679410c193b7670176adb"
+    },
+    {
+      "file": "spack_repo/patches/pr7029_mumps_darwin_avoid_mpi_in_place.diff",
+      "sha256": "c5a5ecd73aefee78c4c7f10462e99aef6671de3355b0c815b8315f634362e012"
     }
   ],
   "snapshots": [
     {
-      "package": "arpack-ng",
-      "directory": "arpack_ng",
-      "version": "3.9.2-palace018",
-      "commit": "804fa3149a0f773064198a8e883bd021832157ca",
-      "url": "https://codeload.github.com/opencollab/arpack-ng/tar.gz/804fa3149a0f773064198a8e883bd021832157ca",
-      "sha256": "b8a2e033e3a61bea453cc54e6575d5b4020c01151ad2b37f6fc1a0734154ac8e"
-    },
-    {
-      "package": "hypre",
-      "directory": "hypre",
-      "version": "3.2.1-palace018",
-      "commit": "fca98afcd78a26b784dc24b0c3edb0e6140598af",
-      "url": "https://codeload.github.com/hypre-space/hypre/tar.gz/fca98afcd78a26b784dc24b0c3edb0e6140598af",
-      "sha256": "a81d0e9923d890642bf3294698339c418815c027f39aad003ce53287c2279cb6"
-    },
-    {
       "package": "libceed",
       "directory": "libceed",
-      "version": "0.13.99-palace018",
-      "commit": "39f259f89332e936122f7e02d6088a1dae3fb628",
-      "url": "https://codeload.github.com/CEED/libCEED/tar.gz/39f259f89332e936122f7e02d6088a1dae3fb628",
-      "sha256": "68cb5766dc7e6534ce83c5d6916eb834afbbedc2d287109157a22ca4defcf9cd"
+      "version": "1.0.0",
+      "commit": "8a374e8d5d8d33fd19ce69a93026384ec1046a86",
+      "url": "https://codeload.github.com/CEED/libCEED/tar.gz/8a374e8d5d8d33fd19ce69a93026384ec1046a86",
+      "sha256": "83c588eee1ce950c55ccd4e259194dd6f298be96ab7bdce97acfa14b1ea79e8c"
     },
     {
-      "package": "libxsmm",
-      "directory": "libxsmm",
-      "version": "2.1.99-palace018",
-      "commit": "ea0b20499a41377bab148257240adbbfe1b4a333",
-      "url": "https://codeload.github.com/libxsmm/libxsmm/tar.gz/ea0b20499a41377bab148257240adbbfe1b4a333",
-      "sha256": "ed8be9b3d575a215807af0906e185614a9aeb7c0869cbec93f93f3739b71c841"
+      "package": "superlu-dist",
+      "directory": "superlu_dist",
+      "version": "9.3.0",
+      "commit": "7e73329b2c2ac47dde14bf8bc4fa2704e281e65c",
+      "url": "https://codeload.github.com/xiaoyeli/superlu_dist/tar.gz/7e73329b2c2ac47dde14bf8bc4fa2704e281e65c",
+      "sha256": "d2d586054795dbc3fb5cea990d7b3f13b59b525402f9981177436d512d43aad9"
     },
     {
-      "package": "mfem",
-      "directory": "mfem",
-      "version": "4.9.1-palace018",
-      "commit": "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
-      "url": "https://codeload.github.com/mfem/mfem/tar.gz/d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
-      "sha256": "5088f518d830086b5d8a809258cac031e87e71b8b243a2c1f5e985e4cc3b5539"
+      "package": "petsc",
+      "directory": "petsc",
+      "version": "3.26.0",
+      "commit": "1136c0bd63ce5f2898c194cf902c865c0c60698c",
+      "url": "https://gitlab.com/petsc/petsc/-/archive/1136c0bd63ce5f2898c194cf902c865c0c60698c/petsc-1136c0bd63ce5f2898c194cf902c865c0c60698c.tar.gz",
+      "sha256": "f796c4c9f497fd87f8eb58df7905cc3aad7916f16002dd4d4b4deb040c7bd14e"
     },
     {
-      "package": "netlib-scalapack",
-      "directory": "netlib_scalapack",
-      "archive": "scalapack-6423f17933eb9a2522814b78ab3c0d6da25ee85a.tar.gz",
-      "version": "2.2.1-palace018",
-      "commit": "6423f17933eb9a2522814b78ab3c0d6da25ee85a",
-      "url": "https://codeload.github.com/Reference-ScaLAPACK/scalapack/tar.gz/6423f17933eb9a2522814b78ab3c0d6da25ee85a",
-      "sha256": "09fb66c2953a310fd761104b12f534fc4858abe1648d5307fd300c38610c5934"
+      "package": "slepc",
+      "directory": "slepc",
+      "version": "3.26.0",
+      "commit": "47ba173c59b17f96639fef93d8b06047f9e4cea6",
+      "url": "https://gitlab.com/slepc/slepc/-/archive/47ba173c59b17f96639fef93d8b06047f9e4cea6/slepc-47ba173c59b17f96639fef93d8b06047f9e4cea6.tar.gz",
+      "sha256": "145afbb284577d3702f9689544f31be7b97e253ddea79e54b274f28c354ada14"
     }
   ],
   "released_versions": {
@@ -96,16 +98,22 @@
     "openmpi": "5.0.10",
     "openblas": "0.3.34",
     "zlib": "1.3.2",
-    "mumps": "5.7.3",
-    "petsc": "3.24.3",
-    "slepc": "3.24.1",
-    "superlu-dist": "9.2.1",
-    "sundials": "7.5.0",
+    "mumps": "5.9.1",
+    "petsc": "3.26.0",
+    "slepc": "3.26.0",
+    "superlu-dist": "9.3.0",
+    "sundials": "7.9.0",
     "gslib": "1.0.9",
     "nlohmann-json": "3.12.0",
     "nlohmann-json-schema-validator": "2.4.0",
     "fmt": "12.1.0",
     "scnlib": "4.0.1",
-    "eigen": "5.0.0"
+    "eigen": "5.0.1",
+    "arpack-ng": "3.9.1",
+    "hypre": "3.2.0",
+    "libceed": "1.0.0",
+    "libxsmm": "2.1.0",
+    "mfem": "4.10.0",
+    "netlib-scalapack": "2.2.3"
   }
 }

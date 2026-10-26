@@ -1,6 +1,8 @@
 # Install and validate Palace CPU with Spack
 
-This workflow installs the Palace 0.18.1 fork with its pinned dependencies.
+This workflow installs the fork of upstream `main` at `7d6b52486facb5717b3f29698a6fefc230033200` with its pinned dependencies.
+The native project version is 0.18.1; `0.19.0-scq` is the archive-bound Spack
+selector for the current-main dependency rules, not an upstream release.
 It assumes you know how to edit, submit, and inspect Slurm jobs.
 Preparation downloads on the login node; build and validation run offline on
 compute nodes. No step submits or retries a job for you.
@@ -12,7 +14,7 @@ records its exact commit.
 
 ```bash
 git clone --branch develop --single-branch \
-  https://github.com/arfiligol/palace.git
+  https://github.com/NCUPHY-LTLab/palace.git
 cd palace
 test -z "$(git status --porcelain)"
 ```

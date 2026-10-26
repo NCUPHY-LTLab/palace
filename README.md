@@ -5,6 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Palace: 3D Finite Element Solver for Computational Electromagnetics
 
+This fork's `main` branch mirrors `awslabs/palace` `main`. Customized solver features
+are developed on `develop`; use `develop` when installing this fork.
+
 [![CI (Linux)](https://github.com/awslabs/palace/actions/workflows/build-and-test-linux.yml/badge.svg)](https://github.com/awslabs/palace/actions/workflows/build-and-test-linux.yml)
 [![CI (macOS)](https://github.com/awslabs/palace/actions/workflows/build-and-test-macos.yml/badge.svg)](https://github.com/awslabs/palace/actions/workflows/build-and-test-macos.yml)
 [![](https://img.shields.io/badge/docs-stable-blue.svg)](https://awslabs.github.io/palace/stable)
@@ -67,8 +70,8 @@ guide](scripts/spack-cpu/README.md). The retired `scripts/f1` workflow remains a
 
 System requirements:
 
-  - CMake version 3.24 or later
-  - C++17 compatible C++ compiler
+  - CMake version 3.27 or later
+  - C++20 compatible C++ compiler
   - C and Fortran (optional) compilers for dependency builds
   - MPI distribution
   - BLAS, LAPACK libraries

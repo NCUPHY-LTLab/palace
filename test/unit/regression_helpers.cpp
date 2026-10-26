@@ -68,7 +68,7 @@ FileListing ListRegressionFiles(const std::filesystem::path &root,
     if (it->is_directory())
     {
       out.dirs.insert(std::filesystem::relative(it->path(), root).generic_string());
-      if (skip_dirs.count(it->path().filename().string()))
+      if (skip_dirs.contains(it->path().filename().string()))
       {
         it.disable_recursion_pending();
       }
@@ -617,9 +617,9 @@ void RunRegressionCase(std::string_view case_dir, std::string_view config_json,
     // listing so their absence in the reference tree is not flagged as a missing file.
     for (auto it = got.csv_files.begin(); it != got.csv_files.end();)
     {
-      const bool unstored = std::any_of(
-          effective_opts.unstored_files.begin(), effective_opts.unstored_files.end(),
-          [&it](const std::string &pat) { return it->find(pat) != std::string::npos; });
+      const bool unstored =
+          std::ranges::any_of(effective_opts.unstored_files, [&it](const std::string &pat)
+                              { return it->find(pat) != std::string::npos; });
       it = unstored ? got.csv_files.erase(it) : std::next(it);
     }
 
@@ -644,9 +644,9 @@ void RunRegressionCase(std::string_view case_dir, std::string_view config_json,
 
       // Presence in both trees is already established above; skip excluded files
       // before any shape/header/value comparison.
-      const bool excluded = std::any_of(
-          effective_opts.excluded_files.begin(), effective_opts.excluded_files.end(),
-          [&rel](const std::string &pat) { return rel.find(pat) != std::string::npos; });
+      const bool excluded =
+          std::ranges::any_of(effective_opts.excluded_files, [&rel](const std::string &pat)
+                              { return rel.find(pat) != std::string::npos; });
       if (excluded)
       {
         continue;
@@ -658,8 +658,10 @@ void RunRegressionCase(std::string_view case_dir, std::string_view config_json,
       auto custom_it = effective_opts.custom_checks.find(rel);
       if (custom_it != effective_opts.custom_checks.end())
       {
-        if (ValidateCSVTables(a, r, effective_opts) &&
-            !SkipNumericComparison(effective_opts))
+        // A custom check owns its numeric tolerance policy. Run it even when the generic
+        // table comparison is disabled with infinite tolerances (adaptive smoke tests can
+        // still require a targeted physical observable such as complex S-parameters).
+        if (ValidateCSVTables(a, r, effective_opts))
         {
           custom_it->second(a, r, actual);
         }

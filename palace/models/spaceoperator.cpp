@@ -3,6 +3,7 @@
 
 #include "spaceoperator.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <set>
 #include <type_traits>
@@ -68,6 +69,9 @@ SpaceOperator::SpaceOperator(const config::SolverData &solver,
     port_excitation_helper(lumped_port_op, wave_port_op, floquet_port_op, surf_j_op,
                            current_dipole_op)
 {
+  // Configure the two shared libCEED element sets before any geometry data is built.
+  SetUpCeedElementSets(mesh);
+
   // In 2D, curl maps H(curl) → L2 (scalar), so we need an L2 FE space for B = curl E.
   // Must use INTEGRAL map type so the discrete interpolator recognizes this as the curl
   // target space.
@@ -100,6 +104,58 @@ SpaceOperator::SpaceOperator(const IoData &iodata,
 {
   // Validate excitations after wave port setup is complete.
   CheckExcitations(iodata.problem.type);
+}
+
+void SpaceOperator::SetUpCeedElementSets(const std::vector<std::unique_ptr<Mesh>> &mesh)
+{
+  // The lossy volume set is the union of the exact nonzero supports of the loss-type
+  // MaterialOperator coefficients, each extracted on its own (summing the tensors first
+  // could cancel entries of opposite sign and drop an attribute). This MaterialOperator has
+  // no imaginary permeability property; add it here if one is introduced.
+  MaterialPropertyCoefficient loss_epsilon(mat_op.GetAttributeToMaterial(),
+                                           mat_op.GetPermittivityImag());
+  MaterialPropertyCoefficient loss_conductivity(mat_op.GetAttributeToMaterial(),
+                                                mat_op.GetConductivity());
+  std::vector<int> lossy_attr;
+  loss_epsilon.AddNonzeroAttributes(lossy_attr);
+  loss_conductivity.AddNonzeroAttributes(lossy_attr);
+  std::sort(lossy_attr.begin(), lossy_attr.end());
+  lossy_attr.erase(std::unique(lossy_attr.begin(), lossy_attr.end()), lossy_attr.end());
+
+  // All boundary bilinear-form coefficients are supported on this global attribute union.
+  std::vector<int> active_bdr_global;
+  auto AddAttributes = [&active_bdr_global](const mfem::Array<int> &attr)
+  { active_bdr_global.insert(active_bdr_global.end(), attr.begin(), attr.end()); };
+  AddAttributes(farfield_op.GetAttrList());
+  AddAttributes(surf_sigma_op.GetAttrList());
+  AddAttributes(surf_z_op.GetAttrList());
+  AddAttributes(surf_rz_op.GetAttrList());
+  AddAttributes(lumped_port_op.GetAttrList());
+  AddAttributes(wave_port_op.GetAttrList());
+  AddAttributes(floquet_port_op.GetAttrList());
+  std::sort(active_bdr_global.begin(), active_bdr_global.end());
+  active_bdr_global.erase(std::unique(active_bdr_global.begin(), active_bdr_global.end()),
+                          active_bdr_global.end());
+
+  // Convert the fine-mesh process-local lossy set back to global attributes. Then map both
+  // global unions directly into the local numbering of every h-level mesh. The p-levels
+  // share the finest mesh and ordering.
+  std::vector<int> lossy_global;
+  for (const auto &[attr, local_attr] : mat_op.GetMesh().GetCeedAttributes())
+  {
+    if (std::binary_search(lossy_attr.begin(), lossy_attr.end(), local_attr))
+    {
+      lossy_global.push_back(attr);
+    }
+  }
+  for (const auto &mesh_l : mesh)
+  {
+    auto lossy_attr_l = mesh_l->GetCeedAttributes(lossy_global);
+    auto active_bdr_attr_l = mesh_l->GetCeedBdrAttributes(active_bdr_global);
+    mesh_l->SetCeedActiveAttributes(
+        std::vector<int>(lossy_attr_l.begin(), lossy_attr_l.end()),
+        std::vector<int>(active_bdr_attr_l.begin(), active_bdr_attr_l.end()));
+  }
 }
 
 void SpaceOperator::CheckExcitations(ProblemType problem_type) const
@@ -266,12 +322,6 @@ void PrintHeader(const mfem::ParFiniteElementSpace &h1_fespace,
   print_hdr = false;
 }
 
-const MaterialPropertyCoefficient *
-ActiveCoefficient(const MaterialPropertyCoefficient *coeff)
-{
-  return (coeff && !coeff->IsExactlyZero()) ? coeff : nullptr;
-}
-
 template <typename... CoeffType>
 bool AreExactlyZero(const CoeffType &...coeff)
 {
@@ -279,8 +329,9 @@ bool AreExactlyZero(const CoeffType &...coeff)
 }
 
 // Add every configured (non-empty) term, including terms whose current value is exactly
-// zero. This storage-based selection is used only for coarse preconditioner assembly below;
-// normal operator assembly uses AddIntegrators and filters exact zeros.
+// zero. This storage-based selection is used only for coarse preconditioner assembly, which
+// retains the configured sparse structure for symbolic reuse; normal operator assembly uses
+// AddIntegrators, which drops exactly-zero coefficients first.
 void AddConfiguredIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *df,
                               const MaterialPropertyCoefficient *f,
                               const MaterialPropertyCoefficient *dfb,
@@ -334,6 +385,16 @@ void AddConfiguredIntegrators(BilinearForm &a, const MaterialPropertyCoefficient
   }
 }
 
+// Coefficients which are exactly zero on every attribute are dropped before the integrator
+// type is chosen, so that a combined integrator degrades to its nonzero block (a mass
+// integrator instead of a curl-curl + mass integrator with a zero curl-curl coefficient).
+// Element subsets then handle coefficients which vanish on only part of the mesh.
+const MaterialPropertyCoefficient *
+ActiveCoefficient(const MaterialPropertyCoefficient *coeff)
+{
+  return (coeff && !coeff->IsExactlyZero()) ? coeff : nullptr;
+}
+
 void AddIntegrators(BilinearForm &a, const MaterialPropertyCoefficient *df,
                     const MaterialPropertyCoefficient *f,
                     const MaterialPropertyCoefficient *dfb,
@@ -379,6 +440,10 @@ auto AssembleOperator(const FiniteElementSpace &fespace,
                       bool assemble_q_data = false)
 {
   BilinearForm a(fespace);
+  // System matrices are only ever applied matrix-free (their sums are assembled into
+  // SumOperator, which has no sparse representation), so elements where a coefficient is
+  // exactly zero can be left out of the partially assembled operator.
+  a.SkipZeroCoefficientElements();
   AddIntegrators(a, df, f, dfb, fb, fp, assemble_q_data);
   return a.Assemble(skip_zeros);
 }
@@ -406,6 +471,10 @@ auto AssembleOperators(const FiniteElementSpaceHierarchy &fespaces,
   if (fespaces.GetNumLevels() > 1)
   {
     BilinearForm fine(fespaces.GetFinestFESpace());
+    // Levels above the coarsest are only applied matrix-free (their smoothers use the
+    // operator action and its diagonal), so elements where a coefficient is exactly zero
+    // can be left out.
+    fine.SkipZeroCoefficientElements();
     AddIntegrators(fine, df, f, dfb, fb, fp, assemble_q_data);
     auto fine_ops = fine.Assemble(fespaces, skip_zeros, 1);
     for (auto &op : fine_ops)
@@ -430,6 +499,7 @@ auto AssembleAuxOperators(const FiniteElementSpaceHierarchy &fespaces,
   if (fespaces.GetNumLevels() > 1)
   {
     BilinearForm fine(fespaces.GetFinestFESpace());
+    fine.SkipZeroCoefficientElements();
     AddAuxIntegrators(fine, f, fb, assemble_q_data);
     auto fine_ops = fine.Assemble(fespaces, skip_zeros, 1);
     for (auto &op : fine_ops)
@@ -442,7 +512,7 @@ auto AssembleAuxOperators(const FiniteElementSpaceHierarchy &fespaces,
 
 }  // namespace
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetStiffnessMatrix(Operator::DiagonalPolicy diag_policy)
 {
@@ -473,7 +543,7 @@ SpaceOperator::GetStiffnessMatrix(Operator::DiagonalPolicy diag_policy)
     ki =
         AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, nullptr, &fc, skip_zeros);
   }
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto K =
         std::make_unique<ComplexParOperator>(std::move(kr), std::move(ki), GetNDSpace());
@@ -489,7 +559,7 @@ SpaceOperator::GetStiffnessMatrix(Operator::DiagonalPolicy diag_policy)
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetDampingMatrix(Operator::DiagonalPolicy diag_policy)
 {
@@ -511,7 +581,7 @@ SpaceOperator::GetDampingMatrix(Operator::DiagonalPolicy diag_policy)
   }
   constexpr bool skip_zeros = false;
   auto c = AssembleOperator(GetNDSpace(), nullptr, &f, nullptr, &fb, &fp, skip_zeros);
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto C = std::make_unique<ComplexParOperator>(std::move(c), nullptr, GetNDSpace());
     C->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
@@ -525,7 +595,7 @@ SpaceOperator::GetDampingMatrix(Operator::DiagonalPolicy diag_policy)
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType> SpaceOperator::GetMassMatrix(Operator::DiagonalPolicy diag_policy)
 {
   PrintHeader(GetH1Space(), GetNDSpace(), GetRTSpace(), print_hdr);
@@ -537,7 +607,7 @@ std::unique_ptr<OperType> SpaceOperator::GetMassMatrix(Operator::DiagonalPolicy 
   {
     AddRealPeriodicCoefficients(-1.0, fr);
   }
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     AddImagMassCoefficients(1.0, fi);
   }
@@ -557,7 +627,7 @@ std::unique_ptr<OperType> SpaceOperator::GetMassMatrix(Operator::DiagonalPolicy 
   {
     mi = AssembleOperator(GetNDSpace(), nullptr, &fi, nullptr, &fbi, nullptr, skip_zeros);
   }
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto M =
         std::make_unique<ComplexParOperator>(std::move(mr), std::move(mi), GetNDSpace());
@@ -572,14 +642,14 @@ std::unique_ptr<OperType> SpaceOperator::GetMassMatrix(Operator::DiagonalPolicy 
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetExtraSystemMatrix(double omega, Operator::DiagonalPolicy diag_policy)
 {
   return GetExtraSystemMatrix<OperType>(omega, diag_policy, /*include_wave_ports=*/true);
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetExtraSystemMatrix(double omega, Operator::DiagonalPolicy diag_policy,
                                     bool include_wave_ports)
@@ -605,7 +675,7 @@ SpaceOperator::GetExtraSystemMatrix(double omega, Operator::DiagonalPolicy diag_
   {
     ai = AssembleOperator(GetNDSpace(), nullptr, nullptr, &dfbi, &fbi, nullptr, skip_zeros);
   }
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto A =
         std::make_unique<ComplexParOperator>(std::move(ar), std::move(ai), GetNDSpace());
@@ -656,7 +726,7 @@ SpaceOperator::GetExtraSystemMatrix(std::complex<double> omega,
   return A;
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetWavePortBoundaryMassMatrix(int port_idx,
                                              Operator::DiagonalPolicy diag_policy)
@@ -676,7 +746,7 @@ SpaceOperator::GetWavePortBoundaryMassMatrix(int port_idx,
   constexpr bool skip_zeros = false;
   auto m =
       AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto M_op = std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace());
     M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
@@ -690,7 +760,7 @@ SpaceOperator::GetWavePortBoundaryMassMatrix(int port_idx,
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetFarfieldBoundaryCurlCurlMatrix(Operator::DiagonalPolicy diag_policy,
                                                  bool imag_slot)
@@ -715,7 +785,7 @@ SpaceOperator::GetFarfieldBoundaryCurlCurlMatrix(Operator::DiagonalPolicy diag_p
   constexpr bool skip_zeros = false;
   auto m =
       AssembleOperator(GetNDSpace(), nullptr, nullptr, &df, nullptr, nullptr, skip_zeros);
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto M_op =
         imag_slot
@@ -735,7 +805,7 @@ SpaceOperator::GetFarfieldBoundaryCurlCurlMatrix(Operator::DiagonalPolicy diag_p
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetSurfaceConductivityBoundaryMatrix(int group_idx,
                                                     Operator::DiagonalPolicy diag_policy)
@@ -757,7 +827,7 @@ SpaceOperator::GetSurfaceConductivityBoundaryMatrix(int group_idx,
   constexpr bool skip_zeros = false;
   auto m =
       AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto M_op = std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace());
     M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
@@ -771,7 +841,7 @@ SpaceOperator::GetSurfaceConductivityBoundaryMatrix(int group_idx,
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType> SpaceOperator::GetRationalImpedanceBoundaryMassMatrix(
     int idx, Operator::DiagonalPolicy diag_policy, bool imag_slot)
 {
@@ -796,7 +866,7 @@ std::unique_ptr<OperType> SpaceOperator::GetRationalImpedanceBoundaryMassMatrix(
   constexpr bool skip_zeros = false;
   auto m =
       AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto M_op =
         imag_slot
@@ -816,7 +886,7 @@ std::unique_ptr<OperType> SpaceOperator::GetRationalImpedanceBoundaryMassMatrix(
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<OperType>
 SpaceOperator::GetFloquetRobinBoundaryMassMatrix(int port_idx,
                                                  Operator::DiagonalPolicy diag_policy)
@@ -843,7 +913,7 @@ SpaceOperator::GetFloquetRobinBoundaryMassMatrix(int port_idx,
   constexpr bool skip_zeros = false;
   auto m =
       AssembleOperator(GetNDSpace(), nullptr, nullptr, nullptr, &fb, nullptr, skip_zeros);
-  if constexpr (std::is_same<OperType, ComplexOperator>::value)
+  if constexpr (std::is_same_v<OperType, ComplexOperator>)
   {
     auto M_op = std::make_unique<ComplexParOperator>(nullptr, std::move(m), GetNDSpace());
     M_op->SetEssentialTrueDofs(nd_dbc_tdof_lists.back(), diag_policy);
@@ -969,7 +1039,7 @@ std::unique_ptr<Operator> SpaceOperator::GetInnerProductMatrix(double a0, double
 namespace
 {
 
-template <typename OperType>
+template <OperatorType OperType>
 auto BuildLevelParOperator(std::unique_ptr<Operator> &&br, std::unique_ptr<Operator> &&bi,
                            const FiniteElementSpace &fespace);
 
@@ -1237,7 +1307,7 @@ std::unique_ptr<OperType> SpaceOperator::GetPreconditionerMatrix(ScalarType a0,
   const auto n_levels = GetNDSpaces().GetNumLevels();
   std::vector<std::unique_ptr<Operator>> br_vec(n_levels), bi_vec(n_levels),
       br_aux_vec(n_levels), bi_aux_vec(n_levels);
-  if (std::is_same<OperType, ComplexOperator>::value && !pc_mat_real)
+  if (std::is_same_v<OperType, ComplexOperator> && !pc_mat_real)
   {
     AssemblePreconditioner(a0, a1, a2, a3, br_vec, br_aux_vec, bi_vec, bi_aux_vec);
   }
@@ -1626,9 +1696,14 @@ bool SpaceOperator::AddExcitationVector2Internal(int excitation_idx, double omeg
   {
     return nnz_floquet;
   }
+  // Restrict the boundary assembly to the excited wave port boundary elements (the
+  // coefficients vanish elsewhere).
+  mfem::Array<int> marker = wave_port_op.GetExcitationBdrMarker(excitation_idx);
+  MFEM_VERIFY(marker.Size() > 0,
+              "No excited wave port found for excitation index " << excitation_idx << "!");
   {
     mfem::LinearForm rhs2(&GetNDSpace().Get());
-    rhs2.AddBoundaryIntegrator(new VectorFEBoundaryLFIntegrator(fbr));
+    rhs2.AddBoundaryIntegrator(new VectorFEBoundaryLFIntegrator(fbr), marker);
     rhs2.UseFastAssembly(false);
     rhs2.UseDevice(false);
     rhs2.Assemble();
@@ -1637,7 +1712,7 @@ bool SpaceOperator::AddExcitationVector2Internal(int excitation_idx, double omeg
   }
   {
     mfem::LinearForm rhs2(&GetNDSpace().Get());
-    rhs2.AddBoundaryIntegrator(new VectorFEBoundaryLFIntegrator(fbi));
+    rhs2.AddBoundaryIntegrator(new VectorFEBoundaryLFIntegrator(fbi), marker);
     rhs2.UseFastAssembly(false);
     rhs2.UseDevice(false);
     rhs2.Assemble();

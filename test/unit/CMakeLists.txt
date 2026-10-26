@@ -35,13 +35,17 @@ add_executable(unit-tests
   ${CMAKE_CURRENT_SOURCE_DIR}/test-constants.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-densematrix.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-domainpostoperator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test-domainsubmesh.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test-errorestimator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-floquetport.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-geodata.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-helpers.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test-iterative.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-libceed.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-lumpedportintegration.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-materialoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-memoryreporting.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test-meshio.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-nondimensionalize.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-orthog.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-outputdir.cpp
@@ -53,8 +57,10 @@ add_executable(unit-tests
   ${CMAKE_CURRENT_SOURCE_DIR}/test-smoother.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-spaceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-strattonchu.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test-surfacecharge.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-surfacefunctional.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-postoperator-boundary-viz.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test-superconductorsheetoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-surfaceimpedanceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-surfacerationalimpedanceoperator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test-tablecsv.cpp

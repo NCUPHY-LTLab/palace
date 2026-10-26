@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <numbers>
 #include <set>
 #include <string>
 #include <vector>
@@ -60,7 +61,7 @@ std::vector<std::string> SchemaCoverageGaps(const std::string &pointer,
     }
     const std::string ref = rit->get<std::string>();
     const std::string defs_prefix = "#/$defs/";
-    REQUIRE(ref.rfind(defs_prefix, 0) == 0);
+    REQUIRE(ref.starts_with(defs_prefix));
     const std::string def_name = ref.substr(defs_prefix.size());
     REQUIRE(schema.contains("$defs"));
     REQUIRE(schema.at("$defs").contains(def_name));
@@ -128,7 +129,7 @@ std::vector<std::string> SchemaCoverageGaps(const std::string &pointer,
   std::vector<std::string> gaps;
   for (const auto &name : property_names)
   {
-    if (required_set.count(name) || skip.count(name))
+    if (required_set.contains(name) || skip.contains(name))
     {
       continue;
     }
@@ -204,6 +205,9 @@ TEST_CASE("Config Boundary Ports", "[config][Serial]")
                        {"PEC", {{"Attributes", {3}}}},
                        {"Absorbing", {{"Attributes", {4}}}}};
     config::BoundaryData boundary_ex_bool(boundaries);
+    CHECK(boundary_ex_bool.waveport.at(4).target == 0.0);
+    CHECK(config::WavePortData(json{{"Index", 7}, {"Attributes", {19}}, {"Target", 3.1}})
+              .target == 3.1);
 
     CHECK(boundary_ex_bool.lumpedport.at(1).active);
     CHECK(boundary_ex_bool.lumpedport.at(3).active == false);
@@ -507,7 +511,7 @@ TEST_CASE("Config Boundary Ports", "[config][Serial]")
                           {"Aperture", {{"Attributes", {7}}, {"Direction", "+Z"}}}}}},
                        {"FluxLoop",
                         {{{"Index", 2},
-                          {"FluxLoopPEC", {8}},
+                          {"FilmAttributes", {8}},
                           {"HoleAttributes", {9}},
                           {"FluxAmounts", {1.0}},
                           {"Direction", "+Z"}}}}};
@@ -765,6 +769,92 @@ TEST_CASE("Config Driven Solver", "[config][Serial]")
         {"Save", {0.05}},
         {"AdaptiveTol", 1e-3}};
     CHECK_THROWS(config::DrivenSolverData(invalid_save));
+
+    // Nonpositive deprecated FreqStep
+    json zero_step = {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.0}};
+    CHECK_THROWS_WITH(config::DrivenSolverData(zero_step),
+                      Catch::Matchers::ContainsSubstring("Invalid range"));
+    json negative_step = {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", -0.5}};
+    CHECK_THROWS(config::DrivenSolverData(negative_step));
+
+    // "MaxFreq" below "MinFreq" with a step would sample only "MinFreq".
+    json reversed_step = {{"MinFreq", 2.0}, {"MaxFreq", 1.0}, {"FreqStep", 0.5}};
+    CHECK_THROWS_WITH(config::DrivenSolverData(reversed_step),
+                      ContainsSubstring("Invalid range"));
+    json reversed_linear = {
+        {"Samples", {{{"MinFreq", 2.0}, {"MaxFreq", 1.0}, {"FreqStep", 0.5}}}}};
+    CHECK_THROWS_WITH(config::DrivenSolverData(reversed_linear),
+                      ContainsSubstring("Invalid range"));
+
+    // A step too small for the number of steps to fit in an int.
+    json tiny_step = {{"MinFreq", 1.0}, {"MaxFreq", 10.0}, {"FreqStep", 1.0e-9}};
+    CHECK_THROWS_WITH(config::DrivenSolverData(tiny_step), ContainsSubstring("too small"));
+
+    // Circuit synthesis needs a positive "AdaptiveTol" and two distinct samples, but only
+    // for a Driven problem, so the parser accepts both.
+    json synthesis_no_tol = {{"Samples", {{{"Freq", {1.0, 2.0}}}}},
+                             {"AdaptiveCircuitSynthesis", true}};
+    CHECK_NOTHROW(config::DrivenSolverData(synthesis_no_tol));
+    json synthesis_single = {{"Samples", {{{"Freq", {3.0}}}}},
+                             {"AdaptiveTol", 1e-3},
+                             {"AdaptiveCircuitSynthesis", true}};
+    CHECK_NOTHROW(config::DrivenSolverData(synthesis_single));
+  }
+
+  SECTION("Circuit synthesis requires two distinct samples")
+  {
+    auto Check = [](ProblemType type, const json &driven)
+    {
+      IoData iodata{Units(1.0, 1.0)};
+      iodata.problem.type = type;
+      iodata.solver.driven = config::DrivenSolverData(driven);
+      iodata.CheckConfiguration();
+    };
+    json synthesis = {{"AdaptiveTol", 1e-3}, {"AdaptiveCircuitSynthesis", true}};
+    json single = synthesis, near_duplicate = synthesis;
+    single["Samples"] = {{{"Freq", {3.0}}}};
+    // Within the sample deduplication tolerance, so a single distinct sample.
+    near_duplicate["Samples"] = {{{"Freq", {3.0, 3.0 + 1.0e-10}}}};
+    CHECK_THROWS_WITH(Check(ProblemType::DRIVEN, single),
+                      ContainsSubstring("two distinct"));
+    CHECK_THROWS_WITH(Check(ProblemType::DRIVEN, near_duplicate),
+                      ContainsSubstring("two distinct"));
+    // An unused "Driven" block of another problem type is not checked.
+    CHECK_NOTHROW(Check(ProblemType::EIGENMODE, single));
+  }
+
+  SECTION("Single sample ranges")
+  {
+    // A single linear or log sample is the interval start (numpy.linspace convention).
+    json linear_single = {
+        {"Samples", {{{"MinFreq", 2.0}, {"MaxFreq", 5.0}, {"NSample", 1}}}}};
+    config::DrivenSolverData linear_solver(linear_single);
+    REQUIRE(linear_solver.sample_f.size() == 1);
+    CHECK_THAT(linear_solver.sample_f[0], WithinAbs(2.0, delta_eps));
+
+    json log_single = {
+        {"Samples",
+         {{{"Type", "Log"}, {"MinFreq", 0.1}, {"MaxFreq", 10.0}, {"NSample", 1}}}}};
+    config::DrivenSolverData log_solver(log_single);
+    REQUIRE(log_solver.sample_f.size() == 1);
+    CHECK_THAT(log_solver.sample_f[0], WithinAbs(0.1, delta_eps));
+
+    // A single-sample adaptive sweep without circuit synthesis parses; DrivenSolver
+    // reverts it to a uniform sweep at runtime.
+    json adaptive_single = {
+        {"Samples", {{{"MinFreq", 2.0}, {"MaxFreq", 5.0}, {"NSample", 1}}}},
+        {"AdaptiveTol", 1e-3}};
+    CHECK_NOTHROW(config::DrivenSolverData(adaptive_single));
+
+    // Deprecated top-level interface with a valid positive step.
+    json legacy = {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.5}};
+    config::DrivenSolverData legacy_solver(legacy);
+    auto sample_f = std::vector{1.0, 1.5, 2.0};
+    REQUIRE(legacy_solver.sample_f.size() == sample_f.size());
+    for (size_t i = 0; i < sample_f.size(); ++i)
+    {
+      CHECK_THAT(legacy_solver.sample_f[i], WithinAbs(sample_f[i], delta_eps));
+    }
   }
 }
 
@@ -773,6 +863,28 @@ TEST_CASE("Config Eigenmode saved modes", "[config][Serial]")
   CHECK(config::EigenSolverData(json{{"Target", 1.0}, {"N", 3}, {"Save", 2}}).n_post == 2);
   CHECK(config::EigenSolverData(json{{"Target", 1.0}, {"N", 2}, {"Save", 3}}).n_post == 2);
   CHECK(config::EigenSolverData(json{{"Target", 1.0}, {"N", 2}, {"Save", -1}}).n_post == 0);
+}
+
+TEST_CASE("Config Eigenmode iteration limits", "[config][Serial]")
+{
+  // The quasi-Newton iterations of the hybrid nonlinear eigenvalue solver have their own
+  // limit, independent of the (large by default) eigenvalue solver iteration limit.
+  const config::EigenSolverData defaults(json{{"Target", 1.0}});
+  CHECK(defaults.max_it == 1'000'000);
+  CHECK(defaults.nonlinear_max_it == 100);
+
+  const config::EigenSolverData linear(json{{"Target", 1.0}, {"MaxIts", 200}});
+  CHECK(linear.max_it == 200);
+  CHECK(linear.nonlinear_max_it == 100);
+
+  const config::EigenSolverData both(
+      json{{"Target", 1.0}, {"MaxIts", 200}, {"NonlinearMaxIts", 30}});
+  CHECK(both.max_it == 200);
+  CHECK(both.nonlinear_max_it == 30);
+
+  const config::EigenSolverData nonlinear(json{{"Target", 1.0}, {"NonlinearMaxIts", 500}});
+  CHECK(nonlinear.max_it == 1'000'000);
+  CHECK(nonlinear.nonlinear_max_it == 500);
 }
 
 TEST_CASE("Config Magnetostatic InactivePorts", "[config][Serial]")
@@ -790,7 +902,7 @@ TEST_CASE("Config Magnetostatic InactivePorts", "[config][Serial]")
                      {"Aperture", {{"Attributes", {5}}, {"Direction", "+Z"}}}}}},
                   {"FluxLoop",
                    {{{"Index", 2},
-                     {"FluxLoopPEC", {6}},
+                     {"FilmAttributes", {6}},
                      {"HoleAttributes", {7}},
                      {"FluxAmounts", {1.0}},
                      {"Direction", "+Z"}}}}}},
@@ -905,8 +1017,8 @@ TEST_CASE("FarField", "[config][Serial]")
     CHECK(data.thetaphis.size() == 2);
     CHECK(data.thetaphis[0].first == Catch::Approx(0.0).margin(delta_eps));
     CHECK(data.thetaphis[0].second == Catch::Approx(0.0).margin(delta_eps));
-    CHECK(data.thetaphis[1].first == Catch::Approx(M_PI / 2).margin(delta_eps));
-    CHECK(data.thetaphis[1].second == Catch::Approx(M_PI).margin(delta_eps));
+    CHECK(data.thetaphis[1].first == Catch::Approx(std::numbers::pi / 2).margin(delta_eps));
+    CHECK(data.thetaphis[1].second == Catch::Approx(std::numbers::pi).margin(delta_eps));
   }
 
   SECTION("Duplicate removal")
@@ -967,7 +1079,7 @@ TEST_CASE("FarField", "[config][Serial]")
       {
         if (std::abs(point.first) < delta_eps)
           has_north_pole = true;
-        if (std::abs(point.first - M_PI) < delta_eps)
+        if (std::abs(point.first - std::numbers::pi) < delta_eps)
           has_south_pole = true;
       }
       CHECK(has_north_pole);
@@ -983,8 +1095,9 @@ TEST_CASE("FarField", "[config][Serial]")
       for (const auto &point : data.thetaphis)
       {
         if ((std::abs(point.second) < delta_eps ||
-             std::abs(point.second - M_PI) < delta_eps) &&
-            std::abs(point.first) > delta_eps && std::abs(point.first - M_PI) > delta_eps)
+             std::abs(point.second - std::numbers::pi) < delta_eps) &&
+            std::abs(point.first) > delta_eps &&
+            std::abs(point.first - std::numbers::pi) > delta_eps)
         {
           xz_plane_count++;
         }
@@ -996,7 +1109,7 @@ TEST_CASE("FarField", "[config][Serial]")
       int equator_count = 0;
       for (const auto &point : data.thetaphis)
       {
-        if (std::abs(point.first - M_PI / 2.0) < delta_eps)
+        if (std::abs(point.first - std::numbers::pi / 2.0) < delta_eps)
         {
           equator_count++;
         }
@@ -1600,6 +1713,8 @@ TEST_CASE("ConcretizeDefaults", "[config][Serial]")
     CHECK(iodata2.solver.eigenmode.target_upper == iodata1.solver.eigenmode.target_upper);
     CHECK(iodata2.solver.eigenmode.max_it == iodata1.solver.eigenmode.max_it);
     CHECK(iodata2.solver.eigenmode.max_size == iodata1.solver.eigenmode.max_size);
+    CHECK(iodata2.solver.eigenmode.nonlinear_max_it ==
+          iodata1.solver.eigenmode.nonlinear_max_it);
 
     // Coverage gate: every optional schema property under Solver.Eigenmode must be
     // emitted by ConcretizeDefaults. A schema addition without a Concretize update
@@ -1727,10 +1842,11 @@ TEST_CASE("ConcretizeDefaults", "[config][Serial]")
     // so they are deliberately not concretized. ComplexCoarseSolve is an opt-in per-port
     // override: an explicit value also takes precedence over Solver.Linear.PCMatReal, so
     // absence (inherit both global settings) has no equivalent explicit value to emit.
+    // Target is opt-in: absence means the eigenvalue target from the port materials.
     auto wp_gaps = SchemaCoverageGaps(
         "/properties/Boundaries/properties/WavePort/items",
         config["Boundaries"]["WavePort"][0],
-        /*skip=*/{"VoltagePath", "PolarityAttributes", "ComplexCoarseSolve"});
+        /*skip=*/{"VoltagePath", "PolarityAttributes", "ComplexCoarseSolve", "Target"});
     INFO("Boundaries.WavePort[] missing keys: " << json(wp_gaps).dump());
     CHECK(wp_gaps.empty());
   }

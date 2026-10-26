@@ -433,6 +433,28 @@ public:
   RationalImpedanceData(const json &boundary);
 };
 
+struct SuperconductorData
+{
+public:
+  // London penetration depth λ and film thickness d, in mesh length units. These define the
+  // one-sided finite-thickness kinetic sheet inductance of a superconductor modeled as a 2D
+  // sheet:
+  //     L_ksq = mu0 * lambda * coth(d/lambda)   [H/square]
+  // (reducing to the thin-film limit mu0 * lambda^2 / d for d << lambda).
+  double lambda_L = 0.0;
+  double thickness = 0.0;
+
+  // Kinetic sheet inductance L_ksq [H/sq], specified directly as an alternative to (λ, d).
+  // Exactly one of {(λ, d), Ls} must be provided.
+  double Ls = 0.0;
+
+  // List of boundary attributes for this superconductor sheet.
+  std::vector<int> attributes = {};
+
+  SuperconductorData() = default;
+  SuperconductorData(const json &boundary);
+};
+
 struct LumpedPortData
 {
 public:
@@ -521,6 +543,10 @@ public:
 
   // Port offset for de-embedding [m].
   double d_offset = 0.0;
+
+  // Target effective index for the boundary mode eigenvalue solver. When zero, the target
+  // lies just above the bulk propagation constants of the port materials.
+  double target = 0.0;
 
   // Eigenvalue solver type for boundary mode calculation.
   EigenSolverBackend eigen_solver = EigenSolverBackend::DEFAULT;
@@ -790,7 +816,7 @@ struct FluxLoopData
 {
 public:
   // List of boundary attributes for the metal surface.
-  std::vector<int> fluxloop_pec = {};
+  std::vector<int> film_attributes = {};
 
   // List of boundary attributes for holes (one per hole).
   std::vector<int> hole_attributes = {};
@@ -801,8 +827,9 @@ public:
   // Direction vector for flux orientation.
   std::array<double, 3> direction = {0.0, 0.0, 1.0};
 
-  // Regularization parameter for curl-curl system stability.
-  double regularization = 1e-6;
+  // Effective λ⊥ [mesh units] for a film listed in FilmAttributes but not declared a
+  // Superconductor: models it as the λ→0 London limit (auto-registered SC sheet).
+  double pec_lperp = 1.0e-4;
 
   FluxLoopData() = default;
   FluxLoopData(const json &fluxloop);
@@ -825,6 +852,7 @@ public:
   std::vector<ConductivityData> conductivity = {};
   std::vector<ImpedanceData> impedance = {};
   std::vector<RationalImpedanceData> rational_impedance = {};
+  std::vector<SuperconductorData> superconductor = {};
   std::map<int, LumpedPortData> lumpedport = {};
   std::map<int, TerminalData> terminal = {};
   std::map<int, WavePortData> waveport = {};
@@ -889,7 +917,8 @@ public:
   // Eigenvalue solver relative tolerance.
   double tol = 1.0e-6;
 
-  // Maximum iterations for eigenvalue solver.
+  // Maximum iterations for eigenvalue solver (for nonlinear problems, the linear or
+  // quadratic eigenvalue solver of the hybrid approach, or the SLP solver).
   int max_it = -1;
 
   // Eigenvalue solver subspace dimension or maximum dimension before restart.
@@ -943,6 +972,10 @@ public:
   // Maximum number of failed attempts with a given initial guess in the quasi-Newton
   // nonlinear eigenvalue solver.
   int max_restart = 2;
+
+  // Maximum number of iterations of each attempt to converge an eigenpair in the
+  // quasi-Newton nonlinear eigenvalue solver.
+  int nonlinear_max_it = 100;
 
   EigenSolverData() = default;
   EigenSolverData(const json &eigenmode);
@@ -1054,6 +1087,9 @@ public:
   // Iterative solver relative tolerance.
   double tol = 1.0e-6;
 
+  // Absolute tolerance (0.0 = disabled).
+  double abs_tol = 0.0;
+
   // Maximum iterations for iterative solver.
   int max_it = 100;
 
@@ -1141,6 +1177,13 @@ public:
   // problems.
   int ams_singular_op = -1;
 
+  // Preconditioner-only gauge shift for the London magnetostatic operator: adds
+  // london_pc_shift · (1/µ) ∫|A|² to the preconditioner matrix only (operator, solution and
+  // extracted inductance unchanged) to lift the shifted-penalty operator's residual
+  // gradient null space so AMS is SPD-solvable in parallel. Ignored when no London sheet is
+  // present.
+  double london_pc_shift = 1.0e-1;
+
   // Option to use aggressive coarsening for Hypre AMG solves (with BoomerAMG or AMS).
   // Typically use this when the operator is positive definite.
   int amg_agg_coarsen = -1;
@@ -1207,8 +1250,8 @@ public:
   SolverData(const json &solver);
 };
 
-// Calculate the number of steps from [start, end) in increments of delta. Will only include
-// end if it is a multiple of delta beyond start.
+// Calculate the number of steps from [start, end) in increments of delta > 0, for end >=
+// start. Will only include end if it is a multiple of delta beyond start.
 int GetNumSteps(double start, double end, double delta);
 
 // Parse a string as a direction vector, returning the direction and coordinate system.
@@ -1238,6 +1281,7 @@ void Nondimensionalize(const Units &units, ProbeData &data);
 void Nondimensionalize(const Units &units, CurrentDipoleData &data);
 void Nondimensionalize(const Units &units, ConductivityData &data);
 void Nondimensionalize(const Units &units, ImpedanceData &data);
+void Nondimensionalize(const Units &units, SuperconductorData &data);
 void Nondimensionalize(const Units &units, LumpedPortData &data);
 void Nondimensionalize(const Units &units, PeriodicBoundaryData &data);
 void Nondimensionalize(const Units &units, WavePortData &data);

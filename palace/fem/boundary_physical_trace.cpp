@@ -3,7 +3,7 @@
 
 #include "fem/boundary_physical_trace.hpp"
 
-#include <cstring>
+#include <bit>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,14 +33,6 @@ namespace palace
 namespace
 {
 
-long long EncodeDouble(double x)
-{
-  static_assert(sizeof(long long) == sizeof(double));
-  long long bits;
-  std::memcpy(&bits, &x, sizeof(bits));
-  return bits;
-}
-
 std::vector<long long> MakeUnionRuleKey(mfem::Geometry::Type geometry,
                                         const std::vector<mfem::IntegrationPoint> &points)
 {
@@ -50,9 +42,9 @@ std::vector<long long> MakeUnionRuleKey(mfem::Geometry::Type geometry,
   key.push_back(static_cast<long long>(points.size()));
   for (const auto &point : points)
   {
-    key.push_back(EncodeDouble(point.x));
-    key.push_back(EncodeDouble(point.y));
-    key.push_back(EncodeDouble(point.z));
+    key.push_back(std::bit_cast<long long>(point.x));
+    key.push_back(std::bit_cast<long long>(point.y));
+    key.push_back(std::bit_cast<long long>(point.z));
   }
   return key;
 }
@@ -419,9 +411,9 @@ void BoundaryPhysicalTraceCache::BuildUnionRoutes(Entry &entry)
       request.point_key.push_back(static_cast<long long>(group.points.size()));
       for (const auto &point : group.points)
       {
-        request.point_key.push_back(EncodeDouble(point.x));
-        request.point_key.push_back(EncodeDouble(point.y));
-        request.point_key.push_back(EncodeDouble(point.z));
+        request.point_key.push_back(std::bit_cast<long long>(point.x));
+        request.point_key.push_back(std::bit_cast<long long>(point.y));
+        request.point_key.push_back(std::bit_cast<long long>(point.z));
       }
       request.pts = group.points;
     }
@@ -553,12 +545,7 @@ void BoundaryPhysicalTraceCache::ApplyUnionRoutes(Entry &entry, const Vector &u,
     // Routing vectors are created unbound. Detach after every apply below so the
     // next source (real/imaginary or a new save generation) can attach directly.
     ceed::InitCeedVector(input, route.ceed, &route.in_vec, false, false);
-    CeedMemType mem;
-    PalaceCeedCall(route.ceed, CeedGetPreferredMemType(route.ceed, &mem));
-    if (!mfem::Device::Allows(mfem::Backend::DEVICE_MASK) && mem == CEED_MEM_DEVICE)
-    {
-      mem = CEED_MEM_HOST;
-    }
+    const CeedMemType mem = ceed::GetUsableMemType(route.ceed);
     double *output_data = output.ReadWrite(mem == CEED_MEM_DEVICE);
     PalaceCeedCall(route.ceed,
                    CeedVectorSetArray(route.out_vec, mem, CEED_USE_POINTER, output_data));

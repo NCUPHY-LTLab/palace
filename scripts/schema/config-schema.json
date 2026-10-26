@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "urn:palace:schema:1-7-0",
+  "$id": "urn:palace:schema:2-3-0",
   "title": "Configuration File Schema",
   "description": "Palace configuration file schema for 3D electromagnetic simulations.",
   "type": "object",
@@ -298,6 +298,14 @@
           "additionalItems": false,
           "items": {
             "$ref": "#/$defs/FluxLoop"
+          }
+        },
+        "Superconductor": {
+          "type": "array",
+          "description": "Array of thin-film superconductor sheet boundaries for magnetostatic simulations. Each sheet contributes a London kinetic-inductance term to the extracted total inductance, modeled by the one-sided finite-thickness London kinetic sheet inductance L_ksq = mu0 * lambda * coth(d/lambda) (field on one face, e.g. a film over a ground plane), specified either via the penetration depth and film thickness or directly (as the thin-film limit lambda^2/d when d << lambda). Only available for magnetostatic simulations.",
+          "additionalItems": false,
+          "items": {
+            "$ref": "#/$defs/Superconductor"
           }
         },
         "Ground": {
@@ -926,6 +934,34 @@
         }
       }
     },
+    "Superconductor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Attributes"
+      ],
+      "properties": {
+        "Attributes": {
+          "$ref": "#/$defs/Attributes",
+          "description": "Integer array of mesh boundary attributes this object applies to."
+        },
+        "PenetrationDepth": {
+          "type": "number",
+          "description": "London penetration depth λ of the superconducting film, specified in mesh length units. Used with Thickness to compute the finite-thickness kinetic sheet inductance L_ksq = mu0 * lambda * coth(d/lambda). Mutually exclusive with KineticInductance.",
+          "default": 0.0
+        },
+        "Thickness": {
+          "type": "number",
+          "description": "Superconducting film thickness d, specified in mesh length units. Used with PenetrationDepth to compute the finite-thickness kinetic sheet inductance L_ksq = mu0 * lambda * coth(d/lambda). Mutually exclusive with KineticInductance.",
+          "default": 0.0
+        },
+        "KineticInductance": {
+          "type": "number",
+          "description": "Kinetic sheet inductance L_ksq, H/sq, specified directly as an alternative to (PenetrationDepth, Thickness). Mutually exclusive with those two.",
+          "default": 0.0
+        }
+      }
+    },
     "RationalImpedance": {
       "type": "object",
       "additionalProperties": false,
@@ -1299,7 +1335,7 @@
         },
         "Mode": {
           "type": "integer",
-          "description": "Mode index (1-based) for the characteristic port mode of this wave port, ranked in order of decreasing wave number.",
+          "description": "Mode index (1-based) for the characteristic port mode of this wave port, ranked by distance to the eigenvalue solver target: `\"Target\"` when given, otherwise just above the bulk propagation constants of the port materials (decreasing wave number for the modes below it).",
           "exclusiveMinimum": 0,
           "default": 1
         },
@@ -1308,6 +1344,11 @@
           "description": "Offset distance used for S-parameter de-embedding for this wave port, specified in mesh length units.",
           "minimum": 0.0,
           "default": 0.0
+        },
+        "Target": {
+          "type": "number",
+          "description": "Target effective index ``n_\\text{eff} = k_n / k_0`` for the boundary mode eigenvalue solver: the port modes are ranked by their distance to it, as for [`/Solver/BoundaryMode/Target`](@ref config-solver-boundarymode-target). If omitted, the target lies just above the bulk propagation constants of the port materials. Use it to select a mode far from that default, for example the slow-wave mode of a superconducting line on a cross-section with several modes.",
+          "exclusiveMinimum": 0.0
         },
         "SolverType": {
           "type": "string",
@@ -1556,7 +1597,7 @@
       "additionalProperties": false,
       "required": [
         "Index",
-        "FluxLoopPEC",
+        "FilmAttributes",
         "HoleAttributes",
         "FluxAmounts",
         "Direction"
@@ -1567,7 +1608,7 @@
           "description": "Index of this flux loop, used in postprocessing output files.",
           "exclusiveMinimum": 0
         },
-        "FluxLoopPEC": {
+        "FilmAttributes": {
           "$ref": "#/$defs/Attributes",
           "description": "Integer array of mesh boundary attributes for the metal surface on which the 2D surface curl problem is solved."
         },
@@ -1594,11 +1635,11 @@
             }
           ]
         },
-        "Regularization": {
+        "PecPenetrationDepth": {
           "type": "number",
-          "description": "Regularization parameter for the curl-curl system stability on the 2D surface problem.",
+          "description": "Effective sheet penetration depth λ⊥ [mesh length units] used to model a FilmAttributes film that is not declared a \"Superconductor\" as the λ→0 perfect-screening limit. Smaller values approach an ideal perfect conductor.",
           "exclusiveMinimum": 0.0,
-          "default": 1.0e-6
+          "default": 1.0e-4
         }
       }
     },
@@ -2393,7 +2434,7 @@
         },
         "MaxIts": {
           "type": "integer",
-          "description": "Maximum number of iterations for the iterative eigenvalue solver. If omitted, Palace uses `1,000,000` iterations.",
+          "description": "Maximum number of iterations for the iterative eigenvalue solver. For nonlinear problems, applies to the linear or quadratic eigenvalue solver computing the initial guesses of the `\"Hybrid\"` solver (see `\"NonlinearMaxIts\"` for the quasi-Newton iterations), or to the `\"SLP\"` solver. If omitted, Palace uses `1,000,000` iterations.",
           "exclusiveMinimum": 0
         },
         "MaxSize": {
@@ -2488,6 +2529,13 @@
           "description": "Maximum number of restarts for the eigensolver.",
           "minimum": 0,
           "default": 2,
+          "x-palace-advanced": true
+        },
+        "NonlinearMaxIts": {
+          "type": "integer",
+          "description": "Maximum number of quasi-Newton iterations of each attempt to converge an eigenpair in the `\"Hybrid\"` nonlinear eigenvalue solver, before restarting.",
+          "exclusiveMinimum": 0,
+          "default": 100,
           "x-palace-advanced": true
         }
       }
@@ -2591,7 +2639,28 @@
           "default": "Energy",
           "x-palace-advanced": true
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "MinFreq",
+              "MaxFreq",
+              "FreqStep"
+            ]
+          },
+          "then": {
+            "properties": {
+              "MinFreq": {
+                "exclusiveMinimum": 0.0
+              },
+              "FreqStep": {
+                "exclusiveMinimum": 0.0
+              }
+            }
+          }
+        }
+      ]
     },
     "SamplesPoint": {
       "type": "object",
@@ -2610,7 +2679,8 @@
           "type": "array",
           "description": "Explicit frequencies to sample, GHz.",
           "items": {
-            "type": "number"
+            "type": "number",
+            "exclusiveMinimum": 0.0
           }
         },
         "SaveStep": {
@@ -2642,12 +2712,12 @@
         "MinFreq": {
           "type": "number",
           "description": "Lower bound, GHz.",
-          "minimum": 0.0
+          "exclusiveMinimum": 0.0
         },
         "MaxFreq": {
           "type": "number",
           "description": "Upper bound, GHz.",
-          "minimum": 0.0
+          "exclusiveMinimum": 0.0
         },
         "FreqStep": {
           "type": "number",
@@ -2656,7 +2726,7 @@
         },
         "NSample": {
           "type": "integer",
-          "description": "Number of samples. Mutually exclusive with `\"FreqStep\"`.",
+          "description": "Number of samples, the first at `\"MinFreq\"` (a single sample is `\"MinFreq\"`). Mutually exclusive with `\"FreqStep\"`.",
           "minimum": 0
         },
         "SaveStep": {
@@ -2699,7 +2769,7 @@
         },
         "NSample": {
           "type": "integer",
-          "description": "Number of samples.",
+          "description": "Number of samples, the first at `\"MinFreq\"` (a single sample is `\"MinFreq\"`).",
           "minimum": 1
         },
         "SaveStep": {
@@ -2893,6 +2963,12 @@
           "minimum": 0.0,
           "default": 1e-06
         },
+        "AbsTol": {
+          "type": "number",
+          "description": "Absolute residual convergence tolerance for the iterative linear solver. The solver converges when `||r|| <= max(Tol * ||b||, AbsTol)`. A value of 0.0 disables the absolute tolerance.",
+          "minimum": 0.0,
+          "default": 0.0
+        },
         "MaxIts": {
           "type": "integer",
           "description": "Maximum number of iterations for the iterative linear solver.",
@@ -3042,6 +3118,12 @@
           "description": "Indicate to AMS that the operator is singular (e.g. magnetostatics with no essential boundary conditions). If omitted, Palace enables this for magnetostatic simulations and disables it otherwise.",
           "x-palace-advanced": true
         },
+        "LondonPCShift": {
+          "type": "number",
+          "description": "Preconditioner-only gauge shift for magnetostatic problems with a London (superconductor) sheet term. Adds this multiple of the reluctance-weighted volume mass to the preconditioner matrix only (leaving the operator, solution, and extracted inductance unchanged) to lift the residual gradient null space so AMS is SPD-solvable in parallel. Ignored when no London sheet term is present.",
+          "default": 0.1,
+          "x-palace-advanced": true
+        },
         "AMGAggressiveCoarsening": {
           "type": "boolean",
           "description": "Enable aggressive coarsening in BoomerAMG. If omitted, Palace enables this for electrostatic, magnetostatic, and transient simulations, and disables it otherwise.",
@@ -3110,7 +3192,31 @@
           "Solver": {
             "required": [
               "Driven"
-            ]
+            ],
+            "properties": {
+              "Driven": {
+                "if": {
+                  "properties": {
+                    "AdaptiveCircuitSynthesis": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "AdaptiveCircuitSynthesis"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "AdaptiveTol": {
+                      "exclusiveMinimum": 0.0
+                    }
+                  },
+                  "required": [
+                    "AdaptiveTol"
+                  ]
+                }
+              }
+            }
           }
         }
       }

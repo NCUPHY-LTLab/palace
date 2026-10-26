@@ -58,7 +58,7 @@ private:
   auto AttrToMat(int attr) const
   {
     const auto &loc_attr = mesh.GetCeedAttributes();
-    MFEM_ASSERT(loc_attr.find(attr) != loc_attr.end(),
+    MFEM_ASSERT(loc_attr.contains(attr),
                 "Missing libCEED domain attribute for attribute " << attr << "!");
     return attr_mat[loc_attr.at(attr) - 1];
   }
@@ -195,6 +195,12 @@ public:
   // Mathematically exact zero: empty storage is zero, otherwise every stored scalar must
   // compare exactly equal to zero. This deliberately has no tolerance.
   bool IsExactlyZero() const;
+
+  // Append the (libCEED, 1-based) attributes whose material property tensor has at least
+  // one entry which is not exactly zero. Attributes with no assigned material, or an
+  // exactly zero tensor, contribute exactly zero and are not appended. The output is not
+  // sorted or made unique by this call.
+  void AddNonzeroAttributes(std::vector<int> &attr_list) const;
 
   const auto &GetAttributeToMaterial() const { return attr_mat; }
   const auto &GetMaterialProperties() const { return mat_coeff; }

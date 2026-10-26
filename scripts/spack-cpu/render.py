@@ -62,7 +62,7 @@ def main():
     palace_recipe = repository / "packages/palace/package.py"
     add_version(
         palace_recipe,
-        '    version("0.18.1-scq", url="file://{0}", sha256="{1}")'.format(
+        '    version("0.19.0-scq", url="file://{0}", sha256="{1}")'.format(
             args.source_archive.resolve(), args.source_sha256
         ),
     )
@@ -84,8 +84,8 @@ def main():
             ),
         )
 
-    # These patched recipes provide the variants required by Palace and the selected
-    # OpenBLAS release. The fixed packages snapshot is patched before this script runs.
+    # Keep the existing machine-local provider recipes. The fixed upstream CI packages
+    # snapshot is patched before this script runs.
     for directory in ("metis", "parmetis", "openblas"):
         shutil.copytree(package_root / directory, repository / "packages" / directory)
 
@@ -100,7 +100,7 @@ def main():
   - group: palace
     needs: [compiler]
     matrix:
-    - [local.palace@=0.18.1-scq +shared +openmp +superlu-dist +mumps +slepc +arpack +sundials +gslib +libxsmm ~strumpack ~cuda ~rocm ~int64 build_type=Release cxxstd=17]
+    - [local.palace@=0.19.0-scq +shared +openmp +superlu-dist +mumps +slepc +arpack +sundials +gslib +libxsmm ~strumpack ~cuda ~rocm ~int64 build_type=Release cxxstd=20]
     - ["%c,cxx,fortran=gcc@15.2.0"]
   view: false
   concretizer:
@@ -127,27 +127,27 @@ def main():
     lapack:
       require: "openblas@=0.3.34 threads=pthreads +locking ~ilp64"
     scalapack:
-      require: "local.netlib-scalapack@=2.2.1-palace018 +shared"
+      require: "netlib-scalapack@=2.2.3 +shared"
     mumps:
-      require: "@=5.7.3 +mpi +double ~float ~complex ~int64 +metis +parmetis +shared +openmp"
+      require: "@=5.9.1 +mpi +double ~float ~complex ~int64 +metis +parmetis +shared +openmp"
     metis:
       require: "@=5.1.0 +petsc_patches +gkrand ~int64"
     parmetis:
       require: "@=4.0.3 +petsc_patches ~int64"
     superlu-dist:
-      require: "@=9.2.1 ~openmp ~int64"
+      require: "@=9.3.0 ~openmp ~int64"
     petsc:
-      require: "@=3.24.3 +mpi +double +complex ~int64 +openmp ~hdf5"
+      require: "@=3.26.0 +mpi +double +complex ~int64 +openmp ~hdf5"
     slepc:
-      require: "@=3.24.1 ~arpack"
+      require: "@=3.26.0 ~arpack"
     hypre:
-      require: "@=3.2.1-palace018 ~int64 ~mixedint ~complex ~unified-memory +lapack +openmp"
+      require: "@=3.2.0 ~int64 ~mixedint ~complex ~unified-memory +lapack +openmp"
     mfem:
-      require: "@=4.9.1-palace018 +mpi +metis +lapack +openmp +threadsafe +superlu-dist +mumps +sundials +gslib +shared ~static"
+      require: "@=4.10.0 +mpi +metis +lapack +openmp +threadsafe +superlu-dist +mumps +sundials +gslib +shared ~static"
     libceed:
-      require: "@=0.13.99-palace018 +shared +openmp +libxsmm ~cuda ~rocm"
+      require: "@=1.0.0 +shared +openmp +libxsmm ~cuda ~rocm"
     libxsmm:
-      require: "@=2.1.99-palace018 +shared blas=0"
+      require: "@=2.1.0 +shared blas=0"
 """.format(
         install_root_yaml=json.dumps(str(install_root)),
         slurm_prefix_yaml=json.dumps(str(args.slurm_prefix.resolve())),

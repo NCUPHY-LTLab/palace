@@ -40,6 +40,9 @@ jobs:
 
   build-and-test-linux:
     needs: filter
+    permissions:
+      contents: write
+      id-token: write  # Codecov OIDC upload
     strategy:
       fail-fast: false
       matrix:
@@ -350,7 +353,7 @@ jobs:
 
       - name: Run unit tests
         if: needs.filter.outputs.test == 'true'
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           # Configure environment
           if [[ "${{ matrix.compiler }}" == 'intel' ]] || \
@@ -365,6 +368,14 @@ jobs:
           fi
           if [[ "${{ matrix.math-libs }}" == 'armpl' ]]; then
             export LD_LIBRARY_PATH="$ARMPL_DIR/lib:$LD_LIBRARY_PATH"
+          fi
+
+          # Disable Open MPI's CPU binding (as in spack-macos.yml): with two ranks, each is
+          # bound to one core, shared by its OpenMP threads.
+          if [[ "${{ matrix.mpi }}" == 'openmpi' ]] && \
+             [[ "${{ matrix.with-openmp }}" == 'openmp' ]]; then
+            export OMPI_MCA_hwloc_base_binding_policy=none
+            export PRTE_MCA_hwloc_default_binding_policy=none
           fi
 
           # Configure sanitizer options
@@ -424,6 +435,15 @@ jobs:
         with:
           name: coverage-${{ matrix.arch }}-${{ matrix.compiler }}-${{ matrix.mpi }}
           path: palace-build/coverage_html/
+
+      - name: Upload coverage to Codecov
+        if: needs.filter.outputs.test == 'true' && matrix.with-coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: palace-build/coverage_filtered.info
+          disable_search: true
+          use_oidc: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+          fail_ci_if_error: false
 
       - name: Run regression tests
         if: needs.filter.outputs.test == 'true' && !matrix.with-sanitizers

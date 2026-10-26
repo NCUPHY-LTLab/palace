@@ -92,6 +92,7 @@ void ConcretizeLinear(const config::LinearSolverData &linear, json &j_linear)
                 {"SuperLU3DCommunicator", linear.superlu_3d},
                 {"AMSVectorInterpolation", linear.ams_vector_interp},
                 {"AMSSingularOperator", static_cast<bool>(linear.ams_singular_op)},
+                {"LondonPCShift", linear.london_pc_shift},
                 {"AMGAggressiveCoarsening", static_cast<bool>(linear.amg_agg_coarsen)},
                 {"AMSMaxIts", linear.ams_max_it},
                 {"DivFreeTol", linear.divfree_tol},
@@ -122,7 +123,8 @@ void ConcretizeEigenmode(const config::EigenSolverData &eigenmode, json &j_eigen
                          {"TargetUpper", eigenmode.target_upper},
                          {"PreconditionerLag", eigenmode.preconditioner_lag},
                          {"PreconditionerLagTol", eigenmode.preconditioner_lag_tol},
-                         {"MaxRestart", eigenmode.max_restart}});
+                         {"MaxRestart", eigenmode.max_restart},
+                         {"NonlinearMaxIts", eigenmode.nonlinear_max_it}});
 }
 
 void ConcretizeTransient(const config::TransientSolverData &transient, json &j_transient)

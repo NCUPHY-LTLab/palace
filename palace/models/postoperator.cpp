@@ -4,9 +4,11 @@
 #include "postoperator.hpp"
 
 #include <algorithm>
+#include <compare>
 #include <complex>
 #include <map>
 #include <memory>
+#include <numbers>
 #include <set>
 #include <string>
 #include <tuple>
@@ -21,6 +23,7 @@
 #include "models/floquetportoperator.hpp"
 #include "models/laplaceoperator.hpp"
 #include "models/materialoperator.hpp"
+#include "models/romoperator.hpp"
 #include "models/spaceoperator.hpp"
 #include "models/surfacecurrentoperator.hpp"
 #include "models/waveportoperator.hpp"
@@ -292,9 +295,8 @@ PostOperator<solver_t>::PostOperator(const IoData &iodata, fem_op_t<solver_t> &f
 }
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::InitializeParaviewDataCollection(int ex_idx)
-    -> std::enable_if_t<U == ProblemType::DRIVEN, void>
+void PostOperator<solver_t>::InitializeParaviewDataCollection(int ex_idx)
+  requires(solver_t == ProblemType::DRIVEN)
 {
   fs::path sub_folder_name = "";
   auto nr_excitations = fem_op->GetPortExcitations().Size();
@@ -598,11 +600,29 @@ void PostOperator<solver_t>::SetupFieldCoefficients()
       MakeBdrFieldEvaluator(PointFieldEvaluator::Kind::FIELD_E, *E->ParFESpace(),
                             E_bdr_eval);
     }
-    // Q_s = D ⋅ n = ε_0 E ⋅ n.
+    // Q_s = D ⋅ n = ε_0 ε E ⋅ n, with the complex permittivity ε = Re{ε} + i Im{ε} of a
+    // lossy dielectric for complex fields (the fused bundle applies it in-kernel; the
+    // independent evaluators need the Im{ε}-weighted counterpart, combined at write time).
     if (use_ceed_boundary_fields)
     {
       MakeBdrCoeffEvaluator(PointFieldEvaluator::Kind::FLUX_Q, *E->ParFESpace(), scaling,
                             Q_bdr_eval);
+      if (HasComplexGridFunction<solver_t>() && fem_op->GetMaterialOp().HasLossTangent() &&
+          !bdr_derived_bundle)
+      {
+        const auto &mesh = fem_op->GetMaterialOp().GetMesh();
+        const auto &pmesh = mesh.Get();
+        const int bdr_attr_max =
+            pmesh.bdr_attributes.Size() ? pmesh.bdr_attributes.Max() : 0;
+        mfem::Array<int> marker(bdr_attr_max);
+        marker = 1;
+        Q_bdr_eval_imag = std::make_unique<PointFieldEvaluator>(
+            PointFieldEvaluator::Kind::FLUX_Q, mesh, marker, *E->ParFESpace(),
+            fem_op->GetMaterialOp(), paraview_refine_order, scaling, bdr_sampling_plan,
+            bdr_trace_cache, nullptr, /*imag_permittivity*/ true);
+        RequireCeedPointFieldEvaluator(Q_bdr_eval_imag.get(),
+                                       "lossy boundary surface charge visualization");
+      }
     }
   }
 
@@ -968,13 +988,37 @@ void PostOperator<solver_t>::InitializeParaviewDataCollection(
   {
     if (HasComplexGridFunction<solver_t>())
     {
+      // Independent evaluators: Q_r = Re{ε} E_r ⋅ n - Im{ε} E_i ⋅ n and
+      // Q_i = Re{ε} E_i ⋅ n + Im{ε} E_r ⋅ n (the Im{ε} evaluator exists only for lossy
+      // materials; the fused bundle computes the same combination in-kernel).
+      auto RegisterBdrChargeField = [&](const std::string &name, bool imaginary_phase)
+      {
+        const auto *eval_ptr = Q_bdr_eval.get();
+        const auto *eval_imag_ptr = Q_bdr_eval_imag.get();
+        const auto *E_ptr = E.get();
+        paraview_bdr->RegisterBoundaryPointEvaluator(
+            name,
+            [eval_ptr, eval_imag_ptr, E_ptr, imaginary_phase](Vector &buffer)
+            {
+              eval_ptr->EvalBuffer(imaginary_phase ? E_ptr->Imag() : E_ptr->Real(), buffer);
+              if (eval_imag_ptr)
+              {
+                Vector cross(buffer.Size());
+                cross.UseDevice(buffer.UseDevice());
+                eval_imag_ptr->EvalBuffer(imaginary_phase ? E_ptr->Real() : E_ptr->Imag(),
+                                          cross);
+                buffer.Add(imaginary_phase ? 1.0 : -1.0, cross);
+              }
+            },
+            eval_ptr->BufferBases(), eval_ptr->BufferNumComp(), eval_ptr->BufferSize());
+      };
       if (!RegisterBdrBundleField("Q_s_real", PointFieldEvaluator::Kind::FLUX_Q, false))
       {
-        RegisterBdrEvalField("Q_s_real", Q_bdr_eval, E->Real());
+        RegisterBdrChargeField("Q_s_real", false);
       }
       if (!RegisterBdrBundleField("Q_s_imag", PointFieldEvaluator::Kind::FLUX_Q, true))
       {
-        RegisterBdrEvalField("Q_s_imag", Q_bdr_eval, E->Imag());
+        RegisterBdrChargeField("Q_s_imag", true);
       }
     }
     else
@@ -1175,7 +1219,8 @@ void PostOperator<solver_t>::WriteParaviewFields(double time, int step)
   double paraview_time = time;
   if constexpr (solver_t == ProblemType::DRIVEN)
   {
-    paraview_time = units.Dimensionalize<Units::ValueType::FREQUENCY>(time) / (2.0 * M_PI);
+    paraview_time =
+        units.Dimensionalize<Units::ValueType::FREQUENCY>(time) / (2.0 * std::numbers::pi);
   }
   paraview->SetCycle(step);
   paraview->SetTime(paraview_time);
@@ -1782,7 +1827,7 @@ void PostOperator<solver_t>::MeasureFloquetPorts() const
       // Unitary: |S_RHC|² + |S_LHC|² = |S_TE|² + |S_TM|² (energy conserved).
       if (circular_output)
       {
-        const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+        const double inv_sqrt2 = 1.0 / std::numbers::sqrt2;
         std::map<std::tuple<int, int, bool>, std::complex<double>> circ;
         std::set<std::pair<int, int>> orders;
         for (const auto &[key, S] : S_all)
@@ -1866,7 +1911,7 @@ void PostOperator<solver_t>::MeasureSParameter() const
     // Cross-type observations require a √2 correction:
     //   - Floquet drives, lumped/wave observes: lumped |b|² = 2×P_avg, divide by √2
     //   - Lumped/wave drives, Floquet observes: Floquet |S|² = P_avg, multiply by √2
-    const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+    const double inv_sqrt2 = 1.0 / std::numbers::sqrt2;
     const bool floquet_drives = (drive_port_type == PortType::FloquetPort);
     const bool lumped_or_wave_drives =
         (drive_port_type == PortType::LumpedPort || drive_port_type == PortType::WavePort);
@@ -1920,7 +1965,7 @@ void PostOperator<solver_t>::MeasureSParameter() const
       {
         if (lumped_or_wave_drives)
         {
-          S *= std::sqrt(2.0);
+          S *= std::numbers::sqrt2;
         }
         auto [m, n, is_te] = key;
         auto pol = measurement_cache.floquet_circular_output ? (is_te ? "RHC" : "LHC")
@@ -2027,22 +2072,22 @@ void PostOperator<solver_t>::MeasureProbes() const
 #if defined(MFEM_USE_GSLIB)
   if constexpr (HasEGridFunction<solver_t>())
   {
-    if (interp_op.GetProbes().size() > 0 && E)
+    if (!interp_op.GetProbes().empty() && E)
     {
       measurement_cache.probe_E_field = interp_op.ProbeField(*E);
     }
   }
-  if (En && interp_op.GetProbes().size() > 0)
+  if (En && !interp_op.GetProbes().empty())
   {
     measurement_cache.probe_En_field = interp_op.ProbeField(*En);
   }
-  if (Bt_inplane && interp_op.GetProbes().size() > 0)
+  if (Bt_inplane && !interp_op.GetProbes().empty())
   {
     measurement_cache.probe_Bt_field = interp_op.ProbeField(*Bt_inplane);
   }
   if constexpr (HasBGridFunction<solver_t>())
   {
-    if (interp_op.GetProbes().size() > 0 && B)
+    if (!interp_op.GetProbes().empty() && B)
     {
       measurement_cache.probe_B_field = interp_op.ProbeField(*B);
     }
@@ -2053,12 +2098,11 @@ void PostOperator<solver_t>::MeasureProbes() const
 using fmt::format;
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureAndPrintAll(int ex_idx, int step,
-                                                const ComplexVector &e,
-                                                const ComplexVector &b,
-                                                std::complex<double> omega)
-    -> std::enable_if_t<U == ProblemType::DRIVEN, double>
+double PostOperator<solver_t>::MeasureAndPrintAll(int ex_idx, int step,
+                                                  const ComplexVector &e,
+                                                  const ComplexVector &b,
+                                                  std::complex<double> omega)
+  requires(solver_t == ProblemType::DRIVEN)
 {
   BlockTimer bt0(Timer::POSTPRO);
   SetEGridFunction(e);
@@ -2070,14 +2114,13 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int ex_idx, int step,
   MeasureAllImpl();
 
   std::complex<double> freq =
-      units.Dimensionalize<Units::ValueType::FREQUENCY>(omega) / (2 * M_PI);
+      units.Dimensionalize<Units::ValueType::FREQUENCY>(omega) / (2 * std::numbers::pi);
   post_op_csv.PrintAllCSVData(*this, measurement_cache, freq.real(), step, ex_idx);
   if (ShouldWriteParaviewFields(step))
   {
     Mpi::Print("\n");
     auto ind = 1 + std::distance(output_save_indices.begin(),
-                                 std::lower_bound(output_save_indices.begin(),
-                                                  output_save_indices.end(), step));
+                                 std::ranges::lower_bound(output_save_indices, step));
     WriteParaviewFields(omega.real(), ind);
     Mpi::Print(" Wrote fields to disk (Paraview) at step {:d}\n", step + 1);
   }
@@ -2085,8 +2128,7 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int ex_idx, int step,
   {
     Mpi::Print("\n");
     auto ind = 1 + std::distance(output_save_indices.begin(),
-                                 std::lower_bound(output_save_indices.begin(),
-                                                  output_save_indices.end(), step));
+                                 std::ranges::lower_bound(output_save_indices, step));
     WriteMFEMGridFunctions(freq.real(), ind);
     Mpi::Print(" Wrote fields to disk (grid function) at step {:d}\n", step + 1);
   }
@@ -2095,13 +2137,219 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int ex_idx, int step,
 }
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &e,
-                                                const ComplexVector &b,
-                                                std::complex<double> omega,
-                                                double error_abs, double error_bkwd,
-                                                int num_conv)
-    -> std::enable_if_t<U == ProblemType::EIGENMODE, double>
+void PostOperator<solver_t>::ConfigureReducedPostprocessing(const RomOperator &rom_op)
+  requires(solver_t == ProblemType::DRIVEN)
+{
+  reduced_postprocessing_ready = false;
+  reduced_postprocessing_checked = false;
+  // The reduced magnetic form contains curl(E) only, while a Floquet wave vector adds a
+  // frequency-dependent k × E correction to the full magnetic flux density.
+  if (fem_op->GetMaterialOp().HasWaveVector() || !fem_op->GetFloquetPortOp().Empty() ||
+      fem_op->GetSurfaceCurrentOp().Size() > 0 || !surf_post_op.flux_surfs.empty() ||
+      !surf_post_op.eps_surfs.empty() || surf_post_op.farfield.size() > 0 ||
+      !interp_op.GetProbes().empty() || !fem_op->GetPortExcitations().IsMultipleSimple())
+  {
+    return;
+  }
+  for (const auto &[excitation_idx, excitation_spec] : fem_op->GetPortExcitations())
+  {
+    const auto [is_simple, port_type, port_idx] = excitation_spec.IsSimple();
+    if (!is_simple ||
+        (port_type != PortType::LumpedPort && port_type != PortType::WavePort))
+    {
+      return;
+    }
+  }
+  for (const auto &[idx, data] : fem_op->GetWavePortOp())
+  {
+    if (data.HasVoltageCoords())
+    {
+      return;
+    }
+  }
+
+  const auto &basis = rom_op.GetBasis();
+  const std::size_t n = basis.size();
+  if (n == 0)
+  {
+    return;
+  }
+  std::vector<Vector> basis_E, basis_B;
+  basis_E.reserve(n);
+  basis_B.reserve(n);
+  const auto &curl = fem_op->GetCurlMatrix();
+  Vector b_true(curl.Height());
+  for (const auto &v : basis)
+  {
+    E->Real().SetFromTrueDofs(v);
+    basis_E.emplace_back(E->Real());
+    curl.Mult(v, b_true);
+    B->Real().SetFromTrueDofs(b_true);
+    basis_B.emplace_back(B->Real());
+  }
+
+  auto project = [&](const Operator *op,
+                     const std::vector<Vector> &local_basis) -> Eigen::MatrixXd
+  {
+    Eigen::MatrixXd result = Eigen::MatrixXd::Zero(n, n);
+    if (!op)
+    {
+      return result;
+    }
+    Vector z(op->Height());
+    for (std::size_t j = 0; j < n; j++)
+    {
+      op->Mult(local_basis[j], z);
+      for (std::size_t i = 0; i < n; i++)
+      {
+        result(i, j) = linalg::LocalDot(z, local_basis[i]);
+      }
+    }
+    Mpi::GlobalSum(static_cast<int>(n * n), result.data(), fem_op->GetComm());
+    return 0.5 * (result + result.transpose()).eval();
+  };
+
+  reduced_energy_E = project(dom_post_op.M_elec.get(), basis_E);
+  reduced_energy_H = project(dom_post_op.M_mag.get(), basis_B);
+  reduced_domain_energy.clear();
+  for (const auto &[idx, ops] : dom_post_op.M_i)
+  {
+    reduced_domain_energy.emplace(idx, std::make_pair(project(ops.first.get(), basis_E),
+                                                      project(ops.second.get(), basis_B)));
+  }
+  reduced_postprocessing_ready = true;
+}
+
+template <ProblemType solver_t>
+void PostOperator<solver_t>::MeasureAndPrintReduced(int ex_idx, int step,
+                                                    const ComplexVector &e,
+                                                    std::complex<double> omega,
+                                                    const Eigen::VectorXcd &y)
+  requires(solver_t == ProblemType::DRIVEN)
+{
+  BlockTimer bt0(Timer::POSTPRO);
+  MFEM_VERIFY(reduced_postprocessing_ready && y.size() == reduced_energy_E.rows(),
+              "Invalid reduced postprocessing state!");
+  SetEGridFunction(e);
+
+  auto quadratic = [&y](const Eigen::MatrixXd &Q)
+  { return 0.5 * std::real(y.dot(Q.cast<std::complex<double>>() * y)); };
+  measurement_cache = {};
+  measurement_cache.freq = omega;
+  measurement_cache.ex_idx = ex_idx;
+  measurement_cache.domain_E_field_energy_all = quadratic(reduced_energy_E);
+  measurement_cache.domain_H_field_energy_all =
+      quadratic(reduced_energy_H) / (omega.real() * omega.real());
+  for (const auto &[idx, forms] : reduced_domain_energy)
+  {
+    const double energy_E = quadratic(forms.first);
+    const double energy_H = quadratic(forms.second) / (omega.real() * omega.real());
+    measurement_cache.domain_E_field_energy_i.push_back(
+        {idx, energy_E,
+         (measurement_cache.domain_E_field_energy_all != 0.0)
+             ? energy_E / measurement_cache.domain_E_field_energy_all
+             : 0.0});
+    measurement_cache.domain_H_field_energy_i.push_back(
+        {idx, energy_H,
+         (measurement_cache.domain_H_field_energy_all != 0.0)
+             ? energy_H / measurement_cache.domain_H_field_energy_all
+             : 0.0});
+  }
+  if (!reduced_postprocessing_checked)
+  {
+    ComplexVector b(fem_op->GetCurlMatrix().Height());
+    b.UseDevice(true);
+    fem_op->GetCurlMatrix().Mult(e.Real(), b.Real());
+    fem_op->GetCurlMatrix().Mult(e.Imag(), b.Imag());
+    b *= -1.0 / (1i * omega);
+    SetBGridFunction(b);
+
+    double max_error = 0.0, max_reference = 0.0;
+    auto compare = [&](double reduced, double exact)
+    {
+      max_error = std::max(max_error, std::abs(reduced - exact));
+      max_reference = std::max(max_reference, std::abs(exact));
+    };
+    const double exact_E = dom_post_op.GetElectricFieldEnergy(*E);
+    const double exact_H = dom_post_op.GetMagneticFieldEnergy(*B);
+    compare(measurement_cache.domain_E_field_energy_all, exact_E);
+    compare(measurement_cache.domain_H_field_energy_all, exact_H);
+    std::vector<Measurement::DomainData> exact_domain_E, exact_domain_H;
+    for (const auto &[idx, forms] : reduced_domain_energy)
+    {
+      const double energy_E = dom_post_op.GetDomainElectricFieldEnergy(idx, *E);
+      const double energy_H = dom_post_op.GetDomainMagneticFieldEnergy(idx, *B);
+      compare(measurement_cache.domain_E_field_energy_i[exact_domain_E.size()].energy,
+              energy_E);
+      compare(measurement_cache.domain_H_field_energy_i[exact_domain_H.size()].energy,
+              energy_H);
+      exact_domain_E.push_back(
+          {idx, energy_E, (exact_E != 0.0) ? energy_E / exact_E : 0.0});
+      exact_domain_H.push_back(
+          {idx, energy_H, (exact_H != 0.0) ? energy_H / exact_H : 0.0});
+    }
+    reduced_postprocessing_checked = true;
+    if (max_error > 1.0e-9 * std::max(max_reference, 1.0e-300))
+    {
+      reduced_postprocessing_ready = false;
+      measurement_cache.domain_E_field_energy_all = exact_E;
+      measurement_cache.domain_H_field_energy_all = exact_H;
+      measurement_cache.domain_E_field_energy_i = std::move(exact_domain_E);
+      measurement_cache.domain_H_field_energy_i = std::move(exact_domain_H);
+      Mpi::Warning("Reduced domain-energy postprocessing disagrees with full evaluation "
+                   "(relative error {:.3e}); reverting to full postprocessing.\n",
+                   max_error / std::max(max_reference, 1.0e-300));
+    }
+  }
+  const auto port_voltages = fem_op->GetLumpedPortOp().GetVoltages(*E);
+  for (const auto &[idx, data] : fem_op->GetLumpedPortOp())
+  {
+    auto &vi = measurement_cache.lumped_port_vi[idx];
+    vi.V = port_voltages.at(idx);
+    vi.I_RLC[0] = (std::abs(data.R) > 0.0)
+                      ? vi.V / data.GetCharacteristicImpedance(omega.real(),
+                                                               LumpedPortData::Branch::R)
+                      : 0.0;
+    vi.I_RLC[1] = (std::abs(data.L) > 0.0)
+                      ? vi.V / data.GetCharacteristicImpedance(omega.real(),
+                                                               LumpedPortData::Branch::L)
+                      : 0.0;
+    vi.I_RLC[2] = (std::abs(data.C) > 0.0)
+                      ? vi.V / data.GetCharacteristicImpedance(omega.real(),
+                                                               LumpedPortData::Branch::C)
+                      : 0.0;
+    vi.I =
+        std::accumulate(vi.I_RLC.begin(), vi.I_RLC.end(), std::complex<double>{0.0, 0.0});
+    vi.S = vi.V / std::sqrt(data.GetExcitationRefResistance());
+    if (std::abs(data.L) > 0.0)
+    {
+      vi.inductor_energy = 0.5 * std::abs(data.L) * std::norm(vi.I_RLC[1]);
+      measurement_cache.lumped_port_inductor_energy += vi.inductor_energy;
+    }
+    if (std::abs(data.C) > 0.0)
+    {
+      vi.capacitor_energy = 0.5 * std::abs(data.C) * std::norm(vi.V);
+      measurement_cache.lumped_port_capacitor_energy += vi.capacitor_energy;
+    }
+  }
+  for (const auto &[idx, data] : fem_op->GetWavePortOp())
+  {
+    measurement_cache.wave_port_vi[idx].S = data.GetSParameter(*E);
+  }
+  MeasureSParameter();
+
+  const std::complex<double> freq =
+      units.Dimensionalize<Units::ValueType::FREQUENCY>(omega) / (2 * std::numbers::pi);
+  post_op_csv.PrintReducedCSVData(*this, measurement_cache, freq.real(), step, ex_idx);
+}
+
+template <ProblemType solver_t>
+double PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &e,
+                                                  const ComplexVector &b,
+                                                  std::complex<double> omega,
+                                                  double error_abs, double error_bkwd,
+                                                  int num_conv)
+  requires(solver_t == ProblemType::EIGENMODE)
 {
   BlockTimer bt0(Timer::POSTPRO);
   SetEGridFunction(e);
@@ -2124,10 +2372,10 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &e
     table.insert(Column("idx", "m", idx_pad, {}, {}, "") << step + 1);
     table.insert(Column("f_re", "Re{f} (GHz)")
                  << (units.Dimensionalize<Units::ValueType::FREQUENCY>(omega.real())) /
-                        (2 * M_PI));
+                        (2 * std::numbers::pi));
     table.insert(Column("f_im", "Im{f} (GHz)")
                  << (units.Dimensionalize<Units::ValueType::FREQUENCY>(omega.imag())) /
-                        (2 * M_PI));
+                        (2 * std::numbers::pi));
     table.insert(Column("q", "Q") << measurement_cache.eigenmode_Q);
     table.insert(Column("err_back", "Error (Bkwd.)") << error_bkwd);
     table.insert(Column("err_abs", "Error (Abs.)") << error_abs);
@@ -2153,10 +2401,9 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &e
 }
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &v, const Vector &e,
-                                                int idx)
-    -> std::enable_if_t<U == ProblemType::ELECTROSTATIC, double>
+double PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &v,
+                                                  const Vector &e, int idx)
+  requires(solver_t == ProblemType::ELECTROSTATIC)
 {
   BlockTimer bt0(Timer::POSTPRO);
   SetVGridFunction(v);
@@ -2183,10 +2430,9 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &v, const
          measurement_cache.domain_H_field_energy_all;
 }
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &a, const Vector &b,
-                                                int idx)
-    -> std::enable_if_t<U == ProblemType::MAGNETOSTATIC, double>
+double PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &a,
+                                                  const Vector &b, int idx)
+  requires(solver_t == ProblemType::MAGNETOSTATIC)
 {
   BlockTimer bt0(Timer::POSTPRO);
   SetAGridFunction(a);
@@ -2214,10 +2460,10 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &a, const
 }
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &e, const Vector &b,
-                                                double time, double J_coef)
-    -> std::enable_if_t<U == ProblemType::TRANSIENT, double>
+double PostOperator<solver_t>::MeasureAndPrintAll(int step, const Vector &e,
+                                                  const Vector &b, double time,
+                                                  double J_coef)
+  requires(solver_t == ProblemType::TRANSIENT)
 {
   BlockTimer bt0(Timer::POSTPRO);
   SetEGridFunction(e);
@@ -2271,10 +2517,9 @@ void PostOperator<solver_t>::MeasureFinalize(const ErrorIndicator &indicator)
 }
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureDomainFieldEnergyOnly(const ComplexVector &e,
-                                                          const ComplexVector &b)
-    -> std::enable_if_t<U == ProblemType::DRIVEN, double>
+double PostOperator<solver_t>::MeasureDomainFieldEnergyOnly(const ComplexVector &e,
+                                                            const ComplexVector &b)
+  requires(solver_t == ProblemType::DRIVEN)
 {
   SetEGridFunction(e);
   SetBGridFunction(b);
@@ -2287,13 +2532,12 @@ auto PostOperator<solver_t>::MeasureDomainFieldEnergyOnly(const ComplexVector &e
 }
 
 template <ProblemType solver_t>
-template <ProblemType U>
-auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &et,
-                                                const ComplexVector &en,
-                                                std::complex<double> kn, double omega,
-                                                double error_abs, double error_bkwd,
-                                                int num_conv)
-    -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, double>
+double PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &et,
+                                                  const ComplexVector &en,
+                                                  std::complex<double> kn, double omega,
+                                                  double error_abs, double error_bkwd,
+                                                  int num_conv)
+  requires(solver_t == ProblemType::BOUNDARYMODE)
 {
   BlockTimer bt0(Timer::POSTPRO);
 
@@ -2369,12 +2613,7 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &e
     std::vector<double> path_data;
     std::vector<int> marker_data;
 
-    bool operator<(const LineIntegralKey &other) const
-    {
-      return std::tie(has_coords, quad_order, path_data, marker_data) <
-             std::tie(other.has_coords, other.quad_order, other.path_data,
-                      other.marker_data);
-    }
+    auto operator<=>(const LineIntegralKey &) const = default;
   };
   auto MakeLineIntegralKey = [](const std::vector<mfem::Vector> &path, bool has_coords,
                                 const mfem::Array<int> &marker, int quad_order)
@@ -2578,7 +2817,7 @@ auto PostOperator<solver_t>::MeasureAndPrintAll(int step, const ComplexVector &e
   // Compute voltage for each configured voltage-only entry.
   for (const auto &[idx, cfg] : voltage_postpro)
   {
-    if (filled_voltage_postpro.count(idx))
+    if (filled_voltage_postpro.contains(idx))
     {
       continue;
     }
@@ -2631,41 +2870,4 @@ template class PostOperator<ProblemType::ELECTROSTATIC>;
 template class PostOperator<ProblemType::MAGNETOSTATIC>;
 template class PostOperator<ProblemType::TRANSIENT>;
 template class PostOperator<ProblemType::BOUNDARYMODE>;
-
-// Function explicit instantiation.
-// TODO(C++20): with requires, we won't need a second template.
-
-template auto PostOperator<ProblemType::DRIVEN>::MeasureAndPrintAll<ProblemType::DRIVEN>(
-    int ex_idx, int step, const ComplexVector &e, const ComplexVector &b,
-    std::complex<double> omega) -> double;
-
-template auto
-PostOperator<ProblemType::EIGENMODE>::MeasureAndPrintAll<ProblemType::EIGENMODE>(
-    int step, const ComplexVector &e, const ComplexVector &b, std::complex<double> omega,
-    double error_abs, double error_bkwd, int num_conv) -> double;
-
-template auto
-PostOperator<ProblemType::ELECTROSTATIC>::MeasureAndPrintAll<ProblemType::ELECTROSTATIC>(
-    int step, const Vector &v, const Vector &e, int idx) -> double;
-
-template auto
-PostOperator<ProblemType::MAGNETOSTATIC>::MeasureAndPrintAll<ProblemType::MAGNETOSTATIC>(
-    int step, const Vector &a, const Vector &b, int idx) -> double;
-
-template auto
-PostOperator<ProblemType::TRANSIENT>::MeasureAndPrintAll<ProblemType::TRANSIENT>(
-    int step, const Vector &e, const Vector &b, double t, double J_coef) -> double;
-
-template auto
-PostOperator<ProblemType::BOUNDARYMODE>::MeasureAndPrintAll<ProblemType::BOUNDARYMODE>(
-    int step, const ComplexVector &et, const ComplexVector &en, std::complex<double> kn,
-    double omega, double error_abs, double error_bkwd, int num_conv) -> double;
-
-template auto
-PostOperator<ProblemType::DRIVEN>::MeasureDomainFieldEnergyOnly<ProblemType::DRIVEN>(
-    const ComplexVector &e, const ComplexVector &b) -> double;
-
-template auto
-PostOperator<ProblemType::DRIVEN>::InitializeParaviewDataCollection(int ex_idx) -> void;
-
 }  // namespace palace

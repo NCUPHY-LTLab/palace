@@ -6,6 +6,7 @@
 #include <complex>
 #include <fstream>
 #include <iterator>
+#include <numbers>
 #include <fmt/format.h>
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -176,6 +177,18 @@ auto RandomMeasurement(int ndomain = 5)
         {std::complex((1 + randd(99)) / 100, randd(100) / 100),
          std::complex((1 + randd(99)) / 100, randd(100) / 100),
          std::complex((1 + randd(99)) / 100, randd(100) / 100)});
+  }
+
+  cache.mode_data.kn = std::complex((1 + randd(99)) / 100, randd(100) / 100);
+  cache.mode_data.n_eff = std::complex(1 + randd(100) / 100, randd(100) / 1000);
+  int nmode_postpro = 2;
+  for (int i = 0; i < nmode_postpro; i++)
+  {
+    // The first mode has no V/I impedance and the second no Z0, which must be left
+    // unscaled.
+    cache.mode_data.impedance[i] = {(1 + randd(99)) / 100, (1 + randd(99)) / 100, i == 0,
+                                    i == 1};
+    cache.mode_data.voltage[i] = {std::complex((1 + randd(99)) / 100, randd(100) / 100)};
   }
 
   return cache;
@@ -422,6 +435,39 @@ TEST_CASE("PostOperator", "[idempotent][Serial]")
       CHECK_THAT(std::arg(dc), Catch::Matchers::WithinRel(std::arg(c)));
     }
   }
+
+  // Mode analysis data: kn [1/m], V [V], and Z [Ω] dimensionalize; n_eff is dimensionless.
+  const auto l_scale = units.GetScaleFactor<Units::ValueType::LENGTH>();
+  const auto v_scale = units.GetScaleFactor<Units::ValueType::VOLTAGE>();
+  const auto z_scale = units.GetScaleFactor<Units::ValueType::IMPEDANCE>();
+  const auto &m = cache.mode_data;
+  const auto &dm = dim_cache.mode_data;
+  const auto &ndm = non_dim_cache.mode_data;
+  CHECK_THAT(std::abs(m.kn), Catch::Matchers::WithinRel(std::abs(ndm.kn)));
+  CHECK_THAT(std::arg(m.kn), Catch::Matchers::WithinRel(std::arg(ndm.kn)));
+  CHECK_THAT(std::abs(dm.kn), Catch::Matchers::WithinRel(std::abs(m.kn) / l_scale));
+  CHECK_THAT(std::arg(dm.kn), Catch::Matchers::WithinRel(std::arg(m.kn)));
+  CHECK(m.n_eff == ndm.n_eff);
+  CHECK(m.n_eff == dm.n_eff);
+  REQUIRE(ndm.voltage.size() == m.voltage.size());
+  for (const auto &[idx, v] : m.voltage)
+  {
+    CHECK_THAT(std::abs(v.V), Catch::Matchers::WithinRel(std::abs(ndm.voltage.at(idx).V)));
+    CHECK_THAT(std::arg(v.V), Catch::Matchers::WithinRel(std::arg(ndm.voltage.at(idx).V)));
+    CHECK_THAT(std::abs(dm.voltage.at(idx).V),
+               Catch::Matchers::WithinRel(std::abs(v.V) * v_scale));
+    CHECK_THAT(std::arg(dm.voltage.at(idx).V), Catch::Matchers::WithinRel(std::arg(v.V)));
+  }
+  REQUIRE(ndm.impedance.size() == m.impedance.size());
+  for (const auto &[idx, z] : m.impedance)
+  {
+    CHECK_THAT(ndm.impedance.at(idx).Z0, Catch::Matchers::WithinRel(z.Z0));
+    CHECK_THAT(ndm.impedance.at(idx).Z_VI, Catch::Matchers::WithinRel(z.Z_VI));
+    CHECK_THAT(dm.impedance.at(idx).Z0,
+               Catch::Matchers::WithinRel(z.has_impedance ? z.Z0 * z_scale : z.Z0));
+    CHECK_THAT(dm.impedance.at(idx).Z_VI,
+               Catch::Matchers::WithinRel(z.has_vi_impedance ? z.Z_VI * z_scale : z.Z_VI));
+  }
 }
 
 TEST_CASE_METHOD(test::SharedTempDir, "Field export",
@@ -567,7 +613,8 @@ TEST_CASE_METHOD(test::SharedTempDir, "Field export",
     auto pos = contents.find("timestep=\"") + std::string("timestep=\"").size();
     double pvd_time = std::stod(contents.substr(pos, contents.find('"', pos) - pos));
     const double expected_freq =
-        iodata.units.Dimensionalize<Units::ValueType::FREQUENCY>(1.0) / (2.0 * M_PI);
+        iodata.units.Dimensionalize<Units::ValueType::FREQUENCY>(1.0) /
+        (2.0 * std::numbers::pi);
     CHECK_THAT(pvd_time, Catch::Matchers::WithinRel(expected_freq, 1.0e-5));
   }
 

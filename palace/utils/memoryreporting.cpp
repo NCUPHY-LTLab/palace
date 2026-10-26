@@ -39,8 +39,8 @@ long GetCurrentMemory()
 #if defined(__APPLE__)
   task_vm_info_data_t vm_info;
   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-  if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &count) ==
-      KERN_SUCCESS)
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info),
+                &count) == KERN_SUCCESS)
   {
     return static_cast<long>(vm_info.phys_footprint);
   }
@@ -50,7 +50,7 @@ long GetCurrentMemory()
   std::string line;
   while (std::getline(status, line))
   {
-    if (line.compare(0, 6, "VmRSS:") == 0)
+    if (line.starts_with("VmRSS:"))
     {
       // Value is in kilobytes.
       return std::stol(line.substr(6)) * 1024;

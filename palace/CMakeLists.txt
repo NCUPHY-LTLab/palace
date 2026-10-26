@@ -5,9 +5,8 @@
 # CMake configuration for the main Palace application
 #
 
-# CMake 3.21 was released in Jul. 2021 (required for HIP support)
-# Cmake 3.24 was released in Aug. 2022 (required for portable WHOLE_ARCHIVE linking of tests)
-cmake_minimum_required(VERSION 3.24)
+# CMake 3.27 was released in Jul. 2023 (required for AOCL in FindBLAS/FindLAPACK)
+cmake_minimum_required(VERSION 3.27)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -16,12 +15,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
   message(FATAL_ERROR "In-source builds are prohibited")
 endif()
 
-# C++17 required for std::filesystem, among others. Override via -DCMAKE_CXX_STANDARD=<VALUE>
+# C++ standard. Override via -DCMAKE_CXX_STANDARD=<VALUE>
 if(NOT DEFINED CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD 20)
 endif()
-if(CMAKE_CXX_STANDARD LESS 17)
-  message(FATAL_ERROR "Palace requires C++17 or later (got ${CMAKE_CXX_STANDARD})")
+if(CMAKE_CXX_STANDARD LESS 20)
+  message(FATAL_ERROR "Palace requires C++20 or later (got ${CMAKE_CXX_STANDARD})")
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -108,10 +107,25 @@ endif()
 if(PALACE_WITH_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  # C++20 device code: nvcc supports -std=c++20 from 12.0
+  if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.0)
+    message(FATAL_ERROR
+      "PALACE_WITH_CUDA requires CUDA 12.0 or later (found ${CMAKE_CUDA_COMPILER_VERSION})")
+  endif()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 elseif(PALACE_WITH_HIP)
   enable_language(HIP)
 endif()
+
+# Device translation units share headers with host code, so compile them with the same C++
+# standard (otherwise nvcc/hipcc use their own default)
+set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_EXTENSIONS OFF)
+set(CMAKE_HIP_STANDARD ${CMAKE_CXX_STANDARD})
+set(CMAKE_HIP_STANDARD_REQUIRED ON)
+set(CMAKE_HIP_EXTENSIONS OFF)
 
 # Set a default build type if none was provided
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -377,14 +391,32 @@ set_property(
 # Generate embedded schema header from JSON schema files
 include(${CMAKE_SOURCE_DIR}/../cmake/EmbedSchema.cmake)
 
-# Add Git revision information (forces reconfigure when Git status changes)
-include(GetGitDescription)
-git_describe(GIT_COMMIT_ID)
+# Add Git revision information (forces reconfigure when Git status changes). Builds without
+# usable Git metadata (e.g. Spack) can supply it via PALACE_GIT_COMMIT_ID, as a CMake variable
+# or, failing that, an environment variable.
+set(PALACE_GIT_COMMIT_ID "" CACHE STRING "Version string to embed instead of git describe")
+if(PALACE_GIT_COMMIT_ID)
+  set(GIT_COMMIT_ID "${PALACE_GIT_COMMIT_ID}")
+elseif(NOT "$ENV{PALACE_GIT_COMMIT_ID}" STREQUAL "")
+  set(GIT_COMMIT_ID "$ENV{PALACE_GIT_COMMIT_ID}")
+else()
+  include(GetGitDescription)
+  git_describe(GIT_COMMIT_ID)
+endif()
 message(STATUS "Git string: ${GIT_COMMIT_ID}")
 if(NOT GIT_COMMIT_ID MATCHES "NOTFOUND")
   set_property(
     SOURCE ${CMAKE_SOURCE_DIR}/main.cpp
     APPEND PROPERTY COMPILE_DEFINITIONS "PALACE_GIT_COMMIT;PALACE_GIT_COMMIT_ID=\"${GIT_COMMIT_ID}\""
+  )
+endif()
+
+# Identifier of the producing build (e.g. the Spack DAG hash), printed by --version
+set(PALACE_BUILD_ID "" CACHE STRING "Build identifier to embed (e.g. Spack DAG hash)")
+if(PALACE_BUILD_ID)
+  set_property(
+    SOURCE ${CMAKE_SOURCE_DIR}/main.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS "PALACE_BUILD_ID=\"${PALACE_BUILD_ID}\""
   )
 endif()
 
@@ -594,7 +626,11 @@ if(PALACE_WITH_STRUMPACK)
     find_package(${pkg} QUIET)
     if(${pkg}_FOUND)
       message(STATUS "Found ${pkg}")
-      target_link_libraries(${LIB_TARGET_NAME} PUBLIC ${pkg})
+      if(TARGET ${pkg}::${pkg})
+        target_link_libraries(${LIB_TARGET_NAME} PUBLIC ${pkg}::${pkg})
+      else()
+        target_link_libraries(${LIB_TARGET_NAME} PUBLIC ${pkg})
+      endif()
     endif()
   endforeach()
 endif()
@@ -659,6 +695,16 @@ if(PALACE_WITH_GSLIB)
   find_library(GSLIB_LIBRARY NAMES gs gslib HINTS ${GSLIB_ROOT}/lib REQUIRED)
   message(STATUS "Found GSLIB: ${GSLIB_LIBRARY}")
   target_link_libraries(${LIB_TARGET_NAME} PUBLIC ${GSLIB_LIBRARY})
+
+  # Only utils/gslibversion.cpp includes the GSLIB header, for the version query
+  get_filename_component(_gslib_prefix "${GSLIB_LIBRARY}" DIRECTORY)
+  find_path(GSLIB_INCLUDE_DIR gslib.h
+    HINTS ${GSLIB_ROOT}/include ${_gslib_prefix}/../include PATH_SUFFIXES gslib REQUIRED)
+  target_sources(${LIB_TARGET_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/utils/gslibversion.cpp)
+  set_property(
+    SOURCE ${CMAKE_SOURCE_DIR}/utils/gslibversion.cpp
+    APPEND PROPERTY INCLUDE_DIRECTORIES ${GSLIB_INCLUDE_DIR}
+  )
 endif()
 
 target_link_libraries(
@@ -676,6 +722,97 @@ if(PALACE_WITH_GPU_AWARE_MPI)
     PUBLIC PALACE_WITH_GPU_AWARE_MPI
   )
 endif()
+
+# Tell utils/versions.cpp which optional dependencies are linked. Versions of dependencies
+# without a header or runtime query that Palace can reach are taken from CMake.
+set(VERSION_DEFINITIONS)
+if(PALACE_WITH_SUPERLU)
+  list(APPEND VERSION_DEFINITIONS PALACE_WITH_SUPERLU)
+endif()
+if(PALACE_WITH_CUDA OR PALACE_WITH_HIP)
+  list(APPEND VERSION_DEFINITIONS PALACE_WITH_UMPIRE)
+endif()
+if(PALACE_WITH_CUDSS)
+  list(APPEND VERSION_DEFINITIONS PALACE_WITH_CUDSS)
+endif()
+if(ZLIB_FOUND)
+  list(APPEND VERSION_DEFINITIONS PALACE_WITH_ZLIB)
+endif()
+foreach(pkg zfp slate lapackpp blaspp)
+  if(PALACE_WITH_STRUMPACK AND ${pkg}_FOUND)
+    string(TOUPPER ${pkg} _pkg)
+    list(APPEND VERSION_DEFINITIONS PALACE_WITH_${_pkg})
+  endif()
+endforeach()
+# The BLAS/LAPACK vendor selects which vendor-specific version query to compile in. Match
+# BLA_VENDOR and library file names only, since directory names (e.g. hashes) are arbitrary.
+set(_blas_lapack "${BLA_VENDOR}")
+foreach(_lib IN LISTS LAPACK_LIBRARIES BLAS_LIBRARIES)
+  get_filename_component(_lib "${_lib}" NAME)
+  list(APPEND _blas_lapack "${_lib}")
+endforeach()
+string(TOLOWER "${_blas_lapack}" _blas_lapack)
+if(_blas_lapack MATCHES "(^|;)(lib)?openblas")
+  list(APPEND VERSION_DEFINITIONS PALACE_BLAS_OPENBLAS)
+  # ILP64 OpenBLAS built with SYMBOLSUFFIX=64_ is named libopenblas64_
+  if(_blas_lapack MATCHES "(^|;)(lib)?openblas[op]?64_")
+    list(APPEND VERSION_DEFINITIONS PALACE_BLAS_OPENBLAS64)
+  endif()
+elseif(_blas_lapack MATCHES "(^|;)((lib)?mkl_|intel10)")
+  list(APPEND VERSION_DEFINITIONS PALACE_BLAS_MKL)
+elseif(_blas_lapack MATCHES "(^|;)((lib)?armpl|arm)")
+  list(APPEND VERSION_DEFINITIONS PALACE_BLAS_ARMPL)
+elseif(_blas_lapack MATCHES "(^|;)((lib)?blis|aocl)")
+  list(APPEND VERSION_DEFINITIONS PALACE_BLAS_AOCL)
+endif()
+if(nlohmann_json_schema_validator_VERSION)
+  list(APPEND VERSION_DEFINITIONS
+    "PALACE_JSON_SCHEMA_VALIDATOR_VERSION=\"${nlohmann_json_schema_validator_VERSION}\"")
+endif()
+if(PALACE_WITH_ARPACK AND arpackng_VERSION)
+  list(APPEND VERSION_DEFINITIONS "PALACE_ARPACK_VERSION=\"${arpackng_VERSION}\"")
+endif()
+if(PALACE_WITH_STRUMPACK AND ButterflyPACK_FOUND AND ButterflyPACK_VERSION)
+  list(APPEND VERSION_DEFINITIONS
+    "PALACE_BUTTERFLYPACK_VERSION=\"${ButterflyPACK_VERSION}\"")
+endif()
+# libxsmm and MAGMA are only linked by libCEED, so check its pkg-config dependencies. Query
+# pkg-config directly, since pkg_check_modules caches its results across reconfigures.
+if(libCEED_STATIC_LIBRARIES MATCHES "(^|;)(:lib)?xsmm(\\.a)?(;|$)")
+  execute_process(
+    COMMAND ${PKG_CONFIG_EXECUTABLE} --modversion libxsmm
+    OUTPUT_VARIABLE _libxsmm_version OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _result ERROR_QUIET
+  )
+  if(_result EQUAL 0 AND _libxsmm_version)
+    list(APPEND VERSION_DEFINITIONS "PALACE_LIBXSMM_VERSION=\"${_libxsmm_version}\"")
+  endif()
+endif()
+if(libCEED_STATIC_LIBRARIES MATCHES "(^|;)(:lib)?magma(\\.a)?(;|$)")
+  # magma.pc carries no version, so read it from the headers
+  pkg_get_variable(_magma_includedir magma includedir)
+  find_file(MAGMA_TYPES_HEADER magma_types.h HINTS ${_magma_includedir})
+  if(MAGMA_TYPES_HEADER)
+    set(_magma_version)
+    foreach(_part MAJOR MINOR MICRO)
+      file(STRINGS ${MAGMA_TYPES_HEADER} _define
+        REGEX "^#define MAGMA_VERSION_${_part}[ \t]+[0-9]+")
+      if(NOT _define MATCHES "^#define MAGMA_VERSION_${_part}[ \t]+([0-9]+)")
+        set(_magma_version)
+        break()
+      endif()
+      list(APPEND _magma_version ${CMAKE_MATCH_1})
+    endforeach()
+    if(_magma_version)
+      list(JOIN _magma_version "." _magma_version)
+      list(APPEND VERSION_DEFINITIONS "PALACE_MAGMA_VERSION=\"${_magma_version}\"")
+    endif()
+  endif()
+endif()
+set_property(
+  SOURCE ${CMAKE_SOURCE_DIR}/utils/versions.cpp
+  APPEND PROPERTY COMPILE_DEFINITIONS "${VERSION_DEFINITIONS}"
+)
 
 
 # Install target and helper scripts
