@@ -345,7 +345,7 @@ Measurement Measurement::Nondimensionalize(const Units &units,
 namespace
 {
 
-constexpr std::string DimLabel(int i)
+std::string DimLabel(int i)
 {
   switch (i)
   {
@@ -361,7 +361,7 @@ constexpr std::string DimLabel(int i)
   }
 }
 
-constexpr std::string LabelIndexCol(const ProblemType solver_t)
+std::string LabelIndexCol(const ProblemType solver_t)
 {
   switch (solver_t)
   {

@@ -3,8 +3,8 @@
   "palace": {
     "upstream_commit": "7d6b52486facb5717b3f29698a6fefc230033200",
     "upstream_tree": "bc8f42285fb0ca78bbab1199d6e123faeb78c1f5",
-    "reviewed_native_tree": "6e1096cfba5695c51e47d3fe3b1e477648996cb0",
-    "solver_content_manifest_sha256": "c702267886e4b16d96b2ced5263d12f7e7cda1dc4236fa8881fd7764d2a88c5c",
+    "reviewed_native_tree": "0280331c288304fcfd6c03b1cefe3de1bcbec7f1",
+    "solver_content_manifest_sha256": "5e7493f201e541e6b9b31026f0132ba8b19844cb6d17ea0c9a746c63d0877627",
     "solver_content_excludes": [
       "scripts/spack-cpu/",
       "spack_repo/"
