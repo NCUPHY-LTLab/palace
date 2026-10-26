@@ -269,10 +269,16 @@ TEST_CASE_METHOD(test::SharedTempDir, "RebalanceMesh removes mesh symlink only i
   iodata.model.mesh = make_mesh_name;
   iodata.model.refinement.save_adapt_mesh = true;
 
+#if defined(MFEM_USE_ZLIB)
+  constexpr auto mesh_extension = ".meshgz";
+#else
+  constexpr auto mesh_extension = ".mesh";
+#endif
+
   SECTION("Regular mesh file is overwritten, not unlinked")
   {
     auto sfile = temp_dir / fs::path(iodata.model.mesh).stem();
-    sfile += ".mesh";
+    sfile += mesh_extension;
     CreateFile(sfile, "old_regular");
 
     mesh::RebalanceMesh(iodata, mesh);
@@ -285,7 +291,7 @@ TEST_CASE_METHOD(test::SharedTempDir, "RebalanceMesh removes mesh symlink only i
   SECTION("Symlink mesh file is removed before overwrite")
   {
     auto sfile = temp_dir / fs::path(iodata.model.mesh).stem();
-    sfile += ".mesh";
+    sfile += mesh_extension;
     auto symlink_target = temp_dir / "linked_target.mesh";
     CreateFile(symlink_target, "adapted_target");
     fs::create_symlink(symlink_target, sfile);

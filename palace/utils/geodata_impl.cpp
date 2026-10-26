@@ -271,6 +271,11 @@ BoundingBox BoundingBoxFromPointCloud(MPI_Comm comm,
       center = origin + frame * (0.5 * (lower + upper));
       Eigen::Vector3d half_lengths = 0.5 * (upper - lower);
       half_lengths(1) = std::max(half_lengths(1), minimum_half_width);
+      // Preserve the upstream degenerate normal for an already-classified planar box.
+      if (box.planar)
+      {
+        half_lengths(2) = 0.0;
+      }
       for (int i = 0; i < 3; i++)
       {
         axes[i] = frame.col(i) * half_lengths(i);
@@ -466,7 +471,7 @@ BoundingBox BoundingBoxFromPointCloud(MPI_Comm comm,
         eig_axes[2] = e_0.cross(e_1);
       }
 
-      // Include all collected points, including transverse offsets classified as planar.
+      // Enclose all collected points on the active upstream frame axes.
       EnclosePointCloud(eig_center, eig_axes, 0.0);
 
       // Make sure the longest dimension comes first.

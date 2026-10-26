@@ -4,8 +4,11 @@
 #include "regression_helpers.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -158,6 +161,98 @@ std::set<std::string> ExpectedMetadataFiles(int max_its)
     expected.insert("iteration" + std::to_string(i) + "/palace.json");
   }
   return expected;
+}
+
+// The fork's interface inventory has string columns, so validate its public contract
+// separately while leaving every upstream numerical CSV comparison intact.
+void CheckInterfaceDoF(const std::filesystem::path &path, const IoData &iodata)
+{
+  INFO("Interface DoF inventory: " << path);
+  std::ifstream input(path);
+  CHECK(input.is_open());
+  if (!input.is_open())
+  {
+    return;
+  }
+  std::string line;
+  std::getline(input, line);
+  CHECK(line == "idx,type,attributes,boundary_elements,h1_boundary_tdofs,nd_boundary_tdofs");
+
+  std::map<std::string, std::pair<std::string, std::string>> expected;
+  std::set<std::string> expected_indices;
+  for (const auto &[idx, data] : iodata.boundaries.postpro.dielectric)
+  {
+    std::string type;
+    switch (data.type)
+    {
+      case InterfaceDielectric::MA:
+        type = "MA";
+        break;
+      case InterfaceDielectric::MS:
+        type = "MS";
+        break;
+      case InterfaceDielectric::SA:
+        type = "SA";
+        break;
+      case InterfaceDielectric::DEFAULT:
+        type = "Default";
+        break;
+    }
+    std::ostringstream attributes;
+    for (std::size_t i = 0; i < data.attributes.size(); ++i)
+    {
+      if (i)
+      {
+        attributes << ';';
+      }
+      attributes << data.attributes[i];
+    }
+    const auto index = std::to_string(idx);
+    expected.emplace(index, std::make_pair(type, attributes.str()));
+    expected_indices.insert(index);
+  }
+
+  std::set<std::string> seen;
+  while (std::getline(input, line))
+  {
+    std::istringstream row(line);
+    std::vector<std::string> cells;
+    std::string cell;
+    while (std::getline(row, cell, ','))
+    {
+      cells.push_back(cell);
+    }
+    if (!line.empty() && line.back() == ',')
+    {
+      cells.emplace_back();
+    }
+    INFO("Inventory row: " << line);
+    CHECK(cells.size() == 6);
+    if (cells.size() != 6)
+    {
+      continue;
+    }
+    CHECK(seen.insert(cells[0]).second);
+    const auto entry = expected.find(cells[0]);
+    CHECK(entry != expected.end());
+    if (entry != expected.end())
+    {
+      CHECK(cells[1] == entry->second.first);
+      CHECK(cells[2] == entry->second.second);
+    }
+    for (std::size_t i = 3; i < cells.size(); ++i)
+    {
+      long long count = -1;
+      const auto result =
+          std::from_chars(cells[i].data(), cells[i].data() + cells[i].size(), count);
+      CHECK(result.ec == std::errc{});
+      CHECK(result.ptr == cells[i].data() + cells[i].size());
+      CHECK(count >= 0);
+      CHECK((!cells[i].empty() && cells[i].front() != '-'));
+    }
+  }
+  CHECK(input.eof());
+  CheckSetEqual("interface DoF indices", seen, expected_indices);
 }
 
 nlohmann::json LoadConfigJson(const std::filesystem::path &config_path)
@@ -505,6 +600,18 @@ void RunRegressionCase(std::string_view case_dir, std::string_view config_json,
     const std::set<std::string> skip_dirs{"paraview", "gridfunction"};
     FileListing got = ListRegressionFiles(postpro_path, skip_dirs);
     const FileListing want = ListRegressionFiles(ref_postpro, skip_dirs);
+
+    if (!iodata.boundaries.postpro.dielectric.empty())
+    {
+      for (const auto &metadata : ExpectedMetadataFiles(max_refinement_iterations))
+      {
+        const auto rel =
+            (std::filesystem::path(metadata).parent_path() / "interface-DoF.csv")
+                .generic_string();
+        CheckInterfaceDoF(postpro_path / rel, iodata);
+        got.csv_files.erase(rel);
+      }
+    }
 
     // Drop intentionally-unstored outputs (large files no check consumes) from the live
     // listing so their absence in the reference tree is not flagged as a missing file.
