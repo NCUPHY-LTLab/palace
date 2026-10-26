@@ -4,7 +4,10 @@
 #include "configfile.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
+#include <limits>
+#include <numbers>
 #include <sstream>
 #include <string_view>
 #include <fmt/format.h>
@@ -13,163 +16,50 @@
 #include <nlohmann/json.hpp>
 
 #include "units.hpp"
+#include "utils/constants.hpp"
+#include "utils/enum_string.hpp"
 
-// This is similar to NLOHMANN_JSON_SERIALIZE_ENUM, but results in an error if an enum
-// value corresponding to the string cannot be found. Also adds an overload for stream
-// printing enum values.
-#define PALACE_JSON_SERIALIZE_ENUM(ENUM_TYPE, ...)                                  \
-  template <typename BasicJsonType>                                                 \
-  inline void to_json(BasicJsonType &j, const ENUM_TYPE &e)                         \
-  {                                                                                 \
-    static_assert(std::is_enum<ENUM_TYPE>::value, #ENUM_TYPE " must be an enum!");  \
-    static const std::pair<ENUM_TYPE, BasicJsonType> m[] = __VA_ARGS__;             \
-    auto it = std::find_if(std::begin(m), std::end(m),                              \
-                           [e](const std::pair<ENUM_TYPE, BasicJsonType> &ej_pair)  \
-                           { return ej_pair.first == e; });                         \
-    MFEM_VERIFY(it != std::end(m),                                                  \
-                "Invalid value for " << #ENUM_TYPE " given when parsing to JSON!"); \
-    j = it->second;                                                                 \
-  }                                                                                 \
-  template <typename BasicJsonType>                                                 \
-  inline void from_json(const BasicJsonType &j, ENUM_TYPE &e)                       \
-  {                                                                                 \
-    static_assert(std::is_enum<ENUM_TYPE>::value, #ENUM_TYPE " must be an enum!");  \
-    static const std::pair<ENUM_TYPE, BasicJsonType> m[] = __VA_ARGS__;             \
-    auto it = std::find_if(std::begin(m), std::end(m),                              \
-                           [j](const std::pair<ENUM_TYPE, BasicJsonType> &ej_pair)  \
-                           { return ej_pair.second == j; });                        \
-    MFEM_VERIFY(it != std::end(m),                                                  \
-                "Invalid value (" << j << ") for "                                  \
-                                  << #ENUM_TYPE                                     \
-                    " given in the configuration file when parsing from JSON!");    \
-    e = it->first;                                                                  \
-  }                                                                                 \
-  std::ostream &operator<<(std::ostream &os, const ENUM_TYPE &e)                    \
-  {                                                                                 \
-    static const std::pair<ENUM_TYPE, const char *> m[] = __VA_ARGS__;              \
-    os << std::find_if(std::begin(m), std::end(m),                                  \
-                       [e](const std::pair<ENUM_TYPE, const char *> &ej_pair)       \
-                       { return ej_pair.first == e; })                              \
-              ->second;                                                             \
-    return os;                                                                      \
+// This is similar to NLOHMANN_JSON_SERIALIZE_ENUM, but delegates to the single
+// ToString/FromString mapping defined in enum_string.cpp (which also raises a descriptive
+// error if the value/string cannot be found), so the enum<->string table lives in exactly
+// one place.
+#define PALACE_JSON_SERIALIZE_ENUM(ENUM_TYPE)                 \
+  template <typename BasicJsonType>                           \
+  inline void to_json(BasicJsonType &j, const ENUM_TYPE &e)   \
+  {                                                           \
+    j = ToString(e);                                          \
+  }                                                           \
+  template <typename BasicJsonType>                           \
+  inline void from_json(const BasicJsonType &j, ENUM_TYPE &e) \
+  {                                                           \
+    FromString(j.template get<std::string>(), e);             \
   }
 
 using json = nlohmann::json;
 namespace palace
 {
-// Helpers for converting enums specified in labels.hpp. Must be done in palace scope rather
-// than palace::config scope to ensure argument-dependent-lookup succeeds in json.
-
-// Helper for converting string keys to enum for CoordinateSystem.
-PALACE_JSON_SERIALIZE_ENUM(CoordinateSystem,
-                           {{CoordinateSystem::CARTESIAN, "Cartesian"},
-                            {CoordinateSystem::CYLINDRICAL, "Cylindrical"}})
-
-// Helper for converting string keys to enum for ProblemType.
-PALACE_JSON_SERIALIZE_ENUM(ProblemType, {{ProblemType::DRIVEN, "Driven"},
-                                         {ProblemType::EIGENMODE, "Eigenmode"},
-                                         {ProblemType::ELECTROSTATIC, "Electrostatic"},
-                                         {ProblemType::MAGNETOSTATIC, "Magnetostatic"},
-                                         {ProblemType::TRANSIENT, "Transient"},
-                                         {ProblemType::BOUNDARYMODE, "BoundaryMode"}})
-
-// Helper for converting string keys to enum for EigenSolverBackend.
-PALACE_JSON_SERIALIZE_ENUM(EigenSolverBackend, {{EigenSolverBackend::DEFAULT, "Default"},
-                                                {EigenSolverBackend::SLEPC, "SLEPc"},
-                                                {EigenSolverBackend::ARPACK, "ARPACK"}})
-
-// Helper for converting string keys to enum for EigenSolverBackend.
-PALACE_JSON_SERIALIZE_ENUM(NonlinearEigenSolver, {{NonlinearEigenSolver::HYBRID, "Hybrid"},
-                                                  {NonlinearEigenSolver::SLP, "SLP"}})
-
-// Helper for converting string keys to enum for SurfaceFlux.
-PALACE_JSON_SERIALIZE_ENUM(SurfaceFlux, {{SurfaceFlux::ELECTRIC, "Electric"},
-                                         {SurfaceFlux::MAGNETIC, "Magnetic"},
-                                         {SurfaceFlux::POWER, "Power"}})
-
-// Helper for converting string keys to enum for InterfaceDielectric.
-PALACE_JSON_SERIALIZE_ENUM(InterfaceDielectric, {{InterfaceDielectric::DEFAULT, "Default"},
-                                                 {InterfaceDielectric::MA, "MA"},
-                                                 {InterfaceDielectric::MS, "MS"},
-                                                 {InterfaceDielectric::SA, "SA"}})
-
-// Helper for converting string keys to enum for FrequencySampling.
-PALACE_JSON_SERIALIZE_ENUM(FrequencySampling, {{FrequencySampling::DEFAULT, "Default"},
-                                               {FrequencySampling::LINEAR, "Linear"},
-                                               {FrequencySampling::LOG, "Log"},
-                                               {FrequencySampling::POINT, "Point"}})
-
-// Helper for converting string keys to enum for TimeSteppingScheme and Excitation.
-PALACE_JSON_SERIALIZE_ENUM(TimeSteppingScheme,
-                           {{TimeSteppingScheme::DEFAULT, "Default"},
-                            {TimeSteppingScheme::GEN_ALPHA, "GeneralizedAlpha"},
-                            {TimeSteppingScheme::RUNGE_KUTTA, "RungeKutta"},
-                            {TimeSteppingScheme::CVODE, "CVODE"},
-                            {TimeSteppingScheme::ARKODE, "ARKODE"}})
-PALACE_JSON_SERIALIZE_ENUM(Excitation,
-                           {{Excitation::SINUSOIDAL, "Sinusoidal"},
-                            {Excitation::GAUSSIAN, "Gaussian"},
-                            {Excitation::DIFF_GAUSSIAN, "DifferentiatedGaussian"},
-                            {Excitation::MOD_GAUSSIAN, "ModulatedGaussian"},
-                            {Excitation::RAMP_STEP, "Ramp"},
-                            {Excitation::SMOOTH_STEP, "SmoothStep"}})
-
-// Helper for converting string keys to enum for LinearSolver, KrylovSolver, and
-// MultigridCoarsening
-PALACE_JSON_SERIALIZE_ENUM(LinearSolver, {{LinearSolver::DEFAULT, "Default"},
-                                          {LinearSolver::AMS, "AMS"},
-                                          {LinearSolver::BOOMER_AMG, "BoomerAMG"},
-                                          {LinearSolver::MUMPS, "MUMPS"},
-                                          {LinearSolver::SUPERLU, "SuperLU"},
-                                          {LinearSolver::STRUMPACK, "STRUMPACK"},
-                                          {LinearSolver::STRUMPACK_MP, "STRUMPACK-MP"},
-                                          {LinearSolver::JACOBI, "Jacobi"}})
-PALACE_JSON_SERIALIZE_ENUM(KrylovSolver, {{KrylovSolver::DEFAULT, "Default"},
-                                          {KrylovSolver::CG, "CG"},
-                                          {KrylovSolver::MINRES, "MINRES"},
-                                          {KrylovSolver::GMRES, "GMRES"},
-                                          {KrylovSolver::FGMRES, "FGMRES"},
-                                          {KrylovSolver::BICGSTAB, "BiCGSTAB"}})
-PALACE_JSON_SERIALIZE_ENUM(MultigridCoarsening,
-                           {{MultigridCoarsening::LINEAR, "Linear"},
-                            {MultigridCoarsening::LOGARITHMIC, "Logarithmic"}})
-
-// Helpers for converting string keys to enum for PreconditionerSide, SymbolicFactorization,
-// SparseCompression, and Orthogonalization.
-PALACE_JSON_SERIALIZE_ENUM(PreconditionerSide, {{PreconditionerSide::DEFAULT, "Default"},
-                                                {PreconditionerSide::RIGHT, "Right"},
-                                                {PreconditionerSide::LEFT, "Left"}})
-PALACE_JSON_SERIALIZE_ENUM(SymbolicFactorization,
-                           {{SymbolicFactorization::DEFAULT, "Default"},
-                            {SymbolicFactorization::METIS, "METIS"},
-                            {SymbolicFactorization::PARMETIS, "ParMETIS"},
-                            {SymbolicFactorization::SCOTCH, "Scotch"},
-                            {SymbolicFactorization::PTSCOTCH, "PTScotch"},
-                            {SymbolicFactorization::PORD, "PORD"},
-                            {SymbolicFactorization::AMD, "AMD"},
-                            {SymbolicFactorization::RCM, "RCM"}})
-PALACE_JSON_SERIALIZE_ENUM(SparseCompression,
-                           {{SparseCompression::NONE, "None"},
-                            {SparseCompression::BLR, "BLR"},
-                            {SparseCompression::HSS, "HSS"},
-                            {SparseCompression::HODLR, "HODLR"},
-                            {SparseCompression::ZFP, "ZFP"},
-                            {SparseCompression::BLR_HODLR, "BLR-HODLR"},
-                            {SparseCompression::ZFP_BLR_HODLR, "ZFP-BLR-HODLR"}})
-PALACE_JSON_SERIALIZE_ENUM(Orthogonalization, {{Orthogonalization::MGS, "MGS"},
-                                               {Orthogonalization::CGS, "CGS"},
-                                               {Orthogonalization::CGS2, "CGS2"}})
-
-PALACE_JSON_SERIALIZE_ENUM(DomainOrthogonalizationWeight,
-                           {{DomainOrthogonalizationWeight::ENERGY, "Energy"},
-                            {DomainOrthogonalizationWeight::FE_BASIS_IDENTITY,
-                             "FEBasisIdentity"},
-                            {DomainOrthogonalizationWeight::SPACE_OVERLAP, "SpaceOverlap"}})
-
-// Helpers for converting string keys to enum for Device.
-PALACE_JSON_SERIALIZE_ENUM(Device, {{Device::CPU, "CPU"},
-                                    {Device::GPU, "GPU"},
-                                    {Device::DEBUG, "Debug"}})
+// to_json/from_json shims for the labels.hpp enums. These must live in palace scope (not
+// palace::config) so argument-dependent lookup succeeds in nlohmann::json, and they
+// delegate to the single ToString/FromString mapping in enum_string.cpp.
+PALACE_JSON_SERIALIZE_ENUM(CoordinateSystem)
+PALACE_JSON_SERIALIZE_ENUM(ProblemType)
+PALACE_JSON_SERIALIZE_ENUM(EigenSolverBackend)
+PALACE_JSON_SERIALIZE_ENUM(NonlinearEigenSolver)
+PALACE_JSON_SERIALIZE_ENUM(SurfaceFlux)
+PALACE_JSON_SERIALIZE_ENUM(InterfaceDielectric)
+PALACE_JSON_SERIALIZE_ENUM(FrequencySampling)
+PALACE_JSON_SERIALIZE_ENUM(TimeSteppingScheme)
+PALACE_JSON_SERIALIZE_ENUM(Excitation)
+PALACE_JSON_SERIALIZE_ENUM(LinearSolver)
+PALACE_JSON_SERIALIZE_ENUM(KrylovSolver)
+PALACE_JSON_SERIALIZE_ENUM(MultigridCoarsening)
+PALACE_JSON_SERIALIZE_ENUM(PreconditionerSide)
+PALACE_JSON_SERIALIZE_ENUM(SymbolicFactorization)
+PALACE_JSON_SERIALIZE_ENUM(SparseCompression)
+PALACE_JSON_SERIALIZE_ENUM(Orthogonalization)
+PALACE_JSON_SERIALIZE_ENUM(DomainOrthogonalizationWeight)
+PALACE_JSON_SERIALIZE_ENUM(Device)
+PALACE_JSON_SERIALIZE_ENUM(InactivePortMode)
 }  // namespace palace
 
 namespace palace::config
@@ -177,6 +67,13 @@ namespace palace::config
 
 namespace
 {
+
+// Standardize the subspace default on SLEPc's max(2*nev, nev+15) (resolved at parse time);
+// previously ARPACK and SLEPc resolved an unset MaxSize differently.
+inline int DefaultEigenSubspaceSize(int num_modes)
+{
+  return std::max(2 * num_modes, num_modes + 15);
+}
 
 int AtIndex(json::const_iterator port_it, std::string_view errmsg_parent)
 {
@@ -208,7 +105,7 @@ void ParseSymmetricMatrixData(const json &mat, const std::string &name,
 void ParseElementData(const json &elem, bool required, internal::ElementData &data)
 {
   data.attributes = elem.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(data.attributes.begin(), data.attributes.end());
+  std::ranges::sort(data.attributes);
   auto it = elem.find("Direction");
   if (it != elem.end() && it->is_array())
   {
@@ -218,10 +115,19 @@ void ParseElementData(const json &elem, bool required, internal::ElementData &da
   else
   {
     // String direction - CoordinateSystem is implicit in the string value.
-    MFEM_VERIFY(elem.find("CoordinateSystem") == elem.end(),
+    MFEM_VERIFY(!elem.contains("CoordinateSystem"),
                 "Cannot specify \"CoordinateSystem\" with string \"Direction\"!");
     std::tie(data.direction, data.coordinate_system) =
         ParseStringAsDirection(elem.value("Direction", ""), required);
+  }
+}
+
+void ParseSurfaceCurrentElementData(const json &elem, SurfaceCurrentElementData &data)
+{
+  ParseElementData(elem, true, data);
+  if (auto aperture = elem.find("Aperture"); aperture != elem.end())
+  {
+    data.aperture.emplace(*aperture);
   }
 }
 
@@ -381,7 +287,7 @@ ModelData::ModelData(const json &model)
 MaterialData::MaterialData(const json &domain)
 {
   attributes = domain.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   ParseSymmetricMatrixData(domain, "Permeability", mu_r);
   ParseSymmetricMatrixData(domain, "Permittivity", epsilon_r);
   ParseSymmetricMatrixData(domain, "LossTan", tandelta);
@@ -392,7 +298,7 @@ MaterialData::MaterialData(const json &domain)
 DomainEnergyData::DomainEnergyData(const json &domain)
 {
   attributes = domain.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
 }
 
 ProbeData::ProbeData(const json &probe)
@@ -410,8 +316,8 @@ DomainPostData::DomainPostData(const json &postpro)
   {
     attributes.insert(attributes.end(), data.attributes.begin(), data.attributes.end());
   }
-  std::sort(attributes.begin(), attributes.end());
-  attributes.erase(std::unique(attributes.begin(), attributes.end()), attributes.end());
+  std::ranges::sort(attributes);
+  attributes.erase(std::ranges::unique(attributes).begin(), attributes.end());
   attributes.shrink_to_fit();
 }
 
@@ -452,47 +358,48 @@ DomainData::DomainData(const json &domains)
   {
     attributes.insert(attributes.end(), data.attributes.begin(), data.attributes.end());
   }
-  std::sort(attributes.begin(), attributes.end());
-  attributes.erase(std::unique(attributes.begin(), attributes.end()), attributes.end());
+  std::ranges::sort(attributes);
+  attributes.erase(std::ranges::unique(attributes).begin(), attributes.end());
   attributes.shrink_to_fit();
   for (const auto &attr : postpro.attributes)
   {
-    MFEM_VERIFY(std::lower_bound(attributes.begin(), attributes.end(), attr) !=
-                    attributes.end(),
-                "Domain postprocessing can only be enabled on domains which have a "
-                "corresponding \"Materials\" entry!");
+    MFEM_VERIFY(
+        std::ranges::binary_search(attributes, attr),
+        fmt::format("Domain postprocessing attribute {:d} has no corresponding entry in "
+                    "config[\"Domains\"][\"Materials\"]!",
+                    attr));
   }
 }
 
 PecBoundaryData::PecBoundaryData(const json &pec)
 {
   attributes = pec.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
 }
 
 PmcBoundaryData::PmcBoundaryData(const json &pmc)
 {
   attributes = pmc.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
 }
 
 WavePortPecBoundaryData::WavePortPecBoundaryData(const json &auxpec)
 {
   attributes = auxpec.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
 }
 
 FarfieldBoundaryData::FarfieldBoundaryData(const json &absorbing)
 {
   attributes = absorbing.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   order = absorbing.value("Order", order);
 }
 
 ConductivityData::ConductivityData(const json &boundary)
 {
   attributes = boundary.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   sigma = boundary.at("Conductivity");  // Required
   mu_r = boundary.value("Permeability", mu_r);
   h = boundary.value("Thickness", h);
@@ -502,7 +409,7 @@ ConductivityData::ConductivityData(const json &boundary)
 ImpedanceData::ImpedanceData(const json &boundary)
 {
   attributes = boundary.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   Rs = boundary.value("Rs", Rs);
   Ls = boundary.value("Ls", Ls);
   Cs = boundary.value("Cs", Cs);
@@ -536,6 +443,50 @@ int ParsePortExcitation(const json &port, int index)
   }
 }
 
+RationalImpedanceData::RationalImpedanceData(const json &boundary)
+{
+  attributes = boundary.at("Attributes").get<std::vector<int>>();  // Required
+  std::ranges::sort(attributes);
+  num = boundary.at("Numerator").get<std::vector<double>>();    // Required
+  den = boundary.at("Denominator").get<std::vector<double>>();  // Required
+  MFEM_VERIFY(!num.empty() && !den.empty(),
+              "Rational impedance \"Numerator\" and \"Denominator\" must be nonempty!");
+  MFEM_VERIFY(std::ranges::any_of(den, [](double c) { return c != 0.0; }),
+              "Rational impedance \"Denominator\" must have a nonzero coefficient!");
+  MFEM_VERIFY(std::ranges::any_of(num, [](double c) { return c != 0.0; }),
+              "Rational impedance \"Numerator\" must have a nonzero coefficient!");
+}
+
+SuperconductorData::SuperconductorData(const json &boundary)
+{
+  attributes = boundary.at("Attributes").get<std::vector<int>>();  // Required
+  std::ranges::sort(attributes);
+  lambda_L = boundary.value("PenetrationDepth", lambda_L);
+  thickness = boundary.value("Thickness", thickness);
+  Ls = boundary.value("KineticInductance", Ls);
+
+  // Require exactly one of {(PenetrationDepth, Thickness), KineticInductance}. The (λ, d)
+  // form defines the kinetic sheet inductance as L_ksq = mu0 * lambda * coth(d/lambda); the
+  // direct form supplies L_ksq itself.
+  const bool has_lambda_d = (lambda_L != 0.0 || thickness != 0.0);
+  const bool has_Ls = (Ls != 0.0);
+  MFEM_VERIFY(has_lambda_d != has_Ls,
+              "Superconductor boundary requires exactly one of {(\"PenetrationDepth\", "
+              "\"Thickness\"), \"KineticInductance\"}!");
+  if (has_lambda_d)
+  {
+    MFEM_VERIFY(
+        lambda_L > 0.0 && thickness > 0.0,
+        "Superconductor boundary \"PenetrationDepth\" and \"Thickness\" must both be "
+        "positive!");
+  }
+  else
+  {
+    MFEM_VERIFY(Ls > 0.0,
+                "Superconductor boundary \"KineticInductance\" must be positive!");
+  }
+}
+
 LumpedPortData::LumpedPortData(const json &port)
 {
   int index = port.at("Index");  // Required
@@ -548,7 +499,13 @@ LumpedPortData::LumpedPortData(const json &port)
 
   excitation = ParsePortExcitation(port, index);
   active = port.value("Active", active);
-  if (port.find("Attributes") != port.end())
+  include_in_synthesis = port.value("IncludeInSynthesis", include_in_synthesis);
+  MFEM_VERIFY(!(excitation != 0 && !include_in_synthesis),
+              fmt::format("\"IncludeInSynthesis\" cannot be false on lumped port index "
+                          "{:d} because it is excited; the excitation vector is always "
+                          "added to the synthesis basis.",
+                          index));
+  if (port.contains("Attributes"))
   {
     auto &elem = elements.emplace_back();
     ParseElementData(port, true, elem);
@@ -566,7 +523,7 @@ LumpedPortData::LumpedPortData(const json &port)
 TerminalData::TerminalData(const json &terminal)
 {
   attributes = terminal.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
 }
 
 PeriodicBoundaryData::PeriodicBoundaryData(const json &periodic)
@@ -577,15 +534,21 @@ PeriodicBoundaryData::PeriodicBoundaryData(const json &periodic)
     wave_vector = floquet->get<std::array<double, 3>>();
   }
 
+  auto fref = periodic.find("FloquetReferenceFrequency");
+  if (fref != periodic.end())
+  {
+    floquet_reference_freq = fref->get<double>();
+  }
+
   const auto &pairs = periodic.at("BoundaryPairs");
-  for (auto it = pairs.begin(); it != pairs.end(); ++it)
+  for (const auto &pair : pairs)
   {
     PeriodicData &data = boundary_pairs.emplace_back();
-    data.donor_attributes = it->at("DonorAttributes").get<std::vector<int>>();  // Required
+    data.donor_attributes = pair.at("DonorAttributes").get<std::vector<int>>();  // Required
     data.receiver_attributes =
-        it->at("ReceiverAttributes").get<std::vector<int>>();  // Required
-    auto translation = it->find("Translation");
-    if (translation != it->end())
+        pair.at("ReceiverAttributes").get<std::vector<int>>();  // Required
+    auto translation = pair.find("Translation");
+    if (translation != pair.end())
     {
       std::array<double, 3> translation_array = translation->get<std::array<double, 3>>();
       for (int i = 0; i < 3; i++)
@@ -595,8 +558,8 @@ PeriodicBoundaryData::PeriodicBoundaryData(const json &periodic)
       }
       data.affine_transform[3 * 4 + 3] = 1.0;
     }
-    auto transformation = it->find("AffineTransformation");
-    if (transformation != it->end())
+    auto transformation = pair.find("AffineTransformation");
+    if (transformation != pair.end())
     {
       data.affine_transform = transformation->get<std::array<double, 16>>();
     }
@@ -607,14 +570,25 @@ WavePortData::WavePortData(const json &port)
 {
   int index = port.at("Index");                                // Required
   attributes = port.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   mode_idx = port.value("Mode", mode_idx);
   d_offset = port.value("Offset", d_offset);
+  target = port.value("Target", target);
   eigen_solver = port.value("SolverType", eigen_solver);
   excitation = ParsePortExcitation(port, index);
   active = port.value("Active", active);
+  include_in_synthesis = port.value("IncludeInSynthesis", include_in_synthesis);
+  MFEM_VERIFY(!(excitation != 0 && !include_in_synthesis),
+              fmt::format("\"IncludeInSynthesis\" cannot be false on wave port index "
+                          "{:d} because it is excited; the excitation vector is always "
+                          "added to the synthesis basis.",
+                          index));
   ksp_max_its = port.value("MaxIts", ksp_max_its);
   ksp_tol = port.value("KSPTol", ksp_tol);
+  if (auto it = port.find("ComplexCoarseSolve"); it != port.end())
+  {
+    complex_coarse_solve = it->get<bool>();
+  }
   eig_tol = port.value("EigenTol", eig_tol);
   max_size = port.value("MaxSize", max_size);
   verbose = port.value("Verbose", verbose);
@@ -626,29 +600,94 @@ WavePortData::WavePortData(const json &port)
     }
   }
   n_samples = port.value("NSamples", n_samples);
+  if (auto it = port.find("PolarityAttributes"); it != port.end())
+  {
+    auto pa = it->get<std::vector<int>>();
+    MFEM_VERIFY(pa.size() == 2,
+                "WavePort \"PolarityAttributes\" must be exactly two attributes "
+                "[high, low] (signal terminal first, ground terminal second)!");
+    MFEM_VERIFY(voltage_path.empty(),
+                "WavePort \"VoltagePath\" and \"PolarityAttributes\" are mutually "
+                "exclusive — \"VoltagePath\" already pins polarity!");
+    polarity_attributes = {pa[0], pa[1]};
+  }
+
+  // Resolve subspace sentinel: fed directly into ModeEigenSolver → SLEPc/ARPACK.
+  if (max_size <= 0)
+  {
+    max_size = DefaultEigenSubspaceSize(mode_idx);
+  }
+}
+
+FloquetPortData::FloquetPortData(const json &port)
+{
+  int index = port.at("Index");                                // Required
+  attributes = port.at("Attributes").get<std::vector<int>>();  // Required
+  std::ranges::sort(attributes);
+  excitation = ParsePortExcitation(port, index);
+  inc_polarization = port.value("IncidentPolarization", inc_polarization);
+  max_order = port.value("MaxOrder", max_order);
+}
+
+SurfaceCurrentApertureData::SurfaceCurrentApertureData(const json &aperture)
+{
+  attributes = aperture.at("Attributes").get<std::vector<int>>();  // Required
+  std::ranges::sort(attributes);
+
+  const auto &input_direction = aperture.at("Direction");  // Required
+  if (input_direction.is_array())
+  {
+    direction = input_direction.get<std::array<double, 3>>();
+  }
+  else
+  {
+    CoordinateSystem coordinate_system;
+    std::tie(direction, coordinate_system) =
+        ParseStringAsDirection(input_direction.get<std::string>(), true);
+    MFEM_VERIFY(coordinate_system == CoordinateSystem::CARTESIAN,
+                "SurfaceCurrent Aperture \"Direction\" must be Cartesian!");
+  }
+
+  double norm2 = 0.0;
+  for (double x : direction)
+  {
+    MFEM_VERIFY(std::isfinite(x),
+                "SurfaceCurrent Aperture \"Direction\" must contain finite values!");
+    norm2 += x * x;
+  }
+  MFEM_VERIFY(norm2 > 0.0, "SurfaceCurrent Aperture \"Direction\" must be nonzero!");
+  const double inv_norm = 1.0 / std::sqrt(norm2);
+  for (double &x : direction)
+  {
+    x *= inv_norm;
+  }
 }
 
 SurfaceCurrentData::SurfaceCurrentData(const json &source)
 {
-  if (source.find("Attributes") != source.end())
+  if (source.contains("Attributes"))
   {
     auto &elem = elements.emplace_back();
-    ParseElementData(source, true, elem);
+    ParseSurfaceCurrentElementData(source, elem);
   }
   else
   {
     for (const auto &e : source.at("Elements"))
     {
       auto &elem = elements.emplace_back();
-      ParseElementData(e, true, elem);
+      ParseSurfaceCurrentElementData(e, elem);
     }
+  }
+  if (source.contains("InactiveMode"))
+  {
+    inactive_port_mode = source.at("InactiveMode").get<InactivePortMode>();
   }
 }
 
 SurfaceFluxData::SurfaceFluxData(const json &flux)
 {
   attributes = flux.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   type = flux.at("Type");  // Required
   two_sided = flux.value("TwoSided", two_sided);
   auto ctr = flux.find("Center");
@@ -662,7 +701,7 @@ SurfaceFluxData::SurfaceFluxData(const json &flux)
 InterfaceDielectricData::InterfaceDielectricData(const json &dielectric)
 {
   attributes = dielectric.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
   type = dielectric.value("Type", type);
   t = dielectric.at("Thickness");             // Required
   epsilon_r = dielectric.at("Permittivity");  // Required
@@ -684,12 +723,12 @@ ModeImpedanceData::ModeImpedanceData(const json &imp)
   if (auto it = imp.find("VoltageAttributes"); it != imp.end())
   {
     voltage_attributes = it->get<std::vector<int>>();
-    std::sort(voltage_attributes.begin(), voltage_attributes.end());
+    std::ranges::sort(voltage_attributes);
   }
   if (auto it = imp.find("CurrentAttributes"); it != imp.end())
   {
     current_attributes = it->get<std::vector<int>>();
-    std::sort(current_attributes.begin(), current_attributes.end());
+    std::ranges::sort(current_attributes);
   }
   if (auto it = imp.find("VoltagePath"); it != imp.end())
   {
@@ -722,7 +761,7 @@ ModeVoltageData::ModeVoltageData(const json &volt)
   if (auto it = volt.find("VoltageAttributes"); it != volt.end())
   {
     voltage_attributes = it->get<std::vector<int>>();
-    std::sort(voltage_attributes.begin(), voltage_attributes.end());
+    std::ranges::sort(voltage_attributes);
   }
   if (auto it = volt.find("VoltagePath"); it != volt.end())
   {
@@ -743,7 +782,7 @@ ModeVoltageData::ModeVoltageData(const json &volt)
 FarFieldPostData::FarFieldPostData(const json &farfield)
 {
   attributes = farfield.at("Attributes").get<std::vector<int>>();  // Required
-  std::sort(attributes.begin(), attributes.end());
+  std::ranges::sort(attributes);
 
   // Generate NSample points with the following properties:
   // - If NSample >= 2, the generated points are precisely NSample, otherwise NSample = 2.
@@ -760,8 +799,8 @@ FarFieldPostData::FarFieldPostData(const json &farfield)
     if (nsample > 0)
     {
       // Always include poles.
-      thetaphis.emplace_back(0.0, 0.0);   // North pole.
-      thetaphis.emplace_back(M_PI, 0.0);  // South pole.
+      thetaphis.emplace_back(0.0, 0.0);               // North pole.
+      thetaphis.emplace_back(std::numbers::pi, 0.0);  // South pole.
 
       if (nsample > 2)
       {
@@ -800,12 +839,13 @@ FarFieldPostData::FarFieldPostData(const json &farfield)
         {
           // Ensure equator and XZ plane inclusion.
           bool is_equator = (i == (n_theta + 1) / 2);
-          double theta = is_equator ? M_PI / 2 : std::acos(1.0 - 2.0 * i / (n_theta + 1.0));
+          double theta = is_equator ? std::numbers::pi / 2
+                                    : std::acos(1.0 - 2.0 * i / (n_theta + 1.0));
           int points_in_level = points_per_level[i - 1];
 
           for (int j = 0; j < points_in_level; ++j)
           {
-            double phi = 2.0 * M_PI * j / points_in_level;
+            double phi = 2.0 * std::numbers::pi * j / points_in_level;
 
             // Force XZ plane points (phi = 0 or π).
             if (j == 0)
@@ -814,7 +854,7 @@ FarFieldPostData::FarFieldPostData(const json &farfield)
             }
             else if (j == points_in_level / 2)
             {
-              phi = M_PI;
+              phi = std::numbers::pi;
             }
 
             thetaphis.emplace_back(theta, phi);
@@ -839,41 +879,45 @@ FarFieldPostData::FarFieldPostData(const json &farfield)
     auto vec_of_vec = thetaphis_json->get<std::vector<std::vector<double>>>();
     for (const auto &vec : vec_of_vec)
     {
-      thetaphis.emplace_back(vec[0] * M_PI / 180, vec[1] * M_PI / 180);
+      thetaphis.emplace_back(vec[0] * std::numbers::pi / 180,
+                             vec[1] * std::numbers::pi / 180);
     }
   }
 
   // Remove duplicate entries with numerical tolerance.
   constexpr double tol = 1e-6;
-  std::sort(thetaphis.begin(), thetaphis.end());
-  auto it = std::unique(thetaphis.begin(), thetaphis.end(),
-                        [tol](const auto &a, const auto &b)
-                        {
-                          // At poles (theta ≈ 0 or π), phi is irrelevant.
-                          if ((std::abs(a.first) < tol || std::abs(a.first - M_PI) < tol) &&
-                              (std::abs(b.first) < tol || std::abs(b.first - M_PI) < tol))
-                          {
-                            return std::abs(a.first - b.first) < tol;
-                          }
+  std::ranges::sort(thetaphis);
+  auto it =
+      std::ranges::unique(
+          thetaphis,
+          [tol](const auto &a, const auto &b)
+          {
+            // At poles (theta ≈ 0 or π), phi is irrelevant.
+            if ((std::abs(a.first) < tol || std::abs(a.first - std::numbers::pi) < tol) &&
+                (std::abs(b.first) < tol || std::abs(b.first - std::numbers::pi) < tol))
+            {
+              return std::abs(a.first - b.first) < tol;
+            }
 
-                          // Check direct match.
-                          if (std::abs(a.first - b.first) < tol)
-                          {
-                            double phi_diff = std::abs(a.second - b.second);
-                            return phi_diff < tol || std::abs(phi_diff - 2.0 * M_PI) < tol;
-                          }
+            // Check direct match.
+            if (std::abs(a.first - b.first) < tol)
+            {
+              double phi_diff = std::abs(a.second - b.second);
+              return phi_diff < tol || std::abs(phi_diff - 2.0 * std::numbers::pi) < tol;
+            }
 
-                          // Check theta periodicity: (θ, φ) ≡ (π-θ, φ+π).
-                          if (std::abs(a.first - (M_PI - b.first)) < tol)
-                          {
-                            double phi_diff = std::abs(a.second - (b.second + M_PI));
-                            if (phi_diff > M_PI)
-                              phi_diff = 2.0 * M_PI - phi_diff;
-                            return phi_diff < tol;
-                          }
+            // Check theta periodicity: (θ, φ) ≡ (π-θ, φ+π).
+            if (std::abs(a.first - (std::numbers::pi - b.first)) < tol)
+            {
+              double phi_diff = std::abs(a.second - (b.second + std::numbers::pi));
+              if (phi_diff > std::numbers::pi)
+                phi_diff = 2.0 * std::numbers::pi - phi_diff;
+              return phi_diff < tol;
+            }
 
-                          return false;
-                        });
+            return false;
+          })
+          .begin();
   thetaphis.erase(it, thetaphis.end());
 
   if (thetaphis.empty())
@@ -881,6 +925,43 @@ FarFieldPostData::FarFieldPostData(const json &farfield)
     MFEM_WARNING("No target points specified under farfield \"FarField\"!\n");
   }
 }
+FluxLoopData::FluxLoopData(const json &fluxloop)
+{
+  MFEM_VERIFY(fluxloop.contains("FilmAttributes"),
+              "Missing \"FilmAttributes\" for \"FluxLoop\" boundary!");
+  film_attributes = fluxloop.at("FilmAttributes").get<std::vector<int>>();
+  std::ranges::sort(film_attributes);
+
+  MFEM_VERIFY(fluxloop.contains("HoleAttributes"),
+              "Missing \"HoleAttributes\" for \"FluxLoop\" boundary!");
+  hole_attributes = fluxloop.at("HoleAttributes").get<std::vector<int>>();
+
+  MFEM_VERIFY(fluxloop.contains("FluxAmounts"),
+              "Missing \"FluxAmounts\" for \"FluxLoop\" boundary!");
+  flux_amounts = fluxloop.at("FluxAmounts").get<std::vector<double>>();
+
+  MFEM_VERIFY(hole_attributes.size() == flux_amounts.size(),
+              "\"HoleAttributes\" and \"FluxAmounts\" arrays must have the same size!");
+
+  pec_lperp = fluxloop.value("PecPenetrationDepth", pec_lperp);
+  MFEM_VERIFY(pec_lperp > 0.0,
+              "\"PecPenetrationDepth\" for \"FluxLoop\" boundary must be positive!");
+
+  auto direction_it = fluxloop.find("Direction");
+  if (direction_it != fluxloop.end())
+  {
+    if (direction_it->is_array())
+    {
+      direction = direction_it->get<std::array<double, 3>>();
+    }
+    else
+    {
+      auto [dir, coord] = ParseStringAsDirection(direction_it->get<std::string>());
+      direction = dir;
+    }
+  }
+}
+
 BoundaryPostData::BoundaryPostData(const json &postpro)
 {
   flux =
@@ -917,8 +998,8 @@ BoundaryPostData::BoundaryPostData(const json &postpro)
   attributes.insert(attributes.end(), farfield.attributes.begin(),
                     farfield.attributes.end());
 
-  std::sort(attributes.begin(), attributes.end());
-  attributes.erase(std::unique(attributes.begin(), attributes.end()), attributes.end());
+  std::ranges::sort(attributes);
+  attributes.erase(std::ranges::unique(attributes).begin(), attributes.end());
   attributes.shrink_to_fit();
 }
 
@@ -952,12 +1033,18 @@ BoundaryData::BoundaryData(const json &boundaries)
   farfield = ParseOptional<FarfieldBoundaryData>(boundaries, "Absorbing");
   conductivity = ParseOptionalVector<ConductivityData>(boundaries, "Conductivity");
   impedance = ParseOptionalVector<ImpedanceData>(boundaries, "Impedance");
+  rational_impedance =
+      ParseOptionalVector<RationalImpedanceData>(boundaries, "RationalImpedance");
+  superconductor = ParseOptionalVector<SuperconductorData>(boundaries, "Superconductor");
   lumpedport = ParseOptionalMap<LumpedPortData>(boundaries, "LumpedPort", "\"LumpedPort\"");
   terminal = ParseOptionalMap<TerminalData>(boundaries, "Terminal", "\"Terminal\"");
   periodic = ParseOptional<PeriodicBoundaryData>(boundaries, "Periodic");
   waveport = ParseOptionalMap<WavePortData>(boundaries, "WavePort", "\"WavePort\"");
+  floquetport =
+      ParseOptionalMap<FloquetPortData>(boundaries, "FloquetPort", "\"FloquetPort\"");
   current = ParseOptionalMap<SurfaceCurrentData>(boundaries, "SurfaceCurrent",
                                                  "\"SurfaceCurrent\"");
+  fluxloop = ParseOptionalMap<FluxLoopData>(boundaries, "FluxLoop", "\"FluxLoop\"");
   postpro = ParseOptional<BoundaryPostData>(boundaries, "Postprocessing");
 
   // Normalize excitation indices: upgrade excitation=1 to excitation=port_idx when
@@ -972,17 +1059,21 @@ BoundaryData::BoundaryData(const json &boundaries)
     {
       excitation_map[data.excitation].emplace_back(idx);
     }
+    for (const auto &[idx, data] : floquetport)
+    {
+      excitation_map[data.excitation].emplace_back(idx);
+    }
     excitation_map.erase(0);  // zeroth index is unexcited.
-    bool calc_s_params = std::all_of(excitation_map.begin(), excitation_map.end(),
-                                     [](const auto &x) { return x.second.size() == 1; });
+    bool calc_s_params = std::ranges::all_of(excitation_map, [](const auto &x)
+                                             { return x.second.size() == 1; });
     if (calc_s_params && !excitation_map.empty())
     {
       // Only normalize if excitation indices are valid (match port indices or are 1).
       const auto &ext1 = *excitation_map.begin();
       bool valid = (excitation_map.size() == 1 &&
                     (ext1.first == 1 || ext1.second[0] == ext1.first)) ||
-                   std::all_of(excitation_map.begin(), excitation_map.end(),
-                               [](const auto &x) { return x.first == x.second[0]; });
+                   std::ranges::all_of(excitation_map, [](const auto &x)
+                                       { return x.first == x.second[0]; });
       if (valid)
       {
         for (auto &[port_idx, lp] : lumpedport)
@@ -997,6 +1088,13 @@ BoundaryData::BoundaryData(const json &boundaries)
           if (wp.excitation == 1)
           {
             wp.excitation = port_idx;
+          }
+        }
+        for (auto &[port_idx, fp] : floquetport)
+        {
+          if (fp.excitation == 1)
+          {
+            fp.excitation = port_idx;
           }
         }
       }
@@ -1017,6 +1115,10 @@ BoundaryData::BoundaryData(const json &boundaries)
   {
     attributes.insert(attributes.end(), data.attributes.begin(), data.attributes.end());
   }
+  for (const auto &data : rational_impedance)
+  {
+    attributes.insert(attributes.end(), data.attributes.begin(), data.attributes.end());
+  }
   for (const auto &[idx, data] : lumpedport)
   {
     for (const auto &elem : data.elements)
@@ -1028,6 +1130,10 @@ BoundaryData::BoundaryData(const json &boundaries)
   {
     attributes.insert(attributes.end(), data.attributes.begin(), data.attributes.end());
   }
+  for (const auto &[idx, data] : floquetport)
+  {
+    attributes.insert(attributes.end(), data.attributes.begin(), data.attributes.end());
+  }
   for (const auto &[idx, data] : current)
   {
     for (const auto &elem : data.elements)
@@ -1035,8 +1141,8 @@ BoundaryData::BoundaryData(const json &boundaries)
       attributes.insert(attributes.end(), elem.attributes.begin(), elem.attributes.end());
     }
   }
-  std::sort(attributes.begin(), attributes.end());
-  attributes.erase(std::unique(attributes.begin(), attributes.end()), attributes.end());
+  std::ranges::sort(attributes);
+  attributes.erase(std::ranges::unique(attributes).begin(), attributes.end());
   attributes.shrink_to_fit();
 }
 
@@ -1045,20 +1151,26 @@ std::vector<double> ConstructLinearRange(double start, double end, double delta)
   auto n_step = GetNumSteps(start, end, delta);
   std::vector<double> f(n_step);
   std::iota(f.begin(), f.end(), 0);
-  std::for_each(f.begin(), f.end(), [=](double &x) { x = start + x * delta; });
+  std::ranges::for_each(f, [=](double &x) { x = start + x * delta; });
   return f;
 }
 std::vector<double> ConstructLinearRange(double start, double end, int n_sample)
 {
+  // A single sample is the interval start (as in numpy.linspace).
   std::vector<double> f(n_sample);
   for (int i = 0; i < n_sample; i++)
   {
-    f[i] = start + (double(i) / (n_sample - 1)) * (end - start);
+    f[i] = start + (n_sample > 1 ? double(i) / (n_sample - 1) : 0.0) * (end - start);
   }
   return f;
 }
 std::vector<double> ConstructLogRange(double start, double end, int n_sample)
 {
+  MFEM_VERIFY(n_sample > 0, "Invalid number of samples for log frequency range!");
+  if (n_sample == 1)
+  {
+    return {start};
+  }
   std::vector<double> f(n_sample);
   double log_start = std::log10(start);
   double log_end = std::log10(end);
@@ -1074,7 +1186,7 @@ std::vector<double> ConstructLogRange(double start, double end, int n_sample)
 auto FindNearestValue(const std::vector<double> &vec, double x, double tol)
 {
   // Find the first element not less than x.
-  auto it = std::lower_bound(vec.begin(), vec.end(), x);
+  auto it = std::ranges::lower_bound(vec, x);
   // Check if we found an exact match or a close enough value.
   if (it != vec.end() && std::abs(*it - x) <= tol)
   {
@@ -1112,8 +1224,8 @@ DrivenSolverData::DrivenSolverData(const json &driven)
 
   std::vector<double> save_f, prom_f;  // samples to be saved to paraview and added to prom
   // Backwards compatible top level interface.
-  if (driven.find("MinFreq") != driven.end() && driven.find("MaxFreq") != driven.end() &&
-      driven.find("FreqStep") != driven.end())
+  if (driven.contains("MinFreq") && driven.contains("MaxFreq") &&
+      driven.contains("FreqStep"))
   {
     double min_f = driven.at("MinFreq");     // Required
     double max_f = driven.at("MaxFreq");     // Required
@@ -1131,8 +1243,8 @@ DrivenSolverData::DrivenSolverData(const json &driven)
   {
     for (auto &r : *freq_samples)
     {
-      auto type = r.value("Type", r.find("Freq") != r.end() ? FrequencySampling::POINT
-                                                            : FrequencySampling::DEFAULT);
+      auto type = r.value("Type", r.contains("Freq") ? FrequencySampling::POINT
+                                                     : FrequencySampling::DEFAULT);
       auto f = [&]()
       {
         switch (type)
@@ -1192,8 +1304,8 @@ DrivenSolverData::DrivenSolverData(const json &driven)
   auto equal_f = [=](auto x, auto y) { return std::abs(x - y) < delta_eps; };
   auto deduplicate = [&equal_f](auto &f)
   {
-    std::sort(f.begin(), f.end());
-    f.erase(std::unique(f.begin(), f.end(), equal_f), f.end());
+    std::ranges::sort(f);
+    f.erase(std::ranges::unique(f, equal_f).begin(), f.end());
   };
 
   // Enforce explicit saves exactly match the sample frequencies.
@@ -1227,11 +1339,11 @@ DrivenSolverData::DrivenSolverData(const json &driven)
   // extra samples. Can use equality comparison given no floating point operations have been
   // done.
   prom_indices = {0, sample_f.size() - 1};
-  if (prom_f.size() > 0 && prom_f.back() == sample_f.back())
+  if (!prom_f.empty() && prom_f.back() == sample_f.back())
   {
     prom_f.pop_back();
   }
-  if (prom_f.size() > 0 && prom_f.front() == sample_f.front())
+  if (!prom_f.empty() && prom_f.front() == sample_f.front())
   {
     prom_f.erase(prom_f.begin(), std::next(prom_f.begin()));
   }
@@ -1272,6 +1384,22 @@ EigenSolverData::EigenSolverData(const json &eigenmode)
   preconditioner_lag = eigenmode.value("PreconditionerLag", preconditioner_lag);
   preconditioner_lag_tol = eigenmode.value("PreconditionerLagTol", preconditioner_lag_tol);
   max_restart = eigenmode.value("MaxRestart", max_restart);
+  nonlinear_max_it = eigenmode.value("NonlinearMaxIts", nonlinear_max_it);
+
+  // Resolve iteration / subspace sentinels to concrete values at parse time so nothing
+  // downstream sees -1. max_it is a single large cap because it only bounds iteration
+  // count, with no buffers scaling with it. It does not apply to the quasi-Newton
+  // iterations (nonlinear_max_it), for which it would let a stagnating Newton iteration
+  // run indefinitely.
+  if (max_it <= 0)
+  {
+    max_it = 1'000'000;
+  }
+  if (max_size <= 0)
+  {
+    max_size = DefaultEigenSubspaceSize(n);
+  }
+  n_post = std::clamp(n_post, 0, n);
 
   target_upper = (target_upper < 0) ? 3 * target : target_upper;  // default = 3 * target
   MFEM_VERIFY(target_upper > target, "config[\"Eigenmode\"][\"TargetUpper\"] must be "
@@ -1286,6 +1414,7 @@ ElectrostaticSolverData::ElectrostaticSolverData(const json &electrostatic)
 MagnetostaticSolverData::MagnetostaticSolverData(const json &magnetostatic)
 {
   n_post = magnetostatic.value("Save", n_post);
+  inactive_port_mode = magnetostatic.value("InactivePorts", inactive_port_mode);
 }
 
 TransientSolverData::TransientSolverData(const json &transient)
@@ -1329,7 +1458,14 @@ BoundaryModeSolverData::BoundaryModeSolverData(const json &ma)
   if (auto it = ma.find("Attributes"); it != ma.end())
   {
     attributes = it->get<std::vector<int>>();
-    std::sort(attributes.begin(), attributes.end());
+    std::ranges::sort(attributes);
+  }
+
+  // Resolve subspace sentinel: ModeEigenSolver forwards this to SLEPc/ARPACK, which
+  // treat negative sizes as memory corruption, not as "use default".
+  if (max_size <= 0)
+  {
+    max_size = DefaultEigenSubspaceSize(n);
   }
 }
 
@@ -1338,6 +1474,7 @@ LinearSolverData::LinearSolverData(const json &linear)
   type = linear.value("Type", type);
   krylov_solver = linear.value("KSPType", krylov_solver);
   tol = linear.value("Tol", tol);
+  abs_tol = linear.value("AbsTol", abs_tol);
   max_it = linear.value("MaxIts", max_it);
   max_size = linear.value("MaxSize", max_size);
   initial_guess = linear.value("InitialGuess", initial_guess);
@@ -1371,6 +1508,7 @@ LinearSolverData::LinearSolverData(const json &linear)
   superlu_3d = linear.value("SuperLU3DCommunicator", superlu_3d);
   ams_vector_interp = linear.value("AMSVectorInterpolation", ams_vector_interp);
   ams_singular_op = linear.value("AMSSingularOperator", ams_singular_op);
+  london_pc_shift = linear.value("LondonPCShift", london_pc_shift);
   amg_agg_coarsen = linear.value("AMGAggressiveCoarsening", amg_agg_coarsen);
   ams_max_it = linear.value("AMSMaxIts", ams_max_it);
 
@@ -1403,16 +1541,18 @@ SolverData::SolverData(const json &solver)
 
 int GetNumSteps(double start, double end, double delta)
 {
-  if (end < start)
-  {
-    return 1;
-  }
+  MFEM_VERIFY(delta > 0.0 && end >= start,
+              "Invalid range from " << start << " to " << end << " in steps of " << delta
+                                    << ": the step must be positive and the end must not "
+                                       "be less than the start!");
   constexpr double delta_eps = 1.0e-9;  // 9 digits of precision comparing endpoint
-  double dn = std::abs(end - start) / std::abs(delta);
+  double dn = (end - start) / delta;
+  MFEM_VERIFY(dn < std::numeric_limits<int>::max() - 2,
+              "Step " << delta << " is too small for the range [" << start << ", " << end
+                      << "]: " << dn << " steps!");
   int n_step = 1 + static_cast<int>(dn);
   double dfinal = start + n_step * delta;
-  return n_step + ((delta < 0.0 && dfinal - end > -delta_eps * end) ||
-                   (delta > 0.0 && dfinal - end < delta_eps * end));
+  return n_step + (dfinal - end < delta_eps * end);
 }
 
 std::pair<std::array<double, 3>, CoordinateSystem> ParseStringAsDirection(std::string str,
@@ -1445,7 +1585,8 @@ std::optional<std::string> Validate(const BoundaryData &boundaries)
 {
   std::ostringstream errors;
 
-  // Check for duplicate indices across LumpedPort, WavePort, SurfaceCurrent, Terminal.
+  // Check for duplicate indices across LumpedPort, WavePort, FloquetPort,
+  // SurfaceCurrent, FluxLoop, Terminal.
   std::map<int, std::string> index_map;
   for (const auto &[idx, data] : boundaries.lumpedport)
   {
@@ -1473,6 +1614,23 @@ std::optional<std::string> Validate(const BoundaryData &boundaries)
              << " and SurfaceCurrent\n";
     }
   }
+  for (const auto &[idx, data] : boundaries.fluxloop)
+  {
+    auto [it, inserted] = index_map.try_emplace(idx, "FluxLoop");
+    if (!inserted)
+    {
+      errors << "Duplicate \"Index\": " << idx << " in " << it->second << " and FluxLoop\n";
+    }
+  }
+  for (const auto &[idx, data] : boundaries.floquetport)
+  {
+    auto [it, inserted] = index_map.try_emplace(idx, "FloquetPort");
+    if (!inserted)
+    {
+      errors << "Duplicate \"Index\": " << idx << " in " << it->second
+             << " and FloquetPort\n";
+    }
+  }
   for (const auto &[idx, data] : boundaries.terminal)
   {
     auto [it, inserted] = index_map.try_emplace(idx, "Terminal");
@@ -1492,16 +1650,20 @@ std::optional<std::string> Validate(const BoundaryData &boundaries)
   {
     excitation_map[data.excitation].emplace_back(idx);
   }
+  for (const auto &[idx, data] : boundaries.floquetport)
+  {
+    excitation_map[data.excitation].emplace_back(idx);
+  }
   excitation_map.erase(0);
-  bool calc_s_params = std::all_of(excitation_map.begin(), excitation_map.end(),
-                                   [](const auto &x) { return x.second.size() == 1; });
+  bool calc_s_params = std::ranges::all_of(excitation_map, [](const auto &x)
+                                           { return x.second.size() == 1; });
   if (calc_s_params && !excitation_map.empty())
   {
     const auto &ext1 = *excitation_map.begin();
     bool valid =
         (excitation_map.size() == 1 && (ext1.first == 1 || ext1.second[0] == ext1.first)) ||
-        std::all_of(excitation_map.begin(), excitation_map.end(),
-                    [](const auto &x) { return x.first == x.second[0]; });
+        std::ranges::all_of(excitation_map,
+                            [](const auto &x) { return x.first == x.second[0]; });
     if (!valid)
     {
       errors << "\"Excitation\" must match \"Index\" for single ports to avoid ambiguity\n";
@@ -1547,14 +1709,13 @@ void Nondimensionalize(const Units &units, RefinementData &data)
   auto scale = LengthScaler(units);
   for (auto &box : data.GetBoxes())
   {
-    std::transform(box.bbmin.begin(), box.bbmin.end(), box.bbmin.begin(), scale);
-    std::transform(box.bbmax.begin(), box.bbmax.end(), box.bbmax.begin(), scale);
+    std::ranges::transform(box.bbmin, box.bbmin.begin(), scale);
+    std::ranges::transform(box.bbmax, box.bbmax.begin(), scale);
   }
   for (auto &sphere : data.GetSpheres())
   {
     sphere.r /= units.GetMeshLengthRelativeScale();
-    std::transform(sphere.center.begin(), sphere.center.end(), sphere.center.begin(),
-                   scale);
+    std::ranges::transform(sphere.center, sphere.center.begin(), scale);
   }
 }
 
@@ -1566,14 +1727,12 @@ void Nondimensionalize(const Units &units, MaterialData &data)
 
 void Nondimensionalize(const Units &units, ProbeData &data)
 {
-  std::transform(data.center.begin(), data.center.end(), data.center.begin(),
-                 LengthScaler(units));
+  std::ranges::transform(data.center, data.center.begin(), LengthScaler(units));
 }
 
 void Nondimensionalize(const Units &units, CurrentDipoleData &data)
 {
-  std::transform(data.center.begin(), data.center.end(), data.center.begin(),
-                 LengthScaler(units));
+  std::ranges::transform(data.center, data.center.begin(), LengthScaler(units));
 }
 
 void Nondimensionalize(const Units &units, ConductivityData &data)
@@ -1587,6 +1746,16 @@ void Nondimensionalize(const Units &units, ImpedanceData &data)
   data.Rs /= units.GetScaleFactor<Units::ValueType::IMPEDANCE>();
   data.Ls /= units.GetScaleFactor<Units::ValueType::INDUCTANCE>();
   data.Cs /= units.GetScaleFactor<Units::ValueType::CAPACITANCE>();
+}
+
+void Nondimensionalize(const Units &units, SuperconductorData &data)
+{
+  // PenetrationDepth (λ) and Thickness (d) are entered in mesh length units (L0), like all
+  // geometric lengths, so they use the mesh-relative scale (consistent with MaterialData's
+  // LondonDepth and ConductivityData's Thickness). KineticInductance (Ls) is in Henries.
+  data.lambda_L /= units.GetMeshLengthRelativeScale();
+  data.thickness /= units.GetMeshLengthRelativeScale();
+  data.Ls /= units.GetScaleFactor<Units::ValueType::INDUCTANCE>();
 }
 
 void Nondimensionalize(const Units &units, LumpedPortData &data)
@@ -1621,8 +1790,7 @@ void Nondimensionalize(const Units &units, WavePortData &data)
 
 void Nondimensionalize(const Units &units, SurfaceFluxData &data)
 {
-  std::transform(data.center.begin(), data.center.end(), data.center.begin(),
-                 LengthScaler(units));
+  std::ranges::transform(data.center, data.center.begin(), LengthScaler(units));
 }
 
 void Nondimensionalize(const Units &units, InterfaceDielectricData &data)
@@ -1647,27 +1815,48 @@ void Nondimensionalize(const Units &units, InterfaceDielectricData &data)
 
 void Nondimensionalize(const Units &units, EigenSolverData &data)
 {
-  data.target =
-      2 * M_PI * units.Nondimensionalize<Units::ValueType::FREQUENCY>(data.target);
+  data.target = 2 * std::numbers::pi *
+                units.Nondimensionalize<Units::ValueType::FREQUENCY>(data.target);
   data.target_upper =
-      2 * M_PI * units.Nondimensionalize<Units::ValueType::FREQUENCY>(data.target_upper);
+      2 * std::numbers::pi *
+      units.Nondimensionalize<Units::ValueType::FREQUENCY>(data.target_upper);
 }
 
 void Nondimensionalize(const Units &units, DrivenSolverData &data)
 {
   for (auto &f : data.sample_f)
   {
-    f = 2 * M_PI * units.Nondimensionalize<Units::ValueType::FREQUENCY>(f);
+    f = 2 * std::numbers::pi * units.Nondimensionalize<Units::ValueType::FREQUENCY>(f);
   }
 }
 
 void Nondimensionalize(const Units &units, TransientSolverData &data)
 {
-  data.pulse_f =
-      2 * M_PI * units.Nondimensionalize<Units::ValueType::FREQUENCY>(data.pulse_f);
+  data.pulse_f = 2 * std::numbers::pi *
+                 units.Nondimensionalize<Units::ValueType::FREQUENCY>(data.pulse_f);
   data.pulse_tau = units.Nondimensionalize<Units::ValueType::TIME>(data.pulse_tau);
   data.max_t = units.Nondimensionalize<Units::ValueType::TIME>(data.max_t);
   data.delta_t = units.Nondimensionalize<Units::ValueType::TIME>(data.delta_t);
+}
+
+void Nondimensionalize(const Units &units, RationalImpedanceData &data)
+{
+  // Zs(s) = N(s)/D(s), s = iω. Internally ω̃ = ω·tc, Z̃ = Z/Z0; with s̃ = s·tc the
+  // numerator coefficient of sᵏ scales by 1/(Z0 tcᵏ) and the denominator by 1/tcᵏ. tc in
+  // SI seconds, coefficients highest-degree-first.
+  const double Z0 = units.GetScaleFactor<Units::ValueType::IMPEDANCE>();
+  const double tc = 1.0e-9 * units.GetScaleFactor<Units::ValueType::TIME>();  // [ns]->[s]
+  const auto rescale = [](std::vector<double> &c, double lead, double tc_s)
+  {
+    const int n = static_cast<int>(c.size());
+    for (int i = 0; i < n; i++)
+    {
+      const int deg = (n - 1) - i;  // highest-degree-first
+      c[i] /= (lead * std::pow(tc_s, deg));
+    }
+  };
+  rescale(data.num, Z0, tc);
+  rescale(data.den, 1.0, tc);
 }
 
 }  // namespace palace::config

@@ -4,6 +4,7 @@
 #include "timeoperator.hpp"
 
 #include <limits>
+#include <utility>
 #include <vector>
 #include "linalg/iterative.hpp"
 #include "linalg/jacobi.hpp"
@@ -54,7 +55,7 @@ public:
     : mfem::TimeDependentOperator(2 * space_op.GetNDSpace().GetTrueVSize() +
                                       space_op.GetCurlSpace().GetTrueVSize(),
                                   t0, type),
-      comm(space_op.GetComm()), dJ_coef(dJ_coef),
+      comm(space_op.GetComm()), dJ_coef(std::move(dJ_coef)),
       size_E(space_op.GetNDSpace().GetTrueVSize()),
       size_B(space_op.GetCurlSpace().GetTrueVSize()), Curl(space_op.GetCurlMatrix())
   {
@@ -67,7 +68,7 @@ public:
     M = space_op.GetMassMatrix<Operator>(Operator::DIAG_ONE);
 
     // Already asserted that only that time dependent solver only has a single excitation.
-    auto excitation_helper = space_op.GetPortExcitations();
+    const auto &excitation_helper = space_op.GetPortExcitations();
     auto excitation_idx = excitation_helper.excitations.begin()->first;
     // Set up RHS vector for the current source term: -g'(t) J, where g(t) handles the time
     // dependence.
@@ -100,8 +101,9 @@ public:
         // Configure the solver.
         if (!kspA)
         {
-          kspA = std::make_unique<KspSolver>(linear, verbose, space_op.GetNDSpaces(),
-                                             &space_op.GetH1Spaces());
+          kspA =
+              std::make_unique<KspSolver>(linear, MatrixSymmetry::SPD, verbose,
+                                          space_op.GetNDSpaces(), &space_op.GetH1Spaces());
         }
         kspA->SetOperators(*A, *B);
       };
@@ -287,7 +289,7 @@ TimeOperator::TimeOperator(const config::SolverData &solver, int verbose,
   : rel_tol(solver.transient.rel_tol), abs_tol(solver.transient.abs_tol),
     order(solver.transient.order)
 {
-  auto excitation_helper = space_op.GetPortExcitations();
+  const auto &excitation_helper = space_op.GetPortExcitations();
   // Should have already asserted that time dependant solver only has a single excitation.
   MFEM_VERIFY(excitation_helper.Size() == 1,
               fmt::format("Transient evolution currently only allows for a single "
@@ -310,7 +312,7 @@ TimeOperator::TimeOperator(const config::SolverData &solver, int verbose,
   // Create ODE solver for 1st-order IVP.
   mfem::TimeDependentOperator::Type type = mfem::TimeDependentOperator::IMPLICIT;
   op = std::make_unique<TimeDependentFirstOrderOperator>(solver.linear, verbose, space_op,
-                                                         dJ_coef, 0.0, type);
+                                                         std::move(dJ_coef), 0.0, type);
   switch (solver.transient.type)
   {
     case TimeSteppingScheme::GEN_ALPHA:
@@ -382,7 +384,7 @@ TimeOperator::TimeOperator(const config::SolverData &solver, int verbose,
 
 TimeOperator::TimeOperator(const IoData &iodata, SpaceOperator &space_op,
                            std::function<double(double)> dJ_coef)
-  : TimeOperator(iodata.solver, iodata.problem.verbose, space_op, dJ_coef)
+  : TimeOperator(iodata.solver, iodata.problem.verbose, space_op, std::move(dJ_coef))
 {
 }
 

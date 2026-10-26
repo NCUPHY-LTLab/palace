@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <complex>
+#include <numbers>
 #include <unordered_set>
 #include "linalg/errorestimator.hpp"
 #include "linalg/vector.hpp"
@@ -45,8 +46,8 @@ ExtractBoundary2DSubmesh(mfem::Mesh &parent, const mfem::Array<int> &surface_att
   auto sub = std::make_unique<mfem::SubMesh>(
       mfem::SubMesh::CreateFromBoundary(parent, surface_attrs));
   // Project to 2D before remapping element attributes: ProjectSubmeshTo2D's call to
-  // GetSurfaceNormal walks the mesh's unique-attribute list, which RemapSubMeshAttributes
-  // leaves stale relative to the per-element attributes it just rewrote.
+  // GetSurfaceNormal walks the unique-attribute list, which the remap rewrites from the
+  // surface tags to the neighboring domain materials.
   frame.normal = mesh::ProjectSubmeshTo2D(*sub, frame.centroid, frame.e1, frame.e2);
   mesh::RemapSubMeshAttributes(*sub);
   mesh::RemapSubMeshBdrAttributes(*sub, surface_attrs);
@@ -107,7 +108,8 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
 
     // Parent boundary face types whose intersection with the cross-section should
     // become 2D boundary edges: BCs that pin the tangential E-field (PEC, auxpec,
-    // impedance, conductivity, farfield) plus other-waveports (relabeled to PEC below).
+    // impedance, conductivity, rational impedance, farfield) plus other-waveports
+    // (relabeled to PEC below).
     std::vector<int> internal_bdr_attrs;
     const auto &bdr = iodata.boundaries;
     auto append = [&](const auto &src)
@@ -122,6 +124,10 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
     {
       append(d.attributes);
     }
+    for (const auto &d : bdr.rational_impedance)
+    {
+      append(d.attributes);
+    }
     append(bdr.farfield.attributes);
 
     std::unordered_set<int> other_waveport_attrs;
@@ -129,7 +135,7 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
     {
       for (auto a : data.attributes)
       {
-        if (std::find(bm.attributes.begin(), bm.attributes.end(), a) != bm.attributes.end())
+        if (std::ranges::find(bm.attributes, a) != bm.attributes.end())
         {
           continue;
         }
@@ -148,8 +154,7 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
                   "BoundaryMode submesh extraction found other-waveport edges on the "
                   "cross-section. Define at least one PEC boundary attribute to "
                   "relabel them to.");
-      const int pec_attr =
-          *std::min_element(bdr.pec.attributes.begin(), bdr.pec.attributes.end());
+      const int pec_attr = *std::ranges::min_element(bdr.pec.attributes);
       int relabelled = 0;
       for (int sbe = 0; sbe < extracted->GetNBE(); sbe++)
       {
@@ -164,6 +169,14 @@ void BoundaryModeSolver::Preprocess(IoData &iodata, std::unique_ptr<mfem::Mesh> 
         Mpi::Print(" Relabelled {:d} other-waveport boundary edge(s) as PEC (attr {:d})\n",
                    relabelled, pec_attr);
       }
+    }
+
+    // The boundary elements of the submesh of a nonconforming mesh, including those added
+    // or relabelled above, are not in its mfem::NCMesh, and would be lost when the mesh is
+    // distributed.
+    if (extracted->Nonconforming())
+    {
+      extracted = mesh::RebuildNonconformingMesh(*extracted);
     }
 
     smesh = std::move(extracted);
@@ -204,7 +217,8 @@ BoundaryModeSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   const int num_modes = bm.n;
   const double freq_GHz = bm.freq;
   const double omega =
-      2.0 * M_PI * iodata.units.Nondimensionalize<Units::ValueType::FREQUENCY>(freq_GHz);
+      2.0 * std::numbers::pi *
+      iodata.units.Nondimensionalize<Units::ValueType::FREQUENCY>(freq_GHz);
 
   Mpi::Print("\nConfiguring 2D waveguide mode analysis at f = {:.3e} GHz "
              "(omega = {:.6e})\n",
@@ -253,12 +267,10 @@ BoundaryModeSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   }
   else
   {
-    double c_min = mode_op.GetMaterialOp().GetLightSpeedMax().Min();
-    Mpi::GlobalMin(1, &c_min, mode_op.GetComm());
-    MFEM_VERIFY(c_min > 0.0 && c_min < mfem::infinity(),
-                "Invalid material speed of light!");
-    kn_target = omega / c_min * std::sqrt(1.1);
-    Mpi::Print(" Auto kn_target = {:.6e} (from c_min = {:.6e})\n", kn_target, c_min);
+    const double mu_eps_max = mode_op.GetMaterialOp().GetMaxMuEpsilon();
+    kn_target = omega * std::sqrt(1.1 * mu_eps_max);
+    Mpi::Print(" Auto kn_target = {:.6e} (from max(mu_r) * max(epsilon_r) = {:.6e})\n",
+               kn_target, mu_eps_max);
   }
 
   // Solve the eigenvalue problem.

@@ -18,6 +18,7 @@ class Mesh;
 template <ProblemType>
 class PostOperator;
 class SurfaceCurrentOperator;
+class SurfaceFluxOperator;
 
 //
 // Driver class for magnetostatic simulations.
@@ -27,8 +28,12 @@ class MagnetostaticSolver : public BaseSolver
 private:
   void PostprocessTerminals(PostOperator<ProblemType::MAGNETOSTATIC> &post_op,
                             const SurfaceCurrentOperator &surf_j_op,
-                            const std::vector<Vector> &A,
-                            const std::vector<double> &I_inc) const;
+                            const SurfaceFluxOperator &surf_flux_op,
+                            const std::vector<Vector> &A, const std::vector<double> &I_inc,
+                            const std::vector<double> &Phi_inc,
+                            const mfem::DenseMatrix &linked_flux,
+                            const std::vector<Vector> &london_ah,
+                            const std::vector<Vector> &london_ms_shifted) const;
 
   std::pair<ErrorIndicator, long long int>
   Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const override;

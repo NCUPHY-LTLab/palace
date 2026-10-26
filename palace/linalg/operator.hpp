@@ -5,6 +5,7 @@
 #define PALACE_LINALG_OPERATOR_HPP
 
 #include <complex>
+#include <concepts>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -67,6 +68,10 @@ public:
                                          const std::complex<double> a = 1.0) const;
 };
 
+// Palace's linear algebra templates are defined for real- and complex-valued operators.
+template <typename T>
+concept OperatorType = std::same_as<T, Operator> || std::same_as<T, ComplexOperator>;
+
 // A complex-valued operator represented using a block 2 x 2 equivalent-real formulation:
 //                          [ yr ]  =  [ Ar  -Ai ] [ xr ]
 //                          [ yi ]     [ Ai   Ar ] [ xi ] .
@@ -112,28 +117,152 @@ public:
                                  const std::complex<double> a = 1.0) const override;
 };
 
-// Wrap a sequence of operators of the same dimensions and optional coefficients.
-class SumOperator : public Operator
+template <OperatorType OperType>
+struct SumOperatorTraits;
+
+template <>
+struct SumOperatorTraits<Operator>
 {
+  using VecType = Vector;
+  using ScalarType = double;
+};
+
+template <>
+struct SumOperatorTraits<ComplexOperator>
+{
+  using VecType = ComplexVector;
+  using ScalarType = std::complex<double>;
+};
+
+// Wrap a sequence of operators of the same dimensions and optional coefficients. In
+// non-owning mode, the caller must ensure the referenced operators outlive this object.
+template <OperatorType OperType>
+class BaseSumOperator : public OperType
+{
+public:
+  using VecType = typename SumOperatorTraits<OperType>::VecType;
+  using ScalarType = typename SumOperatorTraits<OperType>::ScalarType;
+
 private:
-  std::vector<std::pair<const Operator *, double>> ops;
-  mutable Vector z;
+  std::vector<std::pair<const OperType *, ScalarType>> ops;
+  std::vector<std::unique_ptr<OperType>> owned_ops;
+  mutable VecType z;
 
 public:
-  SumOperator(int s) : Operator(s) { z.UseDevice(true); }
-  SumOperator(int h, int w) : Operator(h, w) { z.UseDevice(true); }
-  SumOperator(const Operator &op, double a = 1.0);
+  BaseSumOperator(int s) : OperType(s) { z.UseDevice(true); }
+  BaseSumOperator(int h, int w) : OperType(h, w) { z.UseDevice(true); }
+  BaseSumOperator(const OperType &op, ScalarType a = ScalarType{1.0})
+    : OperType(op.Height(), op.Width())
+  {
+    z.UseDevice(true);
+    AddOperator(op, a);
+  }
+  BaseSumOperator(std::unique_ptr<OperType> &&op, ScalarType a = ScalarType{1.0})
+    : OperType(op->Height(), op->Width())
+  {
+    z.UseDevice(true);
+    AddOperator(std::move(op), a);
+  }
+  BaseSumOperator(std::unique_ptr<OperType> &&A, std::unique_ptr<OperType> &&B)
+    : OperType(A->Height(), A->Width())
+  {
+    z.UseDevice(true);
+    AddOperator(std::move(A));
+    AddOperator(std::move(B));
+  }
+  BaseSumOperator(std::unique_ptr<OperType> &&A, const OperType &B)
+    : OperType(A->Height(), A->Width())
+  {
+    z.UseDevice(true);
+    AddOperator(std::move(A));
+    AddOperator(B);
+  }
+  BaseSumOperator(const OperType &A, std::unique_ptr<OperType> &&B)
+    : OperType(A.Height(), A.Width())
+  {
+    z.UseDevice(true);
+    AddOperator(A);
+    AddOperator(std::move(B));
+  }
+  BaseSumOperator(const OperType &A, const OperType &B) : OperType(A.Height(), A.Width())
+  {
+    z.UseDevice(true);
+    AddOperator(A);
+    AddOperator(B);
+  }
 
-  void AddOperator(const Operator &op, double a = 1.0);
+  void AddOperator(const OperType &op, ScalarType a = ScalarType{1.0})
+  {
+    MFEM_VERIFY(op.Height() == this->Height() && op.Width() == this->Width(),
+                "Invalid Operator dimensions for BaseSumOperator!");
+    ops.emplace_back(&op, a);
+  }
 
-  void Mult(const Vector &x, Vector &y) const override;
+  void AddOperator(std::unique_ptr<OperType> &&op, ScalarType a = ScalarType{1.0})
+  {
+    MFEM_VERIFY(op, "Cannot add an empty Operator to BaseSumOperator!");
+    const auto *op_ptr = op.get();
+    owned_ops.emplace_back(std::move(op));
+    AddOperator(*op_ptr, a);
+  }
 
-  void MultTranspose(const Vector &x, Vector &y) const override;
+  void Mult(const VecType &x, VecType &y) const override
+  {
+    if (ops.size() == 1)
+    {
+      const auto &[op, c] = ops.front();
+      op->Mult(x, y);
+      if (c != ScalarType{1.0})
+      {
+        y *= c;
+      }
+      return;
+    }
+    y = 0.0;
+    AddMult(x, y);
+  }
 
-  void AddMult(const Vector &x, Vector &y, const double a = 1.0) const override;
+  void MultTranspose(const VecType &x, VecType &y) const override
+  {
+    if (ops.size() == 1)
+    {
+      const auto &[op, c] = ops.front();
+      op->MultTranspose(x, y);
+      if (c != ScalarType{1.0})
+      {
+        y *= c;
+      }
+      return;
+    }
+    y = 0.0;
+    AddMultTranspose(x, y);
+  }
 
-  void AddMultTranspose(const Vector &x, Vector &y, const double a = 1.0) const override;
+  void AddMult(const VecType &x, VecType &y,
+               const ScalarType a = ScalarType{1.0}) const override
+  {
+    z.SetSize(y.Size());
+    for (const auto &[op, c] : ops)
+    {
+      op->Mult(x, z);
+      y.Add(a * c, z);
+    }
+  }
+
+  void AddMultTranspose(const VecType &x, VecType &y,
+                        const ScalarType a = ScalarType{1.0}) const override
+  {
+    z.SetSize(y.Size());
+    for (const auto &[op, c] : ops)
+    {
+      op->MultTranspose(x, z);
+      y.Add(a * c, z);
+    }
+  }
 };
+
+using SumOperator = BaseSumOperator<Operator>;
+using SumComplexOperator = BaseSumOperator<ComplexOperator>;
 
 // Wraps two operators such that: (AB)ᵀ = BᵀAᵀ and, for complex symmetric operators, the
 // Hermitian transpose operation is (AB)ᴴ = BᴴAᴴ.
@@ -175,17 +304,16 @@ public:
   }
 };
 
-template <typename OperType>
+template <OperatorType OperType>
 class BaseProductOperator
   : public ProductOperatorHelper<BaseProductOperator<OperType>, OperType>
 {
   friend class ProductOperatorHelper<BaseProductOperator<OperType>, OperType>;
 
-  using VecType = typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                            ComplexVector, Vector>::type;
-  using ScalarType =
-      typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                std::complex<double>, double>::type;
+  using VecType =
+      std::conditional_t<std::is_same_v<OperType, ComplexOperator>, ComplexVector, Vector>;
+  using ScalarType = std::conditional_t<std::is_same_v<OperType, ComplexOperator>,
+                                        std::complex<double>, double>;
 
 private:
   const OperType &A, &B;
@@ -253,17 +381,16 @@ public:
                                  const std::complex<double> a = 1.0) const override;
 };
 
-template <typename OperType>
+template <OperatorType OperType>
 class BaseDiagonalOperator
   : public DiagonalOperatorHelper<BaseDiagonalOperator<OperType>, OperType>
 {
   friend class DiagonalOperatorHelper<BaseDiagonalOperator<OperType>, OperType>;
 
-  using VecType = typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                            ComplexVector, Vector>::type;
-  using ScalarType =
-      typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                std::complex<double>, double>::type;
+  using VecType =
+      std::conditional_t<std::is_same_v<OperType, ComplexOperator>, ComplexVector, Vector>;
+  using ScalarType = std::conditional_t<std::is_same_v<OperType, ComplexOperator>,
+                                        std::complex<double>, double>;
 
 private:
   const VecType &d;
@@ -294,14 +421,13 @@ using ComplexDiagonalOperator = BaseDiagonalOperator<ComplexOperator>;
 // Optionally includes operators for the auxiliary space at each level as well. The
 // Operators are stored from coarsest to finest level. The height and width of this operator
 // are never set.
-template <typename OperType>
+template <OperatorType OperType>
 class BaseMultigridOperator : public OperType
 {
-  using VecType = typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                            ComplexVector, Vector>::type;
-  using ScalarType =
-      typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                std::complex<double>, double>::type;
+  using VecType =
+      std::conditional_t<std::is_same_v<OperType, ComplexOperator>, ComplexVector, Vector>;
+  using ScalarType = std::conditional_t<std::is_same_v<OperType, ComplexOperator>,
+                                        std::complex<double>, double>;
 
 private:
   std::vector<std::unique_ptr<OperType>> ops, aux_ops;

@@ -1,10 +1,18 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
+#include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 #include <fmt/format.h>
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json-schema.hpp>
 #include <nlohmann/json.hpp>
 #include "embedded_schema.hpp"
 #include "fixtures.hpp"
@@ -15,6 +23,88 @@ using json = nlohmann::json;
 using namespace palace;
 
 namespace fs = std::filesystem;
+
+namespace
+{
+
+using json_validator = nlohmann::json_schema::json_validator;
+
+// Collect (JSON-pointer path, subschema) for every object in the schema tree
+// that declares a "default". The path is a plain RFC 6901 JSON pointer (with
+// "~0"/"~1" escaping) and is used only for diagnostics.
+void CollectDefaultNodes(const json &node, const std::string &ptr,
+                         std::vector<std::pair<std::string, json>> &out)
+{
+  if (node.is_object())
+  {
+    if (node.contains("default"))
+    {
+      out.emplace_back(ptr, node);
+    }
+    for (const auto &[key, value] : node.items())
+    {
+      std::string token = key;
+      // RFC 6901 escaping: "~" -> "~0" (must run before the "/" pass), "/" -> "~1".
+      for (std::size_t pos = 0; (pos = token.find('~', pos)) != std::string::npos; pos += 2)
+      {
+        token.replace(pos, 1, "~0");
+      }
+      for (std::size_t pos = 0; (pos = token.find('/', pos)) != std::string::npos; pos += 2)
+      {
+        token.replace(pos, 1, "~1");
+      }
+      CollectDefaultNodes(value, ptr + "/" + token, out);
+    }
+  }
+  else if (node.is_array())
+  {
+    for (std::size_t i = 0; i < node.size(); i++)
+    {
+      CollectDefaultNodes(node[i], ptr + "/" + std::to_string(i), out);
+    }
+  }
+}
+
+// Validate every "default" in the embedded config schema against the subschema
+// that declares it. Returns a newline-separated report of inconsistencies, or an
+// empty string when all defaults are consistent. The root "$defs" is attached to
+// each subschema so its internal "#/$defs/..." refs resolve when it is validated
+// as a standalone root schema (the schema uses only internal refs).
+std::string ValidateSchemaDefaults()
+{
+  const auto &schema_map = schema::GetSchemaMap();
+  auto it = schema_map.find("config-schema.json");
+  if (it == schema_map.end())
+  {
+    return "Root schema not found in embedded schemas";
+  }
+  const json root = json::parse(it->second);
+  const json defs = root.contains("$defs") ? root["$defs"] : json::object();
+
+  std::vector<std::pair<std::string, json>> default_nodes;
+  CollectDefaultNodes(root, "", default_nodes);
+
+  std::ostringstream errors;
+  for (const auto &[ptr, node] : default_nodes)
+  {
+    json sub = node;
+    sub["$defs"] = defs;
+    json_validator validator;
+    try
+    {
+      validator.set_root_schema(sub);
+      validator.validate(node.at("default"));
+    }
+    catch (const std::exception &e)
+    {
+      errors << "At " << ptr << ": default does not satisfy its schema: " << e.what()
+             << "\n";
+    }
+  }
+  return errors.str();
+}
+
+}  // namespace
 
 TEST_CASE("Schema Validation - Embedded Schema Matches Source", "[schema][Serial]")
 {
@@ -208,6 +298,22 @@ TEST_CASE("Schema Validation - Invalid Config", "[schema][Serial]")
   }
 }
 
+TEST_CASE("Schema Validation - Linear Solver Types", "[schema][Serial]")
+{
+  for (const char *type : {"AMS", "BoomerAMG", "SuperLU", "STRUMPACK", "STRUMPACK-MP",
+                           "MUMPS", "Jacobi", "cuDSS"})
+  {
+    json config = {{"Problem", {{"Type", "Electrostatic"}, {"Output", "test_output"}}},
+                   {"Model", {{"Mesh", "test.msh"}}},
+                   {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+                   {"Boundaries", json::object()},
+                   {"Solver", {{"Linear", {{"Type", type}}}}}};
+    INFO("Linear.Type = " << type);
+    std::string err = ValidateConfig(config);
+    CHECK(err.empty());
+  }
+}
+
 TEST_CASE("Schema Validation - Sub-schema by Key", "[schema][Serial]")
 {
 
@@ -242,6 +348,25 @@ TEST_CASE("Schema Validation - Sub-schema by Key", "[schema][Serial]")
     CHECK(!err.empty());
   }
 
+  SECTION("RationalImpedance polynomials require a nonzero coefficient")
+  {
+    json impedance = {
+        {"Attributes", {1}}, {"Numerator", {1.0, 0.0}}, {"Denominator", {0.0, 2.0}}};
+    CHECK(ValidateConfig(impedance, "RationalImpedance").empty());
+
+    for (const char *polynomial : {"Numerator", "Denominator"})
+    {
+      CAPTURE(polynomial);
+      for (const json &zeros : {json{0, 0}, json{0.0, 0.0}})
+      {
+        CAPTURE(zeros);
+        impedance[polynomial] = zeros;
+        CHECK(!ValidateConfig(impedance, "RationalImpedance").empty());
+        impedance[polynomial] = {1.0};
+      }
+    }
+  }
+
   SECTION("Invalid Direction strings")
   {
     std::vector<std::string> invalid_dirs = {"a",  "+a", "-a",  "xx", "~x",
@@ -253,6 +378,78 @@ TEST_CASE("Schema Validation - Sub-schema by Key", "[schema][Serial]")
       INFO("Direction: " << dir);
       CHECK(!err.empty());
     }
+  }
+
+  SECTION("SurfaceCurrent InactiveMode enum")
+  {
+    // Valid values are the enumerated modes; anything else is rejected by the schema.
+    json open = {
+        {"Index", 1}, {"Attributes", {1}}, {"Direction", "+X"}, {"InactiveMode", "Open"}};
+    CHECK(ValidateConfig(open, "SurfaceCurrent").empty());
+    json shorted = {
+        {"Index", 1}, {"Attributes", {1}}, {"Direction", "+X"}, {"InactiveMode", "Short"}};
+    CHECK(ValidateConfig(shorted, "SurfaceCurrent").empty());
+    json invalid = {{"Index", 1},
+                    {"Attributes", {1}},
+                    {"Direction", "+X"},
+                    {"InactiveMode", "Floating"}};
+    CHECK(!ValidateConfig(invalid, "SurfaceCurrent").empty());
+  }
+
+  SECTION("Magnetostatic InactivePorts enum")
+  {
+    CHECK(ValidateConfig(json{{"InactivePorts", "Open"}}, "Magnetostatic").empty());
+    CHECK(ValidateConfig(json{{"InactivePorts", "Short"}}, "Magnetostatic").empty());
+    CHECK(!ValidateConfig(json{{"InactivePorts", "Floating"}}, "Magnetostatic").empty());
+  }
+
+  SECTION("SurfaceCurrent Aperture has Attributes and Cartesian Direction")
+  {
+    json current = {{"Index", 1},
+                    {"Attributes", {1}},
+                    {"Direction", "+X"},
+                    {"Aperture", {{"Attributes", {2, 3}}, {"Direction", "+Z"}}}};
+    CHECK(ValidateConfig(current, "SurfaceCurrent").empty());
+
+    current["Aperture"]["Direction"] = {0.0, 1.0, 1.0};
+    CHECK(ValidateConfig(current, "SurfaceCurrent").empty());
+    current["Aperture"]["Direction"] = "+R";
+    CHECK(!ValidateConfig(current, "SurfaceCurrent").empty());
+
+    current["Aperture"] = {{"Attributes", {2}}};
+    CHECK(!ValidateConfig(current, "SurfaceCurrent").empty());
+    current["Aperture"] = {{"Direction", "+Z"}};
+    CHECK(!ValidateConfig(current, "SurfaceCurrent").empty());
+
+    current.erase("Aperture");
+    current["ApertureAttributes"] = {2};
+    CHECK(!ValidateConfig(current, "SurfaceCurrent").empty());
+  }
+
+  SECTION("SurfaceCurrent multielement apertures are element-owned")
+  {
+    json current = {
+        {"Index", 1},
+        {"Elements",
+         json::array(
+             {{{"Attributes", {1}},
+               {"Direction", "+X"},
+               {"Aperture", {{"Attributes", {3}}, {"Direction", "+Z"}}}},
+              {{"Attributes", {2}},
+               {"Direction", "-X"},
+               {"Aperture", {{"Attributes", {4}}, {"Direction", {0.0, 0.0, -1.0}}}}}})}};
+    CHECK(ValidateConfig(current, "SurfaceCurrent").empty());
+
+    current["Aperture"] = {{"Attributes", {5}}, {"Direction", "+Z"}};
+    CHECK(!ValidateConfig(current, "SurfaceCurrent").empty());
+
+    json lumped = {
+        {"Index", 1},
+        {"Elements",
+         json::array({{{"Attributes", {1}},
+                       {"Direction", "+X"},
+                       {"Aperture", {{"Attributes", {2}}, {"Direction", "+Z"}}}}})}};
+    CHECK(!ValidateConfig(lumped, "LumpedPort").empty());
   }
 
   SECTION("CurrentDipole rejects cylindrical R direction")
@@ -349,7 +546,7 @@ TEST_CASE("Schema Validation - Sub-schema by Key", "[schema][Serial]")
 
   SECTION("Ambiguous schema key")
   {
-    // "Postprocessing" exists in both boundaries.json and domains.json.
+    // "Postprocessing" exists in both the Boundaries and Domains scopes.
     json data = {{"Index", 1}};
     std::string err = ValidateConfig(data, "Postprocessing");
     CHECK(!err.empty());
@@ -479,6 +676,30 @@ TEST_CASE_METHOD(palace::test::PerRankTempDir, "Schema Validation - Range Expans
   CHECK(err.empty());
 }
 
+TEST_CASE_METHOD(palace::test::PerRankTempDir,
+                 "Schema Validation - Range Expansion Strings", "[schema][Serial]")
+{
+  // Brackets inside strings (e.g. file paths) are not integer arrays and must pass through
+  // unchanged, including after an escaped quote, while real arrays still expand.
+  auto temp_path = temp_dir / "palace_test_range_strings.json";
+  {
+    std::ofstream f(temp_path);
+    f << R"({
+      "Problem": { "Type": "Eigenmode", "Output": "postpro/run[2024-09]\"[1-2]\"" },
+      "Model": { "Mesh": "mesh[1-3].msh" },
+      "Domains": { "Materials": [{ "Attributes": [1-3] }] },
+      "Boundaries": {},
+      "Solver": { "Eigenmode": { "Target": 1.0 } }
+    })";
+  }
+
+  std::stringstream buffer = PreprocessFile(temp_path.c_str());
+  json config = json::parse(buffer);
+  CHECK(config["Model"]["Mesh"] == "mesh[1-3].msh");
+  CHECK(config["Problem"]["Output"] == "postpro/run[2024-09]\"[1-2]\"");
+  CHECK(config["Domains"]["Materials"][0]["Attributes"] == json({1, 2, 3}));
+}
+
 TEST_CASE("Schema Validation - Required Field Checks", "[schema][Serial]")
 {
 
@@ -603,10 +824,102 @@ TEST_CASE("Schema Validation - Error Message Format", "[schema][Serial]")
                    {"Solver", json::object()}};
 
     std::string err = ValidateConfig(config);
-    CHECK(err ==
-          "At [\"Problem\"][\"Type\"]: instance not found in required enum; valid values: "
-          "\"Eigenmode\", \"Driven\", \"Transient\", \"Electrostatic\", \"Magnetostatic\", "
-          "\"BoundaryMode\"\n");
+    CHECK(err.find("[\"Problem\"][\"Type\"]") != std::string::npos);
+    CHECK(err.find("valid values: \"Eigenmode\", \"Driven\", \"Transient\", "
+                   "\"Electrostatic\", \"Magnetostatic\", \"BoundaryMode\"") !=
+          std::string::npos);
+    CHECK(err.find("Did you mean") == std::string::npos);
+  }
+
+  SECTION("Enum value with incorrect case suggests canonical spelling")
+  {
+    json config = {{"Problem", {{"Type", "Electrostatic"}}},
+                   {"Model", {{"Mesh", "test.msh"}}},
+                   {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+                   {"Boundaries", json::object()},
+                   {"Solver", {{"Linear", {{"Type", "superlu"}}}}}};
+
+    std::string err = ValidateConfig(config);
+    INFO(err);
+    CHECK(err.find("At [\"Solver\"][\"Linear\"][\"Type\"]: invalid value \"superlu\"") !=
+          std::string::npos);
+    CHECK(err.find("Did you mean \"SuperLU\"?") != std::string::npos);
+    CHECK(err.find("case#") == std::string::npos);
+    CHECK(err.find("valid values: \"Default\", \"AMS\", \"BoomerAMG\", \"MUMPS\", "
+                   "\"SuperLU\", \"STRUMPACK\", \"STRUMPACK-MP\", \"Jacobi\", "
+                   "\"cuDSS\"") != std::string::npos);
+  }
+
+  SECTION("Enum lookup follows object alternatives at the exact instance path")
+  {
+    json config = {{"Problem", {{"Type", "Driven"}}},
+                   {"Model", {{"Mesh", "test.msh"}}},
+                   {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+                   {"Boundaries", json::object()},
+                   {"Solver",
+                    {{"Driven",
+                      {{"Samples",
+                        {{{"Type", "linear"},
+                          {"MinFreq", 1.0},
+                          {"MaxFreq", 2.0},
+                          {"NSample", 2}}}}}}}}};
+
+    std::string err = ValidateConfig(config);
+    INFO(err);
+    const std::string enum_error =
+        "At [\"Solver\"][\"Driven\"][\"Samples\"][0][\"Type\"]: invalid value "
+        "\"linear\"; valid values: \"Point\", \"Linear\", \"Log\". Did you mean "
+        "\"Linear\"?";
+    const auto enum_error_pos = err.find(enum_error);
+    REQUIRE(enum_error_pos != std::string::npos);
+    CHECK(err.find(enum_error, enum_error_pos + enum_error.size()) == std::string::npos);
+    CHECK(err.find("\"SuperLU\"") == std::string::npos);
+  }
+
+  SECTION("Enum lookup recurses through nested arrays and references")
+  {
+    json config = {{"Problem", {{"Type", "Electrostatic"}}},
+                   {"Model", {{"Mesh", "test.msh"}}},
+                   {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+                   {"Boundaries",
+                    {{"LumpedPort",
+                      {{{"Index", 1},
+                        {"Elements",
+                         {{{"Attributes", {1}},
+                           {"Direction", {1.0, 0.0, 0.0}},
+                           {"CoordinateSystem", "cylindrical"}}}}}}}}},
+                   {"Solver", json::object()}};
+
+    std::string err = ValidateConfig(config);
+    INFO(err);
+    CHECK(err.find("[\"Boundaries\"][\"LumpedPort\"][0][\"Elements\"][0]"
+                   "[\"CoordinateSystem\"]") != std::string::npos);
+    CHECK(err.find("valid values: \"Cartesian\", \"Cylindrical\"") != std::string::npos);
+    CHECK(err.find("Did you mean \"Cylindrical\"?") != std::string::npos);
+    CHECK(err.find("\"Open\"") == std::string::npos);
+  }
+
+  SECTION("Enum lookup resolves references within anyOf")
+  {
+    json config = {{"Problem", {{"Type", "Electrostatic"}}},
+                   {"Model", {{"Mesh", "test.msh"}}},
+                   {"Domains",
+                    {{"Materials", {{{"Attributes", {1}}}}},
+                     {"CurrentDipole",
+                      {{{"Index", 1},
+                        {"Moment", 1.0},
+                        {"Center", {0.0, 0.0, 0.0}},
+                        {"Direction", "BadDir"}}}}}},
+                   {"Boundaries", json::object()},
+                   {"Solver", json::object()}};
+
+    std::string err = ValidateConfig(config);
+    INFO(err);
+    CHECK(err.find("[\"Domains\"][\"CurrentDipole\"][0][\"Direction\"]") !=
+          std::string::npos);
+    CHECK(err.find("valid values: \"X\", \"Y\", \"Z\"") != std::string::npos);
+    CHECK(err.find("\"-z\"") != std::string::npos);
+    CHECK(err.find("Did you mean") == std::string::npos);
   }
 
   SECTION("Invalid enum in nested array")
@@ -630,14 +943,20 @@ TEST_CASE("Schema Validation - Error Message Format", "[schema][Serial]")
   {
     json port = {{"Index", "not a number"}, {"Attributes", {1}}};
     std::string err = ValidateConfig(port, "LumpedPort");
-    CHECK(err == "At [\"Index\"]: unexpected instance type (got string)\n");
+    // LumpedPort.items is a oneOf over named variants, so the validator
+    // reports a per-branch failure plus the oneOf wrapper. Check that the
+    // underlying message is present rather than asserting an exact string.
+    CHECK(err.find("[\"Index\"]") != std::string::npos);
+    CHECK(err.find("unexpected instance type") != std::string::npos);
+    CHECK(err.find("(got string)") != std::string::npos);
   }
 
   SECTION("Value below minimum")
   {
     json port = {{"Index", -1}, {"Attributes", {1}}};
     std::string err = ValidateConfig(port, "LumpedPort");
-    CHECK(err == "At [\"Index\"]: instance is below or equals minimum of 0\n");
+    CHECK(err.find("[\"Index\"]") != std::string::npos);
+    CHECK(err.find("below or equals minimum of 0") != std::string::npos);
   }
 
   SECTION("Missing required field shows oneOf options")
@@ -657,6 +976,25 @@ TEST_CASE("Schema Validation - Error Message Format", "[schema][Serial]")
           "property 'Attributes' not found in object\n"
           "At [\"Boundaries\"][\"LumpedPort\"][0]: [combination: oneOf / case#1] required "
           "property 'Elements' not found in object\n");
+  }
+
+  SECTION("Check oneOf child errors shown, if not oneOf + const enum replacement")
+  {
+    // LumpedPort requires either Attributes or Elements. Here oneOf is not just an enum
+    // replacement.
+    json config = {
+        {"Problem", {{"Type", "Driven"}}},
+        {"Model", {{"Mesh", "test.msh"}}},
+        {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+        {"Boundaries", {{"LumpedPort", {{{"Index", 1}, {"R", 50.0}}}}}},
+        {"Solver", {{"Driven", {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.1}}}}}};
+
+    std::string err = ValidateConfig(config);
+    // Child branch errors for oneOf
+    CHECK(err.find("case#0") != std::string::npos);
+    CHECK(err.find("case#1") != std::string::npos);
+    // Must NOT list "valid values:"
+    CHECK(err.find("valid values:") == std::string::npos);
   }
 
   SECTION("Additional property in nested object not allowed")
@@ -695,6 +1033,71 @@ TEST_CASE("Schema Validator Smoke Tests", "[schema][Serial]")
     CHECK(!ValidateConfig(driven, "Driven").empty());
   }
 
+  SECTION("Frequencies must be positive - Driven Samples")
+  {
+    // A driven solve at 0 GHz is singular, so no sample may be there.
+    for (const auto &[min_f, max_f] : {std::pair{0.0, 1.0}, std::pair{1.0, 0.0}})
+    {
+      json linear = {
+          {"Samples", {{{"MinFreq", min_f}, {"MaxFreq", max_f}, {"NSample", 3}}}}};
+      CHECK(!ValidateConfig(linear, "Driven").empty());
+    }
+    json point = {{"Samples", {{{"Freq", {0.0, 1.0}}}}}};
+    CHECK(!ValidateConfig(point, "Driven").empty());
+    json top_level = {{"MinFreq", 0.0}, {"MaxFreq", 1.0}, {"FreqStep", 0.5}};
+    CHECK(!ValidateConfig(top_level, "Driven").empty());
+    json positive = {
+        {"Samples",
+         {{{"MinFreq", 0.1}, {"MaxFreq", 1.0}, {"NSample", 3}}, {{"Freq", {2.0}}}}}};
+    CHECK(ValidateConfig(positive, "Driven").empty());
+  }
+
+  SECTION("Deprecated FreqStep must be positive when it is read - Driven")
+  {
+    json zero_step = {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.0}};
+    CHECK(!ValidateConfig(zero_step, "Driven").empty());
+    json negative_step = {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", -0.5}};
+    CHECK(!ValidateConfig(negative_step, "Driven").empty());
+    json positive_step = {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.5}};
+    CHECK(ValidateConfig(positive_step, "Driven").empty());
+    // Without "MinFreq" and "MaxFreq" the parser ignores "FreqStep".
+    json stray_step = {{"FreqStep", 0.0},
+                       {"Samples", {{{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"NSample", 5}}}}};
+    CHECK(ValidateConfig(stray_step, "Driven").empty());
+  }
+
+  SECTION("AdaptiveCircuitSynthesis requires positive AdaptiveTol for Driven problems")
+  {
+    auto Config = [](const std::string &type, const json &driven)
+    {
+      json config = {{"Problem", {{"Type", type}}},
+                     {"Model", {{"Mesh", "test.msh"}}},
+                     {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+                     {"Boundaries", json::object()},
+                     {"Solver", {{"Driven", driven}}}};
+      if (type == "Eigenmode")
+      {
+        config["Solver"]["Eigenmode"] = {{"Target", 1.0}};
+      }
+      return config;
+    };
+    json base = {{"Samples", {{{"Freq", {1.0, 2.0}}}}}};
+    // Synthesis without AdaptiveTol, or with AdaptiveTol: 0, is invalid.
+    json missing_tol = base;
+    missing_tol["AdaptiveCircuitSynthesis"] = true;
+    CHECK(!ValidateConfig(Config("Driven", missing_tol)).empty());
+    json zero_tol = missing_tol;
+    zero_tol["AdaptiveTol"] = 0.0;
+    CHECK(!ValidateConfig(Config("Driven", zero_tol)).empty());
+    // Positive AdaptiveTol or no synthesis are valid.
+    json ok = missing_tol;
+    ok["AdaptiveTol"] = 1e-3;
+    CHECK(ValidateConfig(Config("Driven", ok)).empty());
+    CHECK(ValidateConfig(Config("Driven", base)).empty());
+    // An unused "Driven" block of another problem type is not checked.
+    CHECK(ValidateConfig(Config("Eigenmode", missing_tol)).empty());
+  }
+
   SECTION("Required field - Model without Mesh")
   {
     CHECK(!ValidateConfig(json::object(), "Model").empty());
@@ -709,4 +1112,42 @@ TEST_CASE("Schema Validator Smoke Tests", "[schema][Serial]")
                    {"Solver", json::object()}};
     CHECK(!ValidateConfig(config).empty());
   }
+}
+
+TEST_CASE("Schema Version", "[schema][Serial]")
+{
+  // The root schema must carry a version via the standard "$id" field using a URN
+  // (see issue #760). Format: "urn:palace:schema:MODEL-REVISION-ADDITION" (SchemaVer).
+  // GetSchemaVersion() extracts that version from the "$id" and is what
+  // `palace --version` reports, so testing through it also covers that path.
+  const std::string version = GetSchemaVersion();
+  INFO("Schema version: " << version);
+
+  // "unknown" means the root schema had no "$id" with the "urn:palace:schema:" prefix.
+  REQUIRE(version != "unknown");
+
+  // Must be a "MODEL-REVISION-ADDITION" SchemaVer of non-negative integers.
+  std::array<int, 3> parts = {-1, -1, -1};
+  const int matched =
+      std::sscanf(version.c_str(), "%d-%d-%d", &parts[0], &parts[1], &parts[2]);
+  CHECK(matched == 3);
+  for (const int p : parts)
+  {
+    CHECK(p >= 0);
+  }
+
+  CHECK(version == fmt::format("{}-{}-{}", parts[0], parts[1], parts[2]));
+}
+
+TEST_CASE("Schema Validation - Defaults Match Their Subschemas", "[schema][Serial]")
+{
+  // JSON Schema treats "default" as an annotation and does NOT check it against
+  // the subschema that declares it, so a typo like
+  //   {"type": "integer", "default": "many"}
+  // passes the schema's own meta-schema and only misbehaves once the default is
+  // applied. Guard the embedded config schema: every "default" must be valid
+  // against the subschema it sits in.
+  std::string err = ValidateSchemaDefaults();
+  INFO("Inconsistent schema defaults:\n" << err);
+  CHECK(err.empty());
 }

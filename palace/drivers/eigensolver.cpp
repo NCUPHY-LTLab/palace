@@ -4,7 +4,10 @@
 #include "eigensolver.hpp"
 
 #include <complex>
+#include <numbers>
+#include <vector>
 #include <mfem.hpp>
+#include "drivers/fluxerrorestimator.hpp"
 #include "fem/errorindicator.hpp"
 #include "fem/mesh.hpp"
 #include "linalg/arpack.hpp"
@@ -39,18 +42,39 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   SpaceOperator space_op(iodata, mesh);
   auto K = space_op.GetStiffnessMatrix<ComplexOperator>(Operator::DIAG_ONE);
   auto C = space_op.GetDampingMatrix<ComplexOperator>(Operator::DIAG_ZERO);
+  const bool has_C = (C != nullptr);
   auto M = space_op.GetMassMatrix<ComplexOperator>(Operator::DIAG_ZERO);
 
   // Check if there are nonlinear terms and, if so, setup interpolation operator.
-  auto funcA2 = [&space_op](double omega) -> std::unique_ptr<ComplexOperator>
-  { return space_op.GetExtraSystemMatrix<ComplexOperator>(omega, Operator::DIAG_ZERO); };
+  auto funcA2 = [&space_op](std::complex<double> lambda) -> std::unique_ptr<ComplexOperator>
+  {
+    const std::complex<double> omega = lambda / std::complex<double>(0.0, 1.0);  // ω = λ/i
+    return space_op.GetExtraSystemMatrix(omega, Operator::DIAG_ZERO);
+  };
+  // As funcA2, plus the matrix-free wave-port modal correction W. Used by the SLP and
+  // Quasi-Newton solves (the polynomial seed keeps funcA2, since W cannot enter
+  // BuildParSumOperator).
+  auto funcA2_full =
+      [&space_op](std::complex<double> lambda) -> std::unique_ptr<ComplexOperator>
+  {
+    const std::complex<double> omega = lambda / std::complex<double>(0.0, 1.0);  // ω = λ/i
+    return space_op.GetExtraSystemOperator(omega, Operator::DIAG_ZERO);
+  };
   auto funcP = [&space_op](std::complex<double> a0, std::complex<double> a1,
                            std::complex<double> a2,
-                           double omega) -> std::unique_ptr<ComplexOperator>
-  { return space_op.GetPreconditionerMatrix<ComplexOperator>(a0, a1, a2, omega); };
+                           std::complex<double> a3) -> std::unique_ptr<ComplexOperator>
+  { return space_op.GetPreconditionerMatrix<ComplexOperator>(a0, a1, a2, a3); };
   const double target = iodata.solver.eigenmode.target;
-  auto A2 = funcA2(target);
+  auto A2 = funcA2(1i * target);
   bool has_A2 = (A2 != nullptr);
+
+  // Freeze the wave-port modal reference at the target so funcA2_full's complex-ω
+  // correction W can extrapolate k_n(ω) around it (used by both the SLP and Quasi-Newton
+  // solves).
+  if (space_op.GetWavePortOp().Size() > 0)
+  {
+    space_op.GetWavePortOp().InitializeModalReference(target);
+  }
 
   // Extend K, C, M operators with interpolated A2 operator.
   // K' = K + A2_0, C' = C + A2_1, M' = M + A2_2
@@ -58,14 +82,87 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   std::unique_ptr<Interpolation> interp_op;
   std::unique_ptr<ComplexOperator> A2_0, A2_1, A2_2;
   NonlinearEigenSolver nonlinear_type = iodata.solver.eigenmode.nonlinear_type;
+  // SLP is only realized through SLEPc's NEP path. Resolve it against the selected backend
+  // here, before the HYBRID interpolation below: an ARPACK backend (or a build without
+  // SLEPc) has no SLP solver, and switching later would leave Kp/Cp/Mp unbuilt and crash.
+  bool slp_available = true;
+#if !defined(PALACE_WITH_SLEPC)
+  slp_available = false;
+#endif
+  if (iodata.solver.eigenmode.type == EigenSolverBackend::ARPACK)
+  {
+    slp_available = false;
+  }
+  if (nonlinear_type == NonlinearEigenSolver::SLP && !slp_available)
+  {
+    Mpi::Warning("SLP nonlinear eigensolver requires the SLEPc backend, using Hybrid!\n");
+    nonlinear_type = NonlinearEigenSolver::HYBRID;
+  }
+  if (nonlinear_type == NonlinearEigenSolver::SLP && !has_A2)
+  {
+    // The SLP nonlinear eigensolver requires a frequency-dependent term A2(λ) (wave ports
+    // or absorbing boundaries). Without one the NEP function/Jacobian shells dereference a
+    // null A2; fall back to the standard linear/quadratic eigensolver instead.
+    Mpi::Warning(
+        "SLP nonlinear eigensolver requires a nonlinear system term (wave ports or "
+        "absorbing boundaries), none found; using a linear eigensolver!\n");
+    nonlinear_type = NonlinearEigenSolver::HYBRID;
+  }
   if (has_A2 && nonlinear_type == NonlinearEigenSolver::HYBRID)
   {
     const double target_max = iodata.solver.eigenmode.target_upper;
-    interp_op = std::make_unique<NewtonInterpolationOperator>(funcA2, A2->Width());
-    interp_op->Interpolate(1i * target, 1i * target_max);
-    A2_0 = interp_op->GetInterpolationOperator(0);
-    A2_1 = interp_op->GetInterpolationOperator(1);
-    A2_2 = interp_op->GetInterpolationOperator(2);
+    auto interp = std::make_unique<NewtonInterpolationOperator>(funcA2, A2->Width());
+    interp->Interpolate(1i * target, 1i * target_max);
+    // Frozen-ABC seed for the NLEPS HYBRID polynomial seed pencil. The 2nd-order farfield
+    // ABC contributes a pole term f(λ)·M_ff to A2(λ), with f(λ) = -0.5/λ, that a
+    // polynomial (K' + λC' + λ²M') seed cannot fit accurately. AddFrozenPole removes the
+    // pole's interpolated contribution and re-adds it frozen at the target into the
+    // K-block. The freeze is deliberately unconditional (no DetermineFrozen): the fit's
+    // pointwise window error is small (the pole at λ = 0 sits outside the window), but its
+    // curvature term injects a fictitious rank-deficient λ² contribution into the seed's
+    // M-block that displaces spurious roots into the unphysical half-plane — the failure
+    // mode is structural, not a pointwise approximation error, so the pointwise metric
+    // must not be allowed to choose the fit here.
+    auto M_ff =
+        space_op.GetFarfieldBoundaryCurlCurlMatrix<ComplexOperator>(Operator::DIAG_ZERO);
+    if (M_ff)
+    {
+      interp->AddFrozenPole(
+          std::move(M_ff), [](std::complex<double> lambda) { return -0.5 / lambda; },
+          1i * target);
+    }
+    // Fit-or-freeze seed for rational impedance boundaries. Each boundary contributes
+    // g(λ)·M_b to A2(λ) with g(λ) = λ·D(λ)/N(λ) = P(λ) + R(λ)/N(λ). The polynomial part
+    // P is exactly representable in the seed pencil when deg(P) <= 2, so only the strictly
+    // proper pole part R/N is a candidate for freezing. We freeze it at the target when
+    // that approximates g over the interpolation window better than the polynomial
+    // interpolant does; otherwise keep the fit.
+    const auto &surf_rz_op = space_op.GetRationalImpedanceOp();
+    for (int idx = 0; idx < surf_rz_op.GetNumBoundaries(); idx++)
+    {
+      const bool proper_split = (surf_rz_op.GetRobinQuotientDegree(idx) <= 2);
+      auto f_full = [&surf_rz_op, idx](std::complex<double> lambda)
+      { return surf_rz_op.EvalRobinCoefficient(idx, lambda); };
+      auto f_frozen = [&surf_rz_op, idx, proper_split](std::complex<double> lambda)
+      {
+        return proper_split ? surf_rz_op.EvalRobinRemainder(idx, lambda)
+                            : surf_rz_op.EvalRobinCoefficient(idx, lambda);
+      };
+      double fit_err, freeze_err;
+      if (interp->DetermineFrozen(f_full, f_frozen, 1i * target, fit_err, freeze_err))
+      {
+        Mpi::Print(" Freezing rational impedance boundary (attribute {}) pole part in the "
+                   "NLEPS seed (fit error {:.2e} > freeze error {:.2e})\n",
+                   fmt::join(surf_rz_op.GetAttrList(idx), ", "), fit_err, freeze_err);
+        auto M_b = space_op.GetRationalImpedanceBoundaryMassMatrix<ComplexOperator>(
+            idx, Operator::DIAG_ZERO);
+        interp->AddFrozenPole(std::move(M_b), f_frozen, 1i * target);
+      }
+    }
+    A2_0 = interp->GetInterpolationOperator(0);
+    A2_1 = interp->GetInterpolationOperator(1);
+    A2_2 = interp->GetInterpolationOperator(2);
+    interp_op = std::move(interp);  // retain: A2_0/A2_1/A2_2 reference its operator DAG
     Kp = BuildParSumOperator({1.0 + 0i, 1.0 + 0i}, {K.get(), A2_0.get()});
     Cp = BuildParSumOperator({1.0 + 0i, 1.0 + 0i}, {C.get(), A2_1.get()});
     Mp = BuildParSumOperator({1.0 + 0i, 1.0 + 0i}, {M.get(), A2_2.get()});
@@ -76,39 +173,15 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
 
   // Configure objects for postprocessing.
   PostOperator<ProblemType::EIGENMODE> post_op(iodata, space_op);
-  ComplexVector E(Curl.Width()), B(Curl.Height());
-  E.UseDevice(true);
+  ComplexVector B(Curl.Height());
   B.UseDevice(true);
 
   // Define and configure the eigensolver to solve the eigenvalue problem:
   //         (K + λ C + λ² M) u = 0    or    K u = -λ² M u
   // with λ = iω. In general, the system matrices are complex and symmetric.
   std::unique_ptr<EigenvalueSolver> eigen;
-  EigenSolverBackend type = iodata.solver.eigenmode.type;
-
-#if defined(PALACE_WITH_ARPACK) && defined(PALACE_WITH_SLEPC)
-  if (type == EigenSolverBackend::DEFAULT)
-  {
-    type = EigenSolverBackend::SLEPC;
-  }
-#elif defined(PALACE_WITH_ARPACK)
-  if (type == EigenSolverBackend::SLEPC)
-  {
-    Mpi::Warning("SLEPc eigensolver not available, using ARPACK!\n");
-  }
-  type = EigenSolverBackend::ARPACK;
-  if (nonlinear_type == NonlinearEigenSolver::SLP)
-  {
-    Mpi::Warning("SLP nonlinear eigensolver not available, using Hybrid!\n");
-  }
-  nonlinear_type = NonlinearEigenSolver::HYBRID;
-#elif defined(PALACE_WITH_SLEPC)
-  if (type == EigenSolverBackend::ARPACK)
-  {
-    Mpi::Warning("ARPACK eigensolver not available, using SLEPc!\n");
-  }
-  type = EigenSolverBackend::SLEPC;
-#else
+  const EigenSolverBackend type = iodata.solver.eigenmode.type;
+#if !defined(PALACE_WITH_ARPACK) && !defined(PALACE_WITH_SLEPC)
 #error "Eigenmode solver requires building with ARPACK or SLEPc!"
 #endif
   if (type == EigenSolverBackend::ARPACK)
@@ -174,8 +247,15 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
                                           : EigenvalueSolver::ScaleType::NONE;
   if (nonlinear_type == NonlinearEigenSolver::SLP)
   {
-    eigen->SetOperators(*K, *C, *M, EigenvalueSolver::ScaleType::NONE);
-    eigen->SetExtraSystemMatrix(funcA2);
+    if (C)
+    {
+      eigen->SetOperators(*K, *C, *M, EigenvalueSolver::ScaleType::NONE);
+    }
+    else
+    {
+      eigen->SetOperators(*K, *M, EigenvalueSolver::ScaleType::NONE);
+    }
+    eigen->SetExtraSystemMatrix(funcA2_full);
     eigen->SetPreconditionerUpdate(funcP);
   }
   else
@@ -276,21 +356,15 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   // closest to the specified target, σ.
   {
     const double f_target =
-        iodata.units.Dimensionalize<Units::ValueType::FREQUENCY>(target) / (2 * M_PI);
+        iodata.units.Dimensionalize<Units::ValueType::FREQUENCY>(target) /
+        (2 * std::numbers::pi);
     Mpi::Print(" Shift-and-invert σ = {:.3e} GHz ({:.3e})\n", f_target, target);
   }
   if (C || has_A2 || nonlinear_type == NonlinearEigenSolver::SLP)
   {
     // Search for eigenvalues closest to λ = iσ.
     eigen->SetShiftInvert(1i * target);
-    if (type == EigenSolverBackend::ARPACK)
-    {
-      // ARPACK searches based on eigenvalues of the transformed problem. The eigenvalue
-      // 1 / (λ - σ) will be a large-magnitude negative imaginary number for an eigenvalue
-      // λ with frequency close to but not below the target σ.
-      eigen->SetWhichEigenpairs(EigenvalueSolver::WhichType::SMALLEST_IMAGINARY);
-    }
-    else if (nonlinear_type == NonlinearEigenSolver::SLP)
+    if (nonlinear_type == NonlinearEigenSolver::SLP)
     {
       eigen->SetWhichEigenpairs(EigenvalueSolver::WhichType::TARGET_MAGNITUDE);
     }
@@ -320,45 +394,31 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   // (K - σ² M) or P(iσ) = (K + iσ C - σ² M) during the eigenvalue solve. The
   // preconditioner for complex linear systems is constructed from a real approximation
   // to the complex system matrix.
-  auto A = space_op.GetSystemMatrix(1.0 + 0.0i, 1i * target, -target * target + 0.0i,
-                                    K.get(), C.get(), M.get(), A2.get());
+  std::unique_ptr<ComplexOperator> A;
+  std::unique_ptr<ComplexOperator> A2_shift;
+  if (has_A2 && nonlinear_type == NonlinearEigenSolver::HYBRID)
+  {
+    // Invert the same W-aware polynomial used by the seed eigensolver.
+    A = space_op.GetSystemMatrix(1.0 + 0.0i, 1i * target, -target * target + 0.0i, Kp.get(),
+                                 Cp.get(), Mp.get());
+  }
+  else
+  {
+    // SLP applies the exact nonlinear operator at the target; linear problems have no A2.
+    A2_shift = (nonlinear_type == NonlinearEigenSolver::SLP) ? funcA2_full(1i * target)
+                                                             : std::move(A2);
+    A = space_op.GetSystemMatrix(1.0 + 0.0i, 1i * target, -target * target + 0.0i, K.get(),
+                                 C.get(), M.get(), A2_shift.get());
+  }
   auto P = space_op.GetPreconditionerMatrix<ComplexOperator>(
-      1.0 + 0.0i, 1i * target, -target * target + 0.0i, target);
+      1.0 + 0.0i, 1i * target, -target * target + 0.0i, target + 0.0i);
   auto ksp = std::make_unique<ComplexKspSolver>(iodata, space_op.GetNDSpaces(),
                                                 &space_op.GetH1Spaces());
   ksp->SetOperators(*A, *P);
   eigen->SetLinearSolver(*ksp);
 
   // Initialize structures for storing and reducing the results of error estimation.
-  const bool is_2d = (space_op.GetNDSpace().Dimension() < 3);
-  std::unique_ptr<TimeDependentFluxErrorEstimator<ComplexVector>> estimator_3d;
-  std::unique_ptr<BoundaryModeFluxErrorEstimator<ComplexVector>> estimator_2d;
-  if (is_2d)
-  {
-    estimator_2d = std::make_unique<BoundaryModeFluxErrorEstimator<ComplexVector>>(
-        space_op.GetMaterialOp(), space_op.GetNDSpaces(), space_op.GetRTSpaces(),
-        space_op.GetCurlSpace(), space_op.GetH1Spaces(), iodata.solver.linear.estimator_tol,
-        iodata.solver.linear.estimator_max_it, 0, iodata.solver.linear.estimator_mg);
-  }
-  else
-  {
-    estimator_3d = std::make_unique<TimeDependentFluxErrorEstimator<ComplexVector>>(
-        space_op.GetMaterialOp(), space_op.GetNDSpaces(), space_op.GetRTSpaces(),
-        iodata.solver.linear.estimator_tol, iodata.solver.linear.estimator_max_it, 0,
-        iodata.solver.linear.estimator_mg);
-  }
-  auto AddEstimate =
-      [&](const ComplexVector &E, const ComplexVector &B, double Et, ErrorIndicator &ind)
-  {
-    if (is_2d)
-    {
-      estimator_2d->AddErrorIndicator(E, B, Et, ind);
-    }
-    else
-    {
-      estimator_3d->AddErrorIndicator(E, B, Et, ind);
-    }
-  };
+  const FluxErrorEstimator<ComplexVector> estimator(space_op, iodata);
   ErrorIndicator indicator;
 
   // Eigenvalue problem solve.
@@ -381,7 +441,7 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
                                                   num_conv, iodata.problem.verbose,
                                                   iodata.solver.eigenmode.refine_nonlinear);
     qn->SetTol(iodata.solver.eigenmode.tol);
-    qn->SetMaxIter(iodata.solver.eigenmode.max_it);
+    qn->SetMaxIter(iodata.solver.eigenmode.nonlinear_max_it);
     if (C)
     {
       qn->SetOperators(*K, *C, *M, EigenvalueSolver::ScaleType::NONE);
@@ -390,7 +450,7 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
     {
       qn->SetOperators(*K, *M, EigenvalueSolver::ScaleType::NONE);
     }
-    qn->SetExtraSystemMatrix(funcA2);
+    qn->SetExtraSystemMatrix(funcA2_full);
     qn->SetPreconditionerUpdate(funcP);
     qn->SetNumModes(iodata.solver.eigenmode.n, iodata.solver.eigenmode.max_size);
     qn->SetPreconditionerLag(iodata.solver.eigenmode.preconditioner_lag,
@@ -411,23 +471,73 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
 
   // Calculate and record the error indicators, and postprocess the results.
   Mpi::Print("\nComputing solution error estimates and performing postprocessing\n");
+  const int num_requested = iodata.solver.eigenmode.n;
+  const int num_report = num_conv;
+  MFEM_VERIFY(num_report >= num_requested, "Eigenmode solve only found "
+                                               << num_report << " modes when "
+                                               << num_requested << " were requested!");
   if (!KM)
   {
-    // Normalize the finalized eigenvectors with respect to mass matrix (unit electric field
-    // energy) even if they are not computed to be orthogonal with respect to it.
+    // Normalize every converged eigenvector with respect to the mass matrix (unit electric
+    // field energy) even if they are not computed to be orthogonal with respect to it.
     KM = space_op.GetInnerProductMatrix(0.0, 1.0, nullptr, M.get());
     eigen->SetBMat(*KM);
-    eigen->RescaleEigenvectors(num_conv);
+    eigen->RescaleEigenvectors(num_report);
+  }
+  std::vector<std::complex<double>> eigenvalues(num_report);
+  std::vector<double> errors_bkwd(num_report), errors_abs(num_report);
+  const bool stage_eigenvectors = post_op.WillWriteFields();
+  // Field output can construct large libCEED visualization operators. Only in that case,
+  // stage the converged eigenvectors in host memory so the eigensolver and matrices can
+  // release their device allocations before postprocessing.
+  std::vector<std::vector<std::complex<double>>> eigenvectors;
+  if (stage_eigenvectors)
+  {
+    eigenvectors.assign(num_report, std::vector<std::complex<double>>(Curl.Width()));
+  }
+  ComplexVector E(Curl.Width());
+  E.UseDevice(true);
+  for (int i = 0; i < num_report; i++)
+  {
+    eigenvalues[i] = eigen->GetEigenvalue(i);
+    errors_bkwd[i] = eigen->GetError(i, EigenvalueSolver::ErrorType::BACKWARD);
+    errors_abs[i] = eigen->GetError(i, EigenvalueSolver::ErrorType::ABSOLUTE);
+    if (stage_eigenvectors)
+    {
+      eigen->GetEigenvector(i, E);
+      E.Get(eigenvectors[i].data(), E.Size(), false);
+    }
+  }
+
+  if (stage_eigenvectors)
+  {
+    eigen.reset();
+    KM.reset();
+    ksp.reset();
+    P.reset();
+    A.reset();
+    divfree.reset();
+    Kp.reset();
+    Cp.reset();
+    Mp.reset();
+    A2_0.reset();
+    A2_1.reset();
+    A2_2.reset();
+    A2.reset();
+    interp_op.reset();
+    K.reset();
+    C.reset();
+    M.reset();
   }
   Mpi::Print("\n");
 
-  for (int i = 0; i < num_conv; i++)
+  for (int i = 0; i < num_report; i++)
   {
     // Get the eigenvalue and relative error.
-    std::complex<double> omega = eigen->GetEigenvalue(i);
-    double error_bkwd = eigen->GetError(i, EigenvalueSolver::ErrorType::BACKWARD);
-    double error_abs = eigen->GetError(i, EigenvalueSolver::ErrorType::ABSOLUTE);
-    if (!C && !has_A2)
+    std::complex<double> omega = eigenvalues[i];
+    double error_bkwd = errors_bkwd[i];
+    double error_abs = errors_abs[i];
+    if (!has_C && !has_A2)
     {
       // Linear EVP has eigenvalue μ = -λ² = ω².
       omega = std::sqrt(omega);
@@ -440,8 +550,14 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
 
     // Compute B = -1/(iω) ∇ x E on the true dofs, and set the internal GridFunctions in
     // PostOperator for all postprocessing operations.
-    eigen->GetEigenvector(i, E);
-
+    if (stage_eigenvectors)
+    {
+      E.Set(eigenvectors[i].data(), E.Size(), false);
+    }
+    else
+    {
+      eigen->GetEigenvector(i, E);
+    }
     linalg::NormalizePhase(space_op.GetComm(), E);
 
     Curl.Mult(E.Real(), B.Real());
@@ -455,24 +571,13 @@ EigenSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
     }
 
     auto total_domain_energy =
-        post_op.MeasureAndPrintAll(i, E, B, omega, error_abs, error_bkwd, num_conv);
-
-    // Calculate and record the error indicators.
-    if (i < iodata.solver.eigenmode.n)
+        post_op.MeasureAndPrintAll(i, E, B, omega, error_abs, error_bkwd, num_report);
+    if (i < num_requested)
     {
-      AddEstimate(E, B, total_domain_energy, indicator);
-    }
-
-    // Final write: Different condition than end of loop (i = num_conv - 1).
-    if (i == iodata.solver.eigenmode.n - 1)
-    {
-      post_op.MeasureFinalize(indicator);
+      estimator.AddErrorIndicator(E, B, total_domain_energy, indicator);
     }
   }
-  MFEM_VERIFY(num_conv >= iodata.solver.eigenmode.n, "Eigenmode solve only found "
-                                                         << num_conv << " modes when "
-                                                         << iodata.solver.eigenmode.n
-                                                         << " were requested!");
+  post_op.MeasureFinalize(indicator);
   return {indicator, space_op.GlobalTrueVSize()};
 }
 

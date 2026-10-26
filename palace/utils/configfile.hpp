@@ -64,8 +64,9 @@ public:
   // Level of printing.
   int verbose = 1;
 
-  // Output path for storing results.
-  std::string output = "";
+  // Output path for storing results. Defaults to "postpro" (relative to the working
+  // directory) when omitted, matching the convention used by the in-tree examples.
+  std::string output = "postpro";
 
   // Output formats configuration.
   OutputFormatsData output_formats = {};
@@ -416,6 +417,44 @@ public:
   ImpedanceData(const json &boundary);
 };
 
+struct RationalImpedanceData
+{
+public:
+  // Rational surface impedance Zs(s) = N(s)/D(s), s = iω, as polynomial coefficient lists
+  // in highest-degree-first order. Roots of N are zeros, roots of D are poles.
+  // SI units: s in [rad/s], Zs in [Ω/sq]; only the ratio N/D is physical.
+  std::vector<double> num = {};  // "Numerator"
+  std::vector<double> den = {};  // "Denominator"
+
+  // List of boundary attributes for this rational impedance boundary condition.
+  std::vector<int> attributes = {};
+
+  RationalImpedanceData() = default;
+  RationalImpedanceData(const json &boundary);
+};
+
+struct SuperconductorData
+{
+public:
+  // London penetration depth λ and film thickness d, in mesh length units. These define the
+  // one-sided finite-thickness kinetic sheet inductance of a superconductor modeled as a 2D
+  // sheet:
+  //     L_ksq = mu0 * lambda * coth(d/lambda)   [H/square]
+  // (reducing to the thin-film limit mu0 * lambda^2 / d for d << lambda).
+  double lambda_L = 0.0;
+  double thickness = 0.0;
+
+  // Kinetic sheet inductance L_ksq [H/sq], specified directly as an alternative to (λ, d).
+  // Exactly one of {(λ, d), Ls} must be provided.
+  double Ls = 0.0;
+
+  // List of boundary attributes for this superconductor sheet.
+  std::vector<int> attributes = {};
+
+  SuperconductorData() = default;
+  SuperconductorData(const json &boundary);
+};
+
 struct LumpedPortData
 {
 public:
@@ -436,6 +475,15 @@ public:
 
   // Flag for boundary damping term in driven and transient simulations.
   bool active = true;
+
+  // Whether this port contributes a port-mode basis vector when adaptive driven circuit
+  // synthesis is enabled (config["Solver"]["Driven"]["AdaptiveCircuitSynthesis"]).
+  // Defaults to true so that, by default, every lumped port appears as a row/column of the
+  // synthesized circuit matrices. Set to false on passive 50 Ohm terminations whose
+  // boundary condition you still want enforced but whose port-port block you do not need
+  // in the output. Excited ports must always be included; the parser will reject
+  // configurations where an excited port has IncludeInSynthesis = false.
+  bool include_in_synthesis = true;
 
   // For each lumped port index, each element contains a list of attributes making up a
   // single element of a potentially multielement lumped port.
@@ -478,6 +526,11 @@ public:
   // Floquet/Bloch wavevector specifying the phase delay in the X/Y/Z directions.
   std::array<double, 3> wave_vector = {0.0, 0.0, 0.0};
 
+  // Reference frequency (GHz) at which wave_vector is defined. When nonzero, k_F scales
+  // linearly with frequency: k_F(f) = wave_vector * (f / reference_freq). When zero
+  // (default), k_F is held constant across all frequencies.
+  double floquet_reference_freq = 0.0;
+
   PeriodicBoundaryData() = default;
   PeriodicBoundaryData(const json &periodic);
 };
@@ -491,6 +544,10 @@ public:
   // Port offset for de-embedding [m].
   double d_offset = 0.0;
 
+  // Target effective index for the boundary mode eigenvalue solver. When zero, the target
+  // lies just above the bulk propagation constants of the port materials.
+  double target = 0.0;
+
   // Eigenvalue solver type for boundary mode calculation.
   EigenSolverBackend eigen_solver = EigenSolverBackend::DEFAULT;
 
@@ -502,6 +559,15 @@ public:
   // Flag for boundary damping term in driven and transient simulations.
   bool active = true;
 
+  // Whether this port contributes a port-mode basis vector when adaptive driven circuit
+  // synthesis is enabled (config["Solver"]["Driven"]["AdaptiveCircuitSynthesis"]).
+  // Defaults to true so that, by default, every wave port appears as a row/column of the
+  // synthesized circuit matrices. Set to false on passive terminations whose boundary
+  // condition you still want enforced but whose port-port block you do not need in the
+  // output. Excited ports must always be included; the parser will reject configurations
+  // where an excited port has IncludeInSynthesis = false.
+  bool include_in_synthesis = true;
+
   // List of boundary attributes for this wave port.
   std::vector<int> attributes = {};
 
@@ -510,6 +576,11 @@ public:
 
   // Tolerance for linear solver.
   double ksp_tol = 1e-8;
+
+  // Optional override for exact doubled-real factorization in the wave-port mode solve.
+  // When unset, inherit Solver.Linear.ComplexCoarseSolve and Solver.Linear.PCMatReal. An
+  // explicit value takes precedence over both for this port.
+  std::optional<bool> complex_coarse_solve = std::nullopt;
 
   // Tolerance for eigenvalue solver.
   double eig_tol = 1e-6;
@@ -525,16 +596,72 @@ public:
   std::vector<std::vector<double>> voltage_path = {};
   int n_samples = 100;
 
+  // Optional pair of parent-mesh boundary attributes [high, low] (signal terminal first,
+  // ground terminal second) used solely to fix the mode polarity (no GSLIB / no Z_PV).
+  // The mode is flipped if needed so that the modal E-field on the port face points from
+  // the high-attribute (signal) terminal toward the low-attribute (ground) terminal,
+  // matching the lumped-port `Direction` convention and the VoltagePath ordering. A
+  // lightweight alternative to VoltagePath when only polarity is needed.
+  std::array<int, 2> polarity_attributes = {0, 0};
+
   WavePortData() = default;
   WavePortData(const json &port);
+};
+
+struct FloquetPortData
+{
+public:
+  // Input excitation for driven solver:
+  // - 1-based index if excited; 0 if not excited.
+  int excitation = 0;
+
+  // List of boundary attributes for this Floquet port.
+  std::vector<int> attributes = {};
+
+  // Incident mode polarization: "TE", "TM", "RHC" (right-hand circular),
+  // or "LHC" (left-hand circular).
+  std::string inc_polarization = "TE";
+
+  // Maximum diffraction order index to include. -1 = auto from geometry + frequency.
+  int max_order = -1;
+
+  FloquetPortData() = default;
+  FloquetPortData(const json &port);
+};
+
+struct SurfaceCurrentApertureData
+{
+public:
+  // List of boundary attributes tiling the surface spanning this current element's loop.
+  std::vector<int> attributes = {};
+
+  // Cartesian reference direction defining the aperture's positive oriented normal.
+  std::array<double, 3> direction{{0.0, 0.0, 0.0}};
+
+  SurfaceCurrentApertureData() = default;
+  SurfaceCurrentApertureData(const json &aperture);
+};
+
+struct SurfaceCurrentElementData : internal::ElementData
+{
+public:
+  // The aperture is omitted for pure surface-current simulations and required for every
+  // element when surface-current and flux-loop excitations are combined.
+  std::optional<SurfaceCurrentApertureData> aperture = std::nullopt;
 };
 
 struct SurfaceCurrentData
 {
 public:
-  // For each surface current source index, each element contains a list of attributes
-  // making up a single element of a potentially multielement current source.
-  std::vector<internal::ElementData> elements = {};
+  // For each surface current source index, each element contains its source geometry and,
+  // when needed, the oriented aperture conjugate to that element's share of the port
+  // current.
+  std::vector<SurfaceCurrentElementData> elements = {};
+
+  // Per-port override for how this port is treated when inactive during a magnetostatic
+  // inductance sweep. If unset, the global `/Solver/Magnetostatic/InactivePorts` value is
+  // used.
+  std::optional<InactivePortMode> inactive_port_mode = std::nullopt;
 
   SurfaceCurrentData() = default;
   SurfaceCurrentData(const json &source);
@@ -685,6 +812,29 @@ public:
   BoundaryPostData(const json &postpro);
 };
 
+struct FluxLoopData
+{
+public:
+  // List of boundary attributes for the metal surface.
+  std::vector<int> film_attributes = {};
+
+  // List of boundary attributes for holes (one per hole).
+  std::vector<int> hole_attributes = {};
+
+  // Flux amounts for each hole (same size as hole_attributes).
+  std::vector<double> flux_amounts = {};
+
+  // Direction vector for flux orientation.
+  std::array<double, 3> direction = {0.0, 0.0, 1.0};
+
+  // Effective λ⊥ [mesh units] for a film listed in FilmAttributes but not declared a
+  // Superconductor: models it as the λ→0 London limit (auto-registered SC sheet).
+  double pec_lperp = 1.0e-4;
+
+  FluxLoopData() = default;
+  FluxLoopData(const json &fluxloop);
+};
+
 struct BoundaryData
 {
 public:
@@ -701,11 +851,15 @@ public:
   FarfieldBoundaryData farfield = {};
   std::vector<ConductivityData> conductivity = {};
   std::vector<ImpedanceData> impedance = {};
+  std::vector<RationalImpedanceData> rational_impedance = {};
+  std::vector<SuperconductorData> superconductor = {};
   std::map<int, LumpedPortData> lumpedport = {};
   std::map<int, TerminalData> terminal = {};
   std::map<int, WavePortData> waveport = {};
+  std::map<int, FloquetPortData> floquetport = {};
   std::map<int, SurfaceCurrentData> current = {};
   PeriodicBoundaryData periodic = {};
+  std::map<int, FluxLoopData> fluxloop = {};
   BoundaryPostData postpro = {};
 
   BoundaryData() = default;
@@ -763,7 +917,8 @@ public:
   // Eigenvalue solver relative tolerance.
   double tol = 1.0e-6;
 
-  // Maximum iterations for eigenvalue solver.
+  // Maximum iterations for eigenvalue solver (for nonlinear problems, the linear or
+  // quadratic eigenvalue solver of the hybrid approach, or the SLP solver).
   int max_it = -1;
 
   // Eigenvalue solver subspace dimension or maximum dimension before restart.
@@ -818,6 +973,10 @@ public:
   // nonlinear eigenvalue solver.
   int max_restart = 2;
 
+  // Maximum number of iterations of each attempt to converge an eigenpair in the
+  // quasi-Newton nonlinear eigenvalue solver.
+  int nonlinear_max_it = 100;
+
   EigenSolverData() = default;
   EigenSolverData(const json &eigenmode);
 };
@@ -837,6 +996,9 @@ struct MagnetostaticSolverData
 public:
   // Number of fields to write to disk.
   int n_post = 0;
+
+  // Boundary condition applied to inactive surface current ports during sweeps.
+  InactivePortMode inactive_port_mode = InactivePortMode::DEFAULT;
 
   MagnetostaticSolverData() = default;
   MagnetostaticSolverData(const json &magnetostatic);
@@ -925,6 +1087,9 @@ public:
   // Iterative solver relative tolerance.
   double tol = 1.0e-6;
 
+  // Absolute tolerance (0.0 = disabled).
+  double abs_tol = 0.0;
+
   // Maximum iterations for iterative solver.
   int max_it = 100;
 
@@ -976,10 +1141,6 @@ public:
   // (makes the preconditioner matrix SPD).
   int pc_mat_shifted = -1;
 
-  // Matrix symmetry type for sparse direct solvers (computed from problem type and
-  // boundary conditions).
-  MatrixSymmetry pc_mat_sym = MatrixSymmetry::UNSYMMETRIC;
-
   // For frequency domain applications, use the complex-valued system matrix in the sparse
   // direct solver.
   bool complex_coarse_solve = false;
@@ -1015,6 +1176,13 @@ public:
   // Option to tell the AMS solver that the operator is singular, like for magnetostatic
   // problems.
   int ams_singular_op = -1;
+
+  // Preconditioner-only gauge shift for the London magnetostatic operator: adds
+  // london_pc_shift · (1/µ) ∫|A|² to the preconditioner matrix only (operator, solution and
+  // extracted inductance unchanged) to lift the shifted-penalty operator's residual
+  // gradient null space so AMS is SPD-solvable in parallel. Ignored when no London sheet is
+  // present.
+  double london_pc_shift = 1.0e-1;
 
   // Option to use aggressive coarsening for Hypre AMG solves (with BoomerAMG or AMS).
   // Typically use this when the operator is positive definite.
@@ -1082,8 +1250,8 @@ public:
   SolverData(const json &solver);
 };
 
-// Calculate the number of steps from [start, end) in increments of delta. Will only include
-// end if it is a multiple of delta beyond start.
+// Calculate the number of steps from [start, end) in increments of delta > 0, for end >=
+// start. Will only include end if it is a multiple of delta beyond start.
 int GetNumSteps(double start, double end, double delta);
 
 // Parse a string as a direction vector, returning the direction and coordinate system.
@@ -1113,6 +1281,7 @@ void Nondimensionalize(const Units &units, ProbeData &data);
 void Nondimensionalize(const Units &units, CurrentDipoleData &data);
 void Nondimensionalize(const Units &units, ConductivityData &data);
 void Nondimensionalize(const Units &units, ImpedanceData &data);
+void Nondimensionalize(const Units &units, SuperconductorData &data);
 void Nondimensionalize(const Units &units, LumpedPortData &data);
 void Nondimensionalize(const Units &units, PeriodicBoundaryData &data);
 void Nondimensionalize(const Units &units, WavePortData &data);
@@ -1121,6 +1290,7 @@ void Nondimensionalize(const Units &units, InterfaceDielectricData &data);
 void Nondimensionalize(const Units &units, EigenSolverData &data);
 void Nondimensionalize(const Units &units, DrivenSolverData &data);
 void Nondimensionalize(const Units &units, TransientSolverData &data);
+void Nondimensionalize(const Units &units, RationalImpedanceData &data);
 
 }  // namespace palace::config
 

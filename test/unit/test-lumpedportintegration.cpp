@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <numbers>
 #include <Eigen/Dense>
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -28,6 +29,10 @@ using namespace Catch::Matchers;
 class LumpedPortDataTest : public LumpedPortData
 {
 public:
+  void InitializeLinearFormsForTest(mfem::ParFiniteElementSpace &nd_fespace) const
+  {
+    InitializeLinearForms(nd_fespace);
+  }
   mfem::LinearForm *GetLinearFormS() const { return s.get(); }
   mfem::LinearForm *GetLinearFormV() const { return v.get(); }
 };
@@ -52,6 +57,92 @@ auto LoadScaleParMesh(IoData &iodata, MPI_Comm world_comm)
     }
   }
   return mesh_;
+}
+
+TEST_CASE("LumpedPort batched voltages", "[lumped_port][Serial][Parallel][GPU]")
+{
+  MPI_Comm comm = Mpi::World();
+  auto [mesh_is_hex, mesh_path] =
+      GENERATE(std::make_tuple(true, fs::path(PALACE_TEST_DATA_DIR) /
+                                         "lumpedport_mesh/cube_mesh_3_2_1_hex.msh"),
+               std::make_tuple(false, fs::path(PALACE_TEST_DATA_DIR) /
+                                          "lumpedport_mesh/cube_mesh_3_2_1_tet.msh"));
+  auto order = GENERATE(1, 2);
+  CAPTURE(mesh_is_hex, order);
+
+  IoData iodata{Units(1.0e-6, 7.0)};
+  iodata.model.mesh = mesh_path;
+  iodata.model.L0 = 1.0e-6;
+  iodata.model.Lc = 7.0;
+  iodata.model.crack_bdr_elements = false;
+  iodata.solver.order = order;
+  json domains_json = {
+      {"Materials",
+       json::array({json::object({{"Attributes", json::array({1, 2, 3, 4, 5, 6})},
+                                  {"Permeability", 1.0},
+                                  {"Permittivity", 1.0},
+                                  {"LossTan", 0.0}})})}};
+  iodata.domains = config::DomainData(domains_json);
+  json boundaries_json = {
+      {"LumpedPort",
+       json::array(
+           {json::object({{"Index", 1},
+                          {"R", 50.0},
+                          {"Excitation", uint(1)},
+                          {"Attributes", json::array({1})},
+                          {"Direction", "+Y"}}),
+            json::object(
+                {{"Index", 2},
+                 {"R", 75.0},
+                 {"Elements",
+                  json::array({json::object({{"Attributes", json::array({9, 11})},
+                                             {"Direction", "+Y"}}),
+                               json::object({{"Attributes", json::array({2, 6, 10})},
+                                             {"Direction", "+X"}})})}})})}};
+  iodata.boundaries = config::BoundaryData(boundaries_json);
+  iodata.CheckConfiguration();
+
+  auto mesh = LoadScaleParMesh(iodata, comm);
+  SpaceOperator space_op(iodata, mesh);
+  GridFunction E(space_op.GetNDSpace(), true);
+  mfem::VectorFunctionCoefficient Er(3,
+                                     [](const mfem::Vector &x, mfem::Vector &v)
+                                     {
+                                       v(0) = 1.0 + x(1);
+                                       v(1) = 0.5 + 2.0 * x(0);
+                                       v(2) = x(0) - x(1);
+                                     });
+  mfem::VectorFunctionCoefficient Ei(3,
+                                     [](const mfem::Vector &x, mfem::Vector &v)
+                                     {
+                                       v(0) = x(0) + x(2);
+                                       v(1) = 1.0 - x(1);
+                                       v(2) = 0.25 + x(0) * x(1);
+                                     });
+  E.Real().ProjectCoefficient(Er);
+  E.Imag().ProjectCoefficient(Ei);
+
+  auto CheckBatched = [&]()
+  {
+    std::map<int, std::complex<double>> expected;
+    for (const auto &[idx, data] : space_op.GetLumpedPortOp())
+    {
+      expected.emplace(idx, data.GetVoltage(E));
+    }
+    const auto values = space_op.GetLumpedPortOp().GetVoltages(E);
+    REQUIRE(values.size() == expected.size());
+    for (const auto &[idx, ref] : expected)
+    {
+      CAPTURE(idx, ref.real(), ref.imag(), values.at(idx).real(), values.at(idx).imag());
+      const double tol = 1.0e-11 * std::max(std::abs(ref), 1.0);
+      CHECK_THAT(values.at(idx).real(), WithinAbs(ref.real(), tol));
+      CHECK_THAT(values.at(idx).imag(), WithinAbs(ref.imag(), tol));
+    }
+  };
+
+  CheckBatched();
+  E *= 1.75;
+  CheckBatched();
 }
 
 TEST_CASE("LumpedPort_BasicTests_1ElementPort_Cube321", "[lumped_port][Serial][Parallel]")
@@ -241,7 +332,7 @@ TEST_CASE("LumpedPort_BasicTests_1ElementPort_Cube321", "[lumped_port][Serial][P
   // reference impedance is 1.0 in internal units, so that it is Z_0 in physical units.
   ComplexVector port_primary_ht_cn;
   port_primary_ht_cn.UseDevice(true);
-  space_op.GetLumpedPortExcitationVectorPrimaryHtcn(1, port_primary_ht_cn, true);
+  space_op.GetLumpedPortExcitationVectorPrimaryHtcn(1, port_primary_ht_cn);
   // As palace GridFunction: Undo restriction
   GridFunction port_primary_gf_ht_cn(space_op.GetNDSpace());
   port_primary_gf_ht_cn = 0.0;
@@ -249,7 +340,7 @@ TEST_CASE("LumpedPort_BasicTests_1ElementPort_Cube321", "[lumped_port][Serial][P
 
   ComplexVector port_primary_et;
   port_primary_et.UseDevice(true);
-  space_op.GetLumpedPortExcitationVectorPrimaryEt(1, port_primary_et, true);
+  space_op.GetLumpedPortExcitationVectorPrimaryEt(1, port_primary_et);
   GridFunction port_primary_gf_et(space_op.GetNDSpace());
   port_primary_gf_et = 0.0;
   port_primary_gf_et.Real().SetFromTrueDofs(port_primary_et.Real());
@@ -375,6 +466,7 @@ TEST_CASE("LumpedPort_BasicTests_1ElementPort_Cube321", "[lumped_port][Serial][P
   // layout Test structure from original structure. Done not to populate code with friend
   // functions, but still access private members for testing.
   const auto &port_1_test_cast = reinterpret_cast<const LumpedPortDataTest &>(port_1);
+  port_1_test_cast.InitializeLinearFormsForTest(space_op.GetNDSpace().Get());
   auto *form_s = port_1_test_cast.GetLinearFormS();
   ComplexVector VecFormS;
   VecFormS.SetSize(space_op.GetNDSpace().GetTrueVSize());
@@ -412,7 +504,7 @@ TEST_CASE("LumpedPort_BasicTests_1ElementPort_Cube321", "[lumped_port][Serial][P
     // dofs if PEC is at the end of the port.
     if (boundary_pec_type == PEC::SIDE || (!mesh_is_hex && boundary_pec_type == PEC::ENDS))
     {
-      const auto *find_pec = std::find(nd_dbc_tdof.begin(), nd_dbc_tdof.end(), i);
+      const auto *find_pec = std::ranges::find(nd_dbc_tdof, i);
       if (find_pec != nd_dbc_tdof.end())
       {
         CHECK(RHS.Real()[i] == 0.0);
@@ -592,13 +684,13 @@ TEST_CASE("LumpedPort_BasicTests_3ElementPort_Cube321", "[lumped_port][Serial][P
   // tangential. Field normalization in GetLumpedPortExcitationVectorPrimaryHt is such that
   // reference impedance is 1.0 in internal units, so that it is Z_0 in physical units.
   ComplexVector port_primary_ht_cn;
-  space_op.GetLumpedPortExcitationVectorPrimaryHtcn(1, port_primary_ht_cn, true);
+  space_op.GetLumpedPortExcitationVectorPrimaryHtcn(1, port_primary_ht_cn);
   GridFunction port_primary_gf_ht_cn(space_op.GetNDSpace());  // As palace GridFunction
   port_primary_gf_ht_cn = 0.0;
   port_primary_gf_ht_cn.Real().SetFromTrueDofs(port_primary_ht_cn.Real());
 
   ComplexVector port_primary_et;
-  space_op.GetLumpedPortExcitationVectorPrimaryEt(1, port_primary_et, true);
+  space_op.GetLumpedPortExcitationVectorPrimaryEt(1, port_primary_et);
   GridFunction port_primary_gf_et(space_op.GetNDSpace());  // As palace GridFunction
   port_primary_gf_et = 0.0;
   port_primary_gf_et.Real().SetFromTrueDofs(port_primary_et.Real());
@@ -728,6 +820,7 @@ TEST_CASE("LumpedPort_BasicTests_3ElementPort_Cube321", "[lumped_port][Serial][P
   // layout Test structure from original structure. Done not to populate code with friend
   // functions, but still access private members for testing.
   const auto &port_1_test_cast = reinterpret_cast<const LumpedPortDataTest &>(port_1);
+  port_1_test_cast.InitializeLinearFormsForTest(space_op.GetNDSpace().Get());
   auto *form_s = port_1_test_cast.GetLinearFormS();
   ComplexVector VecFormS;
   VecFormS.SetSize(space_op.GetNDSpace().GetTrueVSize());
@@ -763,7 +856,7 @@ TEST_CASE("LumpedPort_BasicTests_3ElementPort_Cube321", "[lumped_port][Serial][P
     // dofs if PEC is at the end of the port.
     if (boundary_pec_type == PEC::SIDE || (!mesh_is_hex && boundary_pec_type == PEC::ENDS))
     {
-      const auto *find_pec = std::find(nd_dbc_tdof.begin(), nd_dbc_tdof.end(), i);
+      const auto *find_pec = std::ranges::find(nd_dbc_tdof, i);
       if (find_pec != nd_dbc_tdof.end())
       {
         CHECK(RHS.Real()[i] == 0.0);
@@ -784,4 +877,139 @@ TEST_CASE("LumpedPort_BasicTests_3ElementPort_Cube321", "[lumped_port][Serial][P
                              iodata.units.Nondimensionalize<VT::VOLTAGE>(std::sqrt(50.)),
                          1e-12));
   }
+}
+
+TEST_CASE("LumpedPort_ReactiveExcitation_Cube321", "[lumped_port][Serial][Parallel]")
+{
+  // Exercise a reactive EXCITED lumped port — a port driven through a lumped inductor /
+  // capacitor (e.g. a Josephson-junction port). Historically an excited port had to be
+  // purely resistive; it may now carry reactance (including a purely reactive R = 0 port).
+  // The reactance enters the system matrix as a physical termination; the incident-drive
+  // normalization references a real resistance (the port R, or the unit internal reference
+  // when R = 0) so a purely reactive drive does not divide by zero. This test verifies:
+  //   (1) a reactive excited port constructs without tripping the guardrail,
+  //   (2) GetExcitationRefResistance() returns R when R > 0, else the unit reference,
+  //   (3) GetCharacteristicImpedance() returns the correct complex Z_ref(w) =
+  //   R||iwL||1/iwC, (4) the excitation RHS is finite (no NaN/Inf) for a purely reactive R
+  //   = 0 drive.
+  using VT = palace::Units::ValueType;
+  MPI_Comm world_comm = Mpi::World();
+
+  const auto &[case_R, case_L, case_C] =
+      GENERATE(std::make_tuple(50.0, 1.0e-9, 0.0),   // R + L (well-defined S)
+               std::make_tuple(0.0, 1.0e-9, 0.0),    // pure inductor (R = 0)
+               std::make_tuple(0.0, 0.0, 1.0e-12));  // pure capacitor (R = 0)
+
+  double L0 = 1.0e-6;
+  double Lc = 7.0;
+  IoData iodata{Units(L0, Lc)};
+  iodata.model.mesh =
+      fs::path(PALACE_TEST_DATA_DIR) / "lumpedport_mesh/cube_mesh_3_2_1_hex.msh";
+  iodata.model.L0 = L0;
+  iodata.model.Lc = Lc;
+  iodata.model.crack_bdr_elements = false;
+  iodata.solver.order = 2;
+
+  json domains_json = {
+      {"Materials",
+       json::array({json::object({{"Attributes", json::array({1, 2, 3, 4, 5, 6})},
+                                  {"Permeability", 1.0},
+                                  {"Permittivity", 1.0},
+                                  {"LossTan", 0.0}})})}};
+  iodata.domains = config::DomainData(domains_json);
+
+  // Build the excited reactive port. Only include nonzero circuit elements.
+  json port = {{"Index", 1},
+               {"Excitation", uint(1)},
+               {"Attributes", json::array({1})},
+               {"Direction", "+Y"}};
+  if (case_R > 0.0)
+  {
+    port["R"] = case_R;
+  }
+  if (case_L > 0.0)
+  {
+    port["L"] = case_L;
+  }
+  if (case_C > 0.0)
+  {
+    port["C"] = case_C;
+  }
+  json boundary_json = {{"LumpedPort", json::array({port})}};
+  // (1) Construction must succeed — the R >= 0 guardrail admits reactance.
+  iodata.boundaries = config::BoundaryData(boundary_json);
+  iodata.CheckConfiguration();
+
+  auto mesh_io = LoadScaleParMesh(iodata, world_comm);
+  SpaceOperator space_op(iodata, mesh_io);
+  const auto &port_1 = space_op.GetLumpedPortOp().GetPort(1);
+
+  CHECK(port_1.HasExcitation());
+
+  // (2) Reference resistance: R when R > 0, else the unit internal reference (= 1 in
+  // internal units, i.e. Z_freespace dimensionally).
+  const double R_nondim = iodata.units.Nondimensionalize<VT::IMPEDANCE>(case_R);
+  if (case_R > 0.0)
+  {
+    CHECK_THAT(port_1.GetExcitationRefResistance(), WithinRel(R_nondim));
+  }
+  else
+  {
+    CHECK_THAT(port_1.GetExcitationRefResistance(), WithinRel(1.0));
+  }
+
+  // (3) Characteristic impedance Z_ref(w) = 1 / (1/R + 1/(iwL) + iwC). Check against a
+  // direct evaluation at a representative (nondimensional) frequency.
+  const double f_GHz = 10.0;
+  const double omega =
+      2.0 * std::numbers::pi * iodata.units.Nondimensionalize<VT::FREQUENCY>(f_GHz);
+  const std::complex<double> imag_unit{0.0, 1.0};
+  std::complex<double> Y = 0.0;
+  if (case_R > 0.0)
+  {
+    Y += 1.0 / R_nondim;
+  }
+  if (case_L > 0.0)
+  {
+    Y += 1.0 / (imag_unit * omega * iodata.units.Nondimensionalize<VT::INDUCTANCE>(case_L));
+  }
+  if (case_C > 0.0)
+  {
+    Y += imag_unit * omega * iodata.units.Nondimensionalize<VT::CAPACITANCE>(case_C);
+  }
+  const std::complex<double> Z_expect = 1.0 / Y;
+  const std::complex<double> Z_ref =
+      port_1.GetCharacteristicImpedance(omega, LumpedPortData::Branch::TOTAL);
+  CHECK_THAT(std::abs(Z_ref - Z_expect), WithinAbs(0.0, 1e-9 * std::abs(Z_expect)));
+
+  // (4) The excitation RHS must be finite even for a purely reactive R = 0 drive (the key
+  // fix: the incident-field normalization references GetExcitationRefResistance(), not R,
+  // so it does not divide by zero).
+  ComplexVector RHS;
+  space_op.GetExcitationVector1(1, RHS);
+  double max_abs = 0.0;
+  for (int i = 0; i < RHS.Real().Size(); i++)
+  {
+    CHECK(std::isfinite(RHS.Real()[i]));
+    max_abs = std::max(max_abs, std::abs(RHS.Real()[i]));
+  }
+  Mpi::GlobalMax(1, &max_abs, world_comm);
+  // The drive is nonzero (a genuine incident field was assembled).
+  CHECK(max_abs > 0.0);
+
+  // (5) Output paths reference the same real resistance. GetExcitationVoltage() must be
+  // finite and nonzero for R = 0 (it references GetExcitationRefResistance(), not R), and
+  // the S-parameter projection linear form must produce a finite, nonzero projection for
+  // a nonzero field (its normalization also references the real reference resistance).
+  const double V_inc = port_1.GetExcitationVoltage();
+  CHECK(std::isfinite(V_inc));
+  CHECK(V_inc > 0.0);
+
+  GridFunction E_test(space_op.GetNDSpace(), true);
+  E_test.Real() = 1.0;  // Uniform nonzero field: projection onto the port mode is nonzero
+  E_test.Imag() = 0.0;
+  const std::complex<double> S_proj = port_1.GetSParameter(E_test);
+  CHECK(std::isfinite(S_proj.real()));
+  CHECK(std::isfinite(S_proj.imag()));
+  CHECK(std::abs(S_proj) > 0.0);
 }

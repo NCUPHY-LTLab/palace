@@ -486,14 +486,21 @@ public:
   using SlepcEigenvalueSolver::sinvert;
 
   // Operators for the nonlinear eigenvalue problem.
-  std::unique_ptr<ComplexOperator> opA2, opA2p, opJ, opA, opAJ, opA2_pc, opA_pc, opP_pc;
+  // Function and Jacobian shell matrices must retain independent A2 owners: SLEPc may
+  // apply either shell after invoking the other callback. The top-level opA/opJ sums hold
+  // non-owning references to these subordinate operators.
+  std::unique_ptr<ComplexOperator> opA2, opA;                   // Function T(λ)
+  std::unique_ptr<ComplexOperator> opA2_jac, opA2p, opAJ, opJ;  // Jacobian T′(λ)
+  std::unique_ptr<ComplexOperator> opA2_pc, opA_pc, opP_pc;     // Preconditioner
 
   // Function to compute the A2 operator.
-  std::optional<std::function<std::unique_ptr<ComplexOperator>(double)>> funcA2;
+  std::optional<std::function<std::unique_ptr<ComplexOperator>(std::complex<double>)>>
+      funcA2;
 
   // Function to compute the preconditioner matrix.
   std::optional<std::function<std::unique_ptr<ComplexOperator>(
-      std::complex<double>, std::complex<double>, std::complex<double>, double)>>
+      std::complex<double>, std::complex<double>, std::complex<double>,
+      std::complex<double>)>>
       funcP;
 
   // Eigenvalue estimate at current iteration.
@@ -527,12 +534,12 @@ public:
 
   // Set the frequency-dependent A2 matrix function.
   void SetExtraSystemMatrix(
-      std::function<std::unique_ptr<ComplexOperator>(double)>) override;
+      std::function<std::unique_ptr<ComplexOperator>(std::complex<double>)>) override;
 
   // Set the preconditioner update function.
   void SetPreconditionerUpdate(std::function<std::unique_ptr<ComplexOperator>(
                                    std::complex<double>, std::complex<double>,
-                                   std::complex<double>, double)>) override;
+                                   std::complex<double>, std::complex<double>)>) override;
 };
 
 }  // namespace slepc

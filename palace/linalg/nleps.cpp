@@ -175,14 +175,15 @@ void QuasiNewtonSolver::SetMaxRestart(int max_num_restart)
 }
 
 void QuasiNewtonSolver::SetExtraSystemMatrix(
-    std::function<std::unique_ptr<ComplexOperator>(double)> A2)
+    std::function<std::unique_ptr<ComplexOperator>(std::complex<double>)> A2)
 {
   funcA2 = A2;
 }
 
 void QuasiNewtonSolver::SetPreconditionerUpdate(
-    std::function<std::unique_ptr<ComplexOperator>(
-        std::complex<double>, std::complex<double>, std::complex<double>, double)>
+    std::function<
+        std::unique_ptr<ComplexOperator>(std::complex<double>, std::complex<double>,
+                                         std::complex<double>, std::complex<double>)>
         P)
 {
   funcP = P;
@@ -286,28 +287,20 @@ void QuasiNewtonSolver::SetInitialGuess()
   std::iota(indices.begin(), indices.end(), 0);
   if (nev_linear > nev)
   {
-    double min_error = res.get()[0];
-    for (int i = 0; i < nev_linear; i++)
-    {
-      min_error = std::min(min_error, res.get()[i]);
-    }
+    const double min_error = *std::min_element(res.get(), res.get() + nev_linear);
     const double threshold = 100.0 * min_error;
-    std::sort(indices.begin(), indices.end(),
-              [&](const auto i, const auto j)
-              {
-                if (res.get()[i] < threshold && res.get()[j] > threshold)
-                {
-                  return true;
-                }
-                else if (res.get()[i] > threshold && res.get()[j] < threshold)
-                {
-                  return false;
-                }
-                else
-                {
-                  return eigenvalues[i].imag() < eigenvalues[j].imag();
-                }
-              });
+    // One partition key keeps a strict weak ordering when residuals equal the threshold.
+    std::ranges::sort(indices,
+                      [&](const auto i, const auto j)
+                      {
+                        const bool i_small = res.get()[i] <= threshold;
+                        const bool j_small = res.get()[j] <= threshold;
+                        if (i_small != j_small)
+                        {
+                          return i_small;
+                        }
+                        return eigenvalues[i].imag() < eigenvalues[j].imag();
+                      });
   }
   for (int i = 0; i < nev_linear; i++)
   {
@@ -454,10 +447,16 @@ int QuasiNewtonSolver::Solve()
       eig = sigma;
       if (num_init_guess < 3)
       {
-        // Set purely random vector.
+        // Set purely random vector, zeroing the essential-BC true dofs. On a
+        // partitioned mesh GetEssentialTrueDofs() returns nullptr on ranks whose
+        // local partition owns no essential (Dirichlet/PEC) dofs, in which case
+        // there is nothing to zero on this rank.
         linalg::SetRandom(GetComm(), v);
-        linalg::SetSubVector(
-            v, *dynamic_cast<const ComplexParOperator *>(opK)->GetEssentialTrueDofs(), 0.0);
+        if (const auto *ess_tdof_list =
+                dynamic_cast<const ComplexParOperator *>(opK)->GetEssentialTrueDofs())
+        {
+          linalg::SetSubVector(v, *ess_tdof_list, 0.0);
+        }
       }
       else
       {
@@ -494,10 +493,10 @@ int QuasiNewtonSolver::Solve()
     v2 *= 1.0 / norm_v;
 
     // Set the linear solver operators.
-    opA2 = (*funcA2)(std::abs(eig.imag()));
-    opA = BuildParSumOperator({1.0 + 0.0i, eig, eig * eig, 1.0 + 0.0i},
-                              {opK, opC, opM, opA2.get()}, true);
-    opP = (*funcP)(1.0 + 0.0i, eig, eig * eig, eig.imag());
+    opA2 = (*funcA2)(eig);
+    opA = BuildOperatorWithA2({1.0 + 0.0i, eig, eig * eig}, {opK, opC, opM}, opA2.get());
+    opP = (*funcP)(1.0 + 0.0i, eig, eig * eig,
+                   eig / std::complex<double>(0.0, 1.0));  // ω = λ/i
     opInv->SetOperators(*opA, *opP);
     opInv->SetAbsTol(1.0e-12);
 
@@ -553,9 +552,9 @@ int QuasiNewtonSolver::Solve()
                                  Eigen::VectorXcd &rr2,
                                  std::unique_ptr<ComplexOperator> &A2_out) -> double
     {
-      A2_out = (*funcA2)(std::abs(lam.imag()));
-      auto A = BuildParSumOperator({1.0 + 0.0i, lam, lam * lam, 1.0 + 0.0i},
-                                   {opK, opC, opM, A2_out.get()}, true);
+      A2_out = (*funcA2)(lam);
+      auto A =
+          BuildOperatorWithA2({1.0 + 0.0i, lam, lam * lam}, {opK, opC, opM}, A2_out.get());
       A->Mult(vv, rr);
       if (k > 0)
       {
@@ -646,21 +645,22 @@ int QuasiNewtonSolver::Solve()
         break;
       }
 
-      // Compute w = J * v.
-      auto opA2p = (*funcA2)(std::abs(eig.imag()) * (1.0 + delta));
-      const std::complex<double> denom =
-          std::complex<double>(0.0, delta * std::abs(eig.imag()));
-      std::unique_ptr<ComplexOperator> opAJ =
-          BuildParSumOperator({1.0 / denom, -1.0 / denom}, {opA2p.get(), A2n.get()}, true);
-      auto opJ = BuildParSumOperator({0.0 + 0.0i, 1.0 + 0.0i, 2.0 * eig, 1.0 + 0.0i},
-                                     {opK, opC, opM, opAJ.get()}, true);
+      // Compute w = J * v. The A2 finite difference is a matrix-free sum (each A2 may
+      // itself be a matrix-free SumComplexOperator carrying the wave-port correction).
+      auto opA2p = (*funcA2)(eig * (1.0 + delta));
+      const std::complex<double> denom = delta * eig;
+      auto opAJ = std::make_unique<SumComplexOperator>(opA2p->Height(), opA2p->Width());
+      opAJ->AddOperator(*opA2p, 1.0 / denom);
+      opAJ->AddOperator(*A2n, -1.0 / denom);
+      auto opJ = BuildOperatorWithA2({0.0 + 0.0i, 1.0 + 0.0i, 2.0 * eig}, {opK, opC, opM},
+                                     opAJ.get());
       opJ->Mult(v, w);
       if (k > 0)  // Deflation
       {
         // w1 = T'(l) v1 + U'(l) v2 = T'(l) v1 + T'(l)XS v2 - T(l)XS^2 v2. Scoping T(l)
         // here lets the line search overwrite A2n freely; with no deflation we skip it.
-        auto A = BuildParSumOperator({1.0 + 0.0i, eig, eig * eig, 1.0 + 0.0i},
-                                     {opK, opC, opM, A2n.get()}, true);
+        auto A =
+            BuildOperatorWithA2({1.0 + 0.0i, eig, eig * eig}, {opK, opC, opM}, A2n.get());
         const Eigen::MatrixXcd S = eig * Eigen::MatrixXcd::Identity(k, k) - H;
         const Eigen::VectorXcd Sv2 = S.fullPivLu().solve(v2);
         const ComplexVector XSv2 = MatVecMult(X, Sv2);
@@ -724,11 +724,11 @@ int QuasiNewtonSolver::Solve()
       if (it > 0 && it % preconditioner_lag == 0 && res > preconditioner_tol)
       {
         eig_opInv = eig;
-        opA2 = (*funcA2)(std::abs(eig_opInv.imag()));
-        opA =
-            BuildParSumOperator({1.0 + 0.0i, eig_opInv, eig_opInv * eig_opInv, 1.0 + 0.0i},
-                                {opK, opC, opM, opA2.get()}, true);
-        opP = (*funcP)(1.0 + 0.0i, eig_opInv, eig_opInv * eig_opInv, eig_opInv.imag());
+        opA2 = (*funcA2)(eig_opInv);
+        opA = BuildOperatorWithA2({1.0 + 0.0i, eig_opInv, eig_opInv * eig_opInv},
+                                  {opK, opC, opM}, opA2.get());
+        opP = (*funcP)(1.0 + 0.0i, eig_opInv, eig_opInv * eig_opInv,
+                       eig_opInv / std::complex<double>(0.0, 1.0));
         opInv->SetOperators(*opA, *opP);
         // Recompute w0 and normalize.
         opInv->SetRelTol(std::max(ksp_rel_tol, inexact_tol));
@@ -754,6 +754,16 @@ int QuasiNewtonSolver::Solve()
     }
   }
   nev = k;  // in case some guesses did not converge
+  if (nev == 0)
+  {
+    // No eigenpair converged: there is no invariant pair to extract eigenpairs from (and
+    // the Schur decomposition does not support an empty matrix).
+    eigenvalues.clear();
+    eigenvectors.clear();
+    perm = std::make_unique<int[]>(0);
+    RescaleEigenvectors(0);
+    return 0;
+  }
 
   // Eigenpair extraction from the invariant pair (X, H).
   Eigen::ComplexEigenSolver<Eigen::MatrixXcd> eps;
@@ -763,13 +773,10 @@ int QuasiNewtonSolver::Solve()
   std::iota(order.begin(), order.end(), 0);
   std::iota(order_eigen.begin(), order_eigen.end(), 0);
   std::iota(order2.begin(), order2.end(), 0);
-  std::sort(order.begin(), order.end(),
-            [&](auto l, auto r) { return eigs[l].imag() < eigs[r].imag(); });
-  std::sort(order_eigen.begin(), order_eigen.end(),
-            [&epseig = eps.eigenvalues()](auto l, auto r)
-            { return epseig(l).imag() < epseig(r).imag(); });
-  std::sort(order2.begin(), order2.end(),
-            [&](auto l, auto r) { return order[l] < order[r]; });
+  std::ranges::sort(order, [&](auto l, auto r) { return eigs[l].imag() < eigs[r].imag(); });
+  std::ranges::sort(order_eigen, [&epseig = eps.eigenvalues()](auto l, auto r)
+                    { return epseig(l).imag() < epseig(r).imag(); });
+  std::ranges::sort(order2, [&](auto l, auto r) { return order[l] < order[r]; });
 
   // Sort Eigen eigenvectors.
   std::vector<Eigen::VectorXcd> Xeig;
@@ -815,7 +822,7 @@ double QuasiNewtonSolver::GetResidualNorm(std::complex<double> l, const ComplexV
     opC->AddMult(x, r, l);
   }
   opM->AddMult(x, r, l * l);
-  auto A2 = (*funcA2)(std::abs(l.imag()));
+  auto A2 = (*funcA2)(l);
   A2->AddMult(x, r, 1.0);
   return linalg::Norml2(comm, r);
 }
@@ -841,7 +848,7 @@ double QuasiNewtonSolver::GetBackwardScaling(std::complex<double> l) const
 }
 
 NewtonInterpolationOperator::NewtonInterpolationOperator(
-    std::function<std::unique_ptr<ComplexOperator>(double)> funcA2, int size)
+    std::function<std::unique_ptr<ComplexOperator>(std::complex<double>)> funcA2, int size)
   : funcA2(funcA2)
 {
   rhs.SetSize(size);
@@ -873,11 +880,13 @@ void NewtonInterpolationOperator::Interpolate(const std::complex<double> sigma_m
   ops.resize(num_points);
   points.clear();
   points.resize(num_points);
+  frozen_ops.clear();
 
   // Linearly spaced sample points.
+  const auto n_intervals = static_cast<double>(num_points - 1);
   for (int j = 0; j < num_points; j++)
   {
-    points[j] = sigma_min + (double)j * (sigma_max - sigma_min) / (double)(num_points - 1);
+    points[j] = sigma_min + static_cast<double>(j) * (sigma_max - sigma_min) / n_intervals;
   }
 
   // Build divided difference matrices.
@@ -887,7 +896,7 @@ void NewtonInterpolationOperator::Interpolate(const std::complex<double> sigma_m
     {
       if (k == 0)
       {
-        auto A2j = (funcA2)(points[j].imag());
+        auto A2j = (funcA2)(points[j]);
         ops[k].push_back(std::move(A2j));
       }
       else
@@ -912,6 +921,142 @@ void NewtonInterpolationOperator::Interpolate(const std::complex<double> sigma_m
       coeffs[k][j] = sign * elementarySymmetric(points, j - k, j);
     }
   }
+
+  // Assemble the single per-order (coefficient, operator) representation read by
+  // GetInterpolationOperator, Mult, and AddMult: the order-th pencil coefficient operator
+  // is Σₜ pencil_coeffs[order][t]·pencil_ops[order][t]. The base terms are the
+  // Newton→monomial combination of the leading divided-difference operators;
+  // AddFrozenPole appends one correction term per frozen pole.
+  pencil_coeffs.assign(num_points, {});
+  pencil_ops.assign(num_points, {});
+  for (int order = 0; order < num_points; order++)
+  {
+    for (int j = 0; j < num_points; j++)
+    {
+      pencil_coeffs[order].push_back(coeffs[order][j]);
+      pencil_ops[order].push_back(ops[j][0].get());
+    }
+  }
+}
+
+std::vector<std::complex<double>>
+NewtonInterpolationOperator::ComputeLeadingDividedDifferences(
+    const std::function<std::complex<double>(std::complex<double>)> &f) const
+{
+  // In-place leading divided differences: after pass k, dd[j] = f[x_{j-k}, ..., x_j] for
+  // j >= k, so on completion dd[j] = f[x_0, ..., x_j] — the scalar analogue of the
+  // operator divided differences ops[j][0], with the same denominators
+  // points[j] - points[j - k] as the operator DAG in Interpolate().
+  std::vector<std::complex<double>> dd(num_points);
+  for (int j = 0; j < num_points; j++)
+  {
+    dd[j] = f(points[j]);
+  }
+  for (int k = 1; k < num_points; k++)
+  {
+    for (int j = num_points - 1; j >= k; j--)
+    {
+      dd[j] = (dd[j] - dd[j - 1]) / (points[j] - points[j - k]);
+    }
+  }
+  return dd;
+}
+
+std::vector<std::complex<double>> NewtonInterpolationOperator::ComputeMonomialCoefficients(
+    const std::vector<std::complex<double>> &dd) const
+{
+  // q[order] = Σⱼ coeffs[order][j]·dd[j], the same Newton→monomial combination the
+  // operator path applies to ops[j][0], so the scalar Newton interpolant through the
+  // nodes is p(λ) = Σ q[order]·λ^order.
+  std::vector<std::complex<double>> q(num_points, 0.0);
+  for (int order = 0; order < num_points; order++)
+  {
+    for (int j = 0; j < num_points; j++)
+    {
+      q[order] += coeffs[order][j] * dd[j];
+    }
+  }
+  return q;
+}
+
+void NewtonInterpolationOperator::AddFrozenPole(
+    std::unique_ptr<ComplexOperator> M,
+    const std::function<std::complex<double>(std::complex<double>)> &f,
+    std::complex<double> lambda_target)
+{
+  if (!M)
+  {
+    return;
+  }
+  MFEM_VERIFY(!points.empty() && !coeffs.empty(),
+              "AddFrozenPole requires a prior Interpolate() call!");
+
+  // Per-order multiplier of M: remove the interpolated pole at every order (the scalar
+  // Newton interpolant of f through the same nodes as the operator path), then re-add the
+  // pole frozen at the target into order 0. By linearity of the interpolation, this
+  // yields the smooth remainder pencil with the pole frozen in K. The correction terms
+  // are appended to the shared pencil representation, so GetInterpolationOperator, Mult,
+  // and AddMult all see them.
+  const auto q = ComputeMonomialCoefficients(ComputeLeadingDividedDifferences(f));
+  const ComplexOperator *M_raw = M.get();
+  frozen_ops.push_back(std::move(M));
+  for (int order = 0; order < num_points; order++)
+  {
+    std::complex<double> corr = -q[order];
+    if (order == 0)
+    {
+      corr += f(lambda_target);
+    }
+    pencil_coeffs[order].push_back(corr);
+    pencil_ops[order].push_back(M_raw);
+  }
+}
+
+bool NewtonInterpolationOperator::DetermineFrozen(
+    const std::function<std::complex<double>(std::complex<double>)> &f_full,
+    const std::function<std::complex<double>(std::complex<double>)> &f_frozen,
+    std::complex<double> lambda_target, double &fit_err, double &freeze_err) const
+{
+  MFEM_VERIFY(!points.empty() && !coeffs.empty(),
+              "DetermineFrozen requires a prior Interpolate() call!");
+
+  // Monomial coefficients of the scalar Newton interpolants through the same nodes as the
+  // operator path: the full coefficient (fit branch) and its smooth part f_full - f_frozen
+  // (what AddFrozenPole(M, f_frozen, lambda_target) leaves interpolated, exact when that
+  // part is a polynomial of degree < num_points).
+  const auto q_full = ComputeMonomialCoefficients(ComputeLeadingDividedDifferences(f_full));
+  const auto q_smooth = ComputeMonomialCoefficients(ComputeLeadingDividedDifferences(
+      [&](std::complex<double> lambda) { return f_full(lambda) - f_frozen(lambda); }));
+  auto eval = [&](const std::vector<std::complex<double>> &q, std::complex<double> lambda)
+  {
+    // Horner evaluation of Σ q[order]·λ^order.
+    std::complex<double> val = 0.0;
+    for (int order = num_points - 1; order >= 0; order--)
+    {
+      val = val * lambda + q[order];
+    }
+    return val;
+  };
+
+  // Max relative error over a dense sample of the window. The freeze branch is what
+  // AddFrozenPole(M, f_frozen, lambda_target) produces: the interpolant of the smooth part
+  // plus the frozen value f_frozen(lambda_target).
+  const std::complex<double> frozen_target = f_frozen(lambda_target);
+  constexpr int n_samples = 101;
+  const auto n_intervals = static_cast<double>(n_samples - 1);
+  fit_err = freeze_err = 0.0;
+  for (int i = 0; i < n_samples; i++)
+  {
+    const std::complex<double> lambda =
+        points.front() +
+        static_cast<double>(i) * (points.back() - points.front()) / n_intervals;
+    const std::complex<double> f_exact = f_full(lambda);
+    const double scale = std::max(std::abs(f_exact), 1.0e-300);
+    fit_err = std::max(fit_err, std::abs(eval(q_full, lambda) - f_exact) / scale);
+    freeze_err = std::max(
+        freeze_err, std::abs(eval(q_smooth, lambda) + frozen_target - f_exact) / scale);
+  }
+  return freeze_err < fit_err;
 }
 
 std::unique_ptr<ComplexOperator>
@@ -920,8 +1065,7 @@ NewtonInterpolationOperator::GetInterpolationOperator(int order) const
   MFEM_VERIFY(order >= 0 && order < num_points,
               "Order must be greater than or equal to 0 and smaller than the number of "
               "interpolation points!");
-  return BuildParSumOperator({coeffs[order][0], coeffs[order][1], coeffs[order][2]},
-                             {ops[0][0].get(), ops[1][0].get(), ops[2][0].get()}, true);
+  return BuildParSumOperator(pencil_coeffs[order], pencil_ops[order], true);
 }
 
 void NewtonInterpolationOperator::Mult(int order, const ComplexVector &x,
@@ -932,11 +1076,11 @@ void NewtonInterpolationOperator::Mult(int order, const ComplexVector &x,
               "interpolation points!");
 
   y = 0.0;
-  for (int j = 0; j < num_points; j++)
+  for (std::size_t t = 0; t < pencil_ops[order].size(); t++)
   {
-    if (coeffs[order][j] != 0.0)
+    if (pencil_coeffs[order][t] != 0.0)
     {
-      ops[j][0]->AddMult(x, y, coeffs[order][j]);
+      pencil_ops[order][t]->AddMult(x, y, pencil_coeffs[order][t]);
     }
   }
 }

@@ -10,6 +10,7 @@
 #include <vector>
 #include <mfem.hpp>
 #include "fem/lumpedelement.hpp"
+#include "fem/output_functionals.hpp"
 
 namespace palace
 {
@@ -33,6 +34,8 @@ struct LumpedPortData;
 //
 class LumpedPortData
 {
+  friend class LumpedPortOperator;
+
 public:
   // Reference to material property data (not owned).
   const MaterialOperator &mat_op;
@@ -45,12 +48,19 @@ public:
   double R, L, C;
   int excitation;
   bool active;
+  bool include_in_synthesis;
 
 protected:
   // Linear forms for postprocessing integrated quantities on the port.
   mutable std::unique_ptr<mfem::LinearForm> s, v;
 
+  // libCEED surface functionals for port power, voltage, and S-parameter computation,
+  // replacing host boundary LinearForm paths when supported.
+  mutable std::unique_ptr<SurfaceFunctional> power_func, v_func;
+
   void InitializeLinearForms(mfem::ParFiniteElementSpace &nd_fespace) const;
+  SurfaceModeCoefficient GetModeCoefficient(const LumpedElementData &elem,
+                                            double coeff) const;
 
 public:
   LumpedPortData(const config::LumpedPortData &data, const MaterialOperator &mat_op,
@@ -90,6 +100,15 @@ public:
 
   constexpr bool HasExcitation() const { return excitation != 0; }
 
+  // Real reference resistance used to normalize the incident-field amplitude of an excited
+  // port. For a resistive port this is R, so the incident/reflected-wave normalization and
+  // the port's own termination impedance coincide and behaviour is unchanged. For a purely
+  // reactive excited port (R == 0) there is no real port resistance, so we fall back to the
+  // unit reference impedance |Z_R| = 1 in internal units (= Z_freespace) purely to define a
+  // finite drive amplitude; the reactance acts physically through the system-matrix
+  // termination, and that port's own S column is referenced to this unit impedance.
+  double GetExcitationRefResistance() const { return (std::abs(R) > 0.0) ? R : 1.0; }
+
   enum class Branch
   {
     TOTAL,
@@ -104,6 +123,7 @@ public:
   double GetExcitationVoltage() const;
 
   std::complex<double> GetPower(GridFunction &E, GridFunction &B) const;
+  std::complex<double> GetPowerLegacy(GridFunction &E, GridFunction &B) const;
   std::complex<double> GetSParameter(GridFunction &E) const;
   std::complex<double> GetVoltage(GridFunction &E) const;
 };
@@ -118,6 +138,20 @@ private:
   // calculate circuit properties like voltage and current on lumped or multielement lumped
   // ports.
   std::map<int, LumpedPortData> ports;
+
+  struct PortAttributeBins
+  {
+    mfem::Array<int> attr_to_port;
+    std::vector<int> port_indices;
+    bool unavailable = false;
+  };
+
+  // Batched libCEED surface functionals for lumped-port power and voltage. Individual
+  // LumpedPortData evaluation remains available for port sets that cannot be batched.
+  mutable std::unique_ptr<SurfaceFunctional> batched_power_func;
+  mutable PortAttributeBins batched_power_bins;
+  mutable std::unique_ptr<SurfaceFunctional> batched_voltage_func;
+  mutable PortAttributeBins batched_voltage_bins;
 
   void SetUpBoundaryProperties(const std::map<int, config::LumpedPortData> &lumpedport,
                                const MaterialOperator &mat_op, const mfem::ParMesh &mesh);
@@ -137,6 +171,14 @@ public:
   auto rbegin() const { return ports.rbegin(); }
   auto rend() const { return ports.rend(); }
   auto Size() const { return ports.size(); }
+
+  // Compute port powers, batching disjoint libCEED surface-functional evaluations when
+  // possible while preserving per-port scalar outputs.
+  std::map<int, std::complex<double>> GetPowers(GridFunction &E, GridFunction &B) const;
+
+  // Compute port voltages, batching disjoint libCEED mode-overlap evaluations when
+  // possible while preserving per-port scalar outputs.
+  std::map<int, std::complex<double>> GetVoltages(GridFunction &E) const;
 
   // Returns array of lumped port attributes.
   mfem::Array<int> GetAttrList() const;

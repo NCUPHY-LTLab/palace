@@ -69,7 +69,7 @@ inline void PrettyPrint(const Container<T, U...> &data, T scale,
   auto i = data.begin();
   while (i != data.end())
   {
-    if constexpr (std::is_integral<T>::value)
+    if constexpr (std::is_integral_v<T>)
     {
       auto j = i;
       if (scale == 1)
@@ -107,7 +107,7 @@ inline void PrettyPrint(const Container<T, U...> &data, T scale,
 }
 
 template <template <typename...> class Container, typename T, typename... U>
-inline void PrettyPrint(const Container<T, U...> &data, const std::string &prefix = "",
+inline void PrettyPrint(const Container<T, U...> &data, const std::string_view prefix = "",
                         MPI_Comm comm = MPI_COMM_WORLD)
 {
   PrettyPrint(data, T(1), prefix, comm);

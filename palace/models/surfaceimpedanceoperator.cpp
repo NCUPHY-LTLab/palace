@@ -3,7 +3,7 @@
 
 #include "surfaceimpedanceoperator.hpp"
 
-#include <set>
+#include "models/boundaryattributes.hpp"
 #include "models/materialoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/geodata.hpp"
@@ -37,41 +37,10 @@ void SurfaceImpedanceOperator::SetUpBoundaryProperties(
     const std::unordered_set<int> &cracked_attributes, const mfem::ParMesh &mesh)
 {
   // Check that impedance boundary attributes have been specified correctly.
-  int bdr_attr_max = mesh.bdr_attributes.Size() ? mesh.bdr_attributes.Max() : 0;
-  mfem::Array<int> bdr_attr_marker;
+  MeshBoundaryAttributes mesh_attrs(mesh);
   if (!impedance.empty())
   {
-    mfem::Array<int> impedance_marker(bdr_attr_max);
-    bdr_attr_marker.SetSize(bdr_attr_max);
-    bdr_attr_marker = 0;
-    impedance_marker = 0;
-    for (auto attr : mesh.bdr_attributes)
-    {
-      bdr_attr_marker[attr - 1] = 1;
-    }
-    std::set<int> bdr_warn_list;
-    for (const auto &data : impedance)
-    {
-      for (auto attr : data.attributes)
-      {
-        MFEM_VERIFY(
-            !impedance_marker[attr - 1],
-            "Multiple definitions of impedance boundary properties for boundary attribute "
-                << attr << "!");
-        impedance_marker[attr - 1] = 1;
-        if (attr <= 0 || attr > bdr_attr_max || !bdr_attr_marker[attr - 1])
-        {
-          bdr_warn_list.insert(attr);
-        }
-      }
-    }
-    if (!bdr_warn_list.empty())
-    {
-      Mpi::Print("\n");
-      Mpi::Warning("Unknown impedance boundary attributes!\nSolver will just ignore them!");
-      utils::PrettyPrint(bdr_warn_list, "Boundary attribute list:");
-      Mpi::Print("\n");
-    }
+    CheckBoundaryAttributes(mesh_attrs, impedance, "impedance");
   }
 
   // Impedance boundaries are defined using the user provided impedance per square.
@@ -87,23 +56,14 @@ void SurfaceImpedanceOperator::SetUpBoundaryProperties(
     bdr.attr_list.Reserve(static_cast<int>(data.attributes.size()));
     for (auto attr : data.attributes)
     {
-      if (attr <= 0 || attr > bdr_attr_max || !bdr_attr_marker[attr - 1])
+      if (!mesh_attrs.Contains(attr))
       {
         continue;  // Can just ignore if wrong
       }
       bdr.attr_list.Append(attr);
-      // Compute a scaling factor to account for increased area when using mesh cracking.
-      if (cracked_attributes.find(attr) != cracked_attributes.end())
-      {
-        bdr.scaling = 2.0;
-      }
-      MFEM_VERIFY((cracked_attributes.find(attr) != cracked_attributes.end()) ||
-                      (bdr.scaling == 1.0),
-                  "Impedance boundary has both cracked and uncracked attributes!");
+      // Per-attribute scaling to account for increased area when using mesh cracking.
+      bdr.attr_scaling[attr] = cracked_attributes.contains(attr) ? 2.0 : 1.0;
     }
-    bdr.Ls *= bdr.scaling;
-    bdr.Rs *= bdr.scaling;
-    bdr.Cs /= bdr.scaling;
   }
 }
 
@@ -128,17 +88,17 @@ void SurfaceImpedanceOperator::PrintBoundaryInfo(const Units &units,
       if (std::abs(bdr.Rs) > 0.0)
       {
         fmt::format_to(out, " Rs = {:.3e} Ω/sq,",
-                       units.Dimensionalize<VT::IMPEDANCE>(bdr.Rs / bdr.scaling));
+                       units.Dimensionalize<VT::IMPEDANCE>(bdr.Rs));
       }
       if (std::abs(bdr.Ls) > 0.0)
       {
         fmt::format_to(out, " Ls = {:.3e} H/sq,",
-                       units.Dimensionalize<VT::INDUCTANCE>(bdr.Ls / bdr.scaling));
+                       units.Dimensionalize<VT::INDUCTANCE>(bdr.Ls));
       }
       if (std::abs(bdr.Cs) > 0.0)
       {
         fmt::format_to(out, " Cs = {:.3e} F/sq,",
-                       units.Dimensionalize<VT::CAPACITANCE>(bdr.Cs * bdr.scaling));
+                       units.Dimensionalize<VT::CAPACITANCE>(bdr.Cs));
       }
       fmt::format_to(out, " n = ({:+.1f})\n",
                      fmt::join(mesh::GetSurfaceNormal(mesh, attr), ","));
@@ -204,7 +164,11 @@ void SurfaceImpedanceOperator::AddStiffnessBdrCoefficients(double coeff,
   {
     if (std::abs(bdr.Ls) > 0.0)
     {
-      fb.AddMaterialProperty(mat_op.GetCeedBdrAttributes(bdr.attr_list), coeff / bdr.Ls);
+      for (auto attr : bdr.attr_list)
+      {
+        const double s = bdr.attr_scaling.at(attr);
+        fb.AddMaterialProperty(mat_op.GetCeedBdrAttributes(attr), coeff / (bdr.Ls * s));
+      }
     }
   }
 }
@@ -217,7 +181,11 @@ void SurfaceImpedanceOperator::AddDampingBdrCoefficients(double coeff,
   {
     if (std::abs(bdr.Rs) > 0.0)
     {
-      fb.AddMaterialProperty(mat_op.GetCeedBdrAttributes(bdr.attr_list), coeff / bdr.Rs);
+      for (auto attr : bdr.attr_list)
+      {
+        const double s = bdr.attr_scaling.at(attr);
+        fb.AddMaterialProperty(mat_op.GetCeedBdrAttributes(attr), coeff / (bdr.Rs * s));
+      }
     }
   }
 }
@@ -230,7 +198,11 @@ void SurfaceImpedanceOperator::AddMassBdrCoefficients(double coeff,
   {
     if (std::abs(bdr.Cs) > 0.0)
     {
-      fb.AddMaterialProperty(mat_op.GetCeedBdrAttributes(bdr.attr_list), coeff * bdr.Cs);
+      for (auto attr : bdr.attr_list)
+      {
+        const double s = bdr.attr_scaling.at(attr);
+        fb.AddMaterialProperty(mat_op.GetCeedBdrAttributes(attr), coeff * bdr.Cs / s);
+      }
     }
   }
 }

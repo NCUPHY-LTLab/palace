@@ -23,6 +23,7 @@ class PostOperatorCSVManualTest : public PostOperatorCSV<ProblemType::DRIVEN>
 {
 public:
   using PostOperatorCSV<ProblemType::DRIVEN>::PostOperatorCSV;
+  bool DefersTableWrites() const { return defer_table_writes; }
   friend class PostOperatorCSVFixture;
 };
 
@@ -152,6 +153,12 @@ public:
         CHECK(post_op_csv.port_V->table[1].name == "inc1_1");
         CHECK(post_op_csv.port_V->table[2].name == "re1_1");
         CHECK(post_op_csv.port_V->table[3].name == "im1_1");
+
+        // Name lookups go through the index, which must match the restored names.
+        CHECK(post_op_csv.port_V->table.has("inc1_1"));
+        CHECK(!post_op_csv.port_V->table.has("col_1"));
+        CHECK_NOTHROW(post_op_csv.port_V->table["idx"]);
+        CHECK(&post_op_csv.port_V->table["re1_1"] == &post_op_csv.port_V->table[2]);
 
         // Validate properties copied form reference table.
         CHECK(post_op_csv.port_V->table[0].column_group_idx ==
@@ -483,6 +490,17 @@ TEST_CASE("PostOperatorCSV_Restart_OneExcitation", "[postoperatorcsv][Serial]")
     reload_fixture.restart1_bad_col_alignment();
   }
 }
+TEST_CASE("PostOperatorCSV_AdaptiveOutputBuffering", "[postoperatorcsv][Serial]")
+{
+  PostOperatorCSVFixture fixture{"postoperatorcsv_restart/restart1.json"};
+  fixture.iodata.solver.driven.adaptive_tol = 1.0e-3;
+  PostOperatorCSVManualTest post_op_csv{fixture.iodata, fixture.space_op};
+  if (Mpi::Root(Mpi::World()))
+  {
+    CHECK(post_op_csv.DefersTableWrites());
+  }
+}
+
 TEST_CASE("PostOperatorCSV_Restart_TwoExcitation", "[postoperatorcsv][Serial]")
 {
   PostOperatorCSVFixture fixture{"postoperatorcsv_restart/restart2.json"};

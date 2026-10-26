@@ -4,10 +4,13 @@
 #ifndef PALACE_MODELS_POST_OPERATOR_CSV_HPP
 #define PALACE_MODELS_POST_OPERATOR_CSV_HPP
 
+#include <chrono>
 #include <map>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include "fem/errorindicator.hpp"
 #include "models/boundarymodeoperator.hpp"
 #include "models/curlcurloperator.hpp"
@@ -116,6 +119,12 @@ struct Measurement
     // S-Parameter.
     std::complex<double> S = 0.0;
 
+    // Wave port mode characteristic impedance Z_PV = |V_exc|² / |P_exc| computed from
+    // the boundary-mode-solved E-field along the user-specified VoltagePath. Independent
+    // of which port is excited (property of the mode, not the simulation result). Only
+    // populated for wave ports with VoltagePath configured; left as 0 otherwise.
+    std::complex<double> Z_PV = 0.0;
+
     // Energies (currently only for lumped port).
     double inductor_energy = 0.0;   // E_ind = ∑_j 1/2 L_j I_mj².
     double capacitor_energy = 0.0;  // E_cap = ∑_j 1/2 C_j V_mj².
@@ -200,6 +209,10 @@ struct Measurement
   std::vector<InterfaceData> interface_eps_mask_i;
   FarFieldData farfield;
 
+  // Floquet port S-parameters: port_idx -> {(m, n, is_te/is_rhc) -> S}.
+  std::map<int, std::map<std::tuple<int, int, bool>, std::complex<double>>> floquet_port_s;
+  bool floquet_circular_output = false;
+
   // Dimensionalize and nondimensionalize a set of measurements
   static Measurement Dimensionalize(const Units &units,
                                     const Measurement &nondim_measurement_cache);
@@ -207,7 +220,10 @@ struct Measurement
                                        const Measurement &dim_measurement_cache);
   // Helpers for converting complex variable to magnitude in dB and phase.
   static double Magnitude(std::complex<double> x) { return 20.0 * std::log10(std::abs(x)); }
-  static double Phase(std::complex<double> x) { return std::arg(x) * 180.0 / M_PI; }
+  static double Phase(std::complex<double> x)
+  {
+    return std::arg(x) * 180.0 / std::numbers::pi;
+  }
 };
 
 namespace _impl
@@ -230,7 +246,16 @@ class PostOperatorCSV
 protected:
   // Copy savepath from PostOperator for simpler dependencies.
   fs::path post_dir;
-  bool reload_table = false;  // True only for driven simulation with non-default restart
+  bool reload_table = false;  // Driven simulation with non-default restart.
+  // Adaptive driven output is buffered and written at most once per flush interval (and
+  // at finalization), so an interrupted sweep still leaves usable tables.
+  bool defer_table_writes = false;
+  std::chrono::steady_clock::time_point last_deferred_flush;
+  void FlushDeferredTables();
+
+  // Flush deferred tables if the flush interval has elapsed. Call only at a step boundary,
+  // once every table holds this step's row.
+  void MaybeFlushDeferredTables();
 
   // Dimensionalized measurement cache. Converted from the PostOperator member variable.
   Measurement measurement_cache;
@@ -253,6 +278,8 @@ protected:
   bool HasSingleExIdx() const { return ex_idx_v_all.size() == 1; }
 
   void MoveTableValidateReload(TableWithCSVFile &t_csv_base, Table &&t_ref);
+  void WriteTable(TableWithCSVFile &table);
+  void WriteTable(std::optional<TableWithCSVFile> &table);
 
   // Data tables.
   //
@@ -315,120 +342,143 @@ protected:
   void InitializeProbeB(const InterpolationOperator &interp_op, int v_dim);
   void PrintProbeB(const InterpolationOperator &interp_op, int v_dim);
 
-  // TODO(C++20): Upgrade SFINAE to C++20 concepts to simplify static selection since we can
-  // just use `void Function(...) requires (solver_t == Type::A);`.
-
-  // Driven + Transient.
+  // Driven + Transient
   std::optional<TableWithCSVFile> surface_I;
-  template <ProblemType U = solver_t>
-  auto InitializeSurfaceI(const SurfaceCurrentOperator &surf_j_op)
-      -> std::enable_if_t<U == ProblemType::DRIVEN || U == ProblemType::TRANSIENT, void>;
-  template <ProblemType U = solver_t>
-  auto PrintSurfaceI(const SurfaceCurrentOperator &surf_j_op, const Units &units)
-      -> std::enable_if_t<U == ProblemType::DRIVEN || U == ProblemType::TRANSIENT, void>;
+
+  void InitializeSurfaceI(const SurfaceCurrentOperator &surf_j_op)
+    requires(solver_t == ProblemType::DRIVEN || solver_t == ProblemType::TRANSIENT);
+
+  void PrintSurfaceI(const SurfaceCurrentOperator &surf_j_op, const Units &units)
+    requires(solver_t == ProblemType::DRIVEN || solver_t == ProblemType::TRANSIENT);
 
   // Eigenmode + Driven + Transient.
   std::optional<TableWithCSVFile> port_V;
   std::optional<TableWithCSVFile> port_I;
-  template <ProblemType U = solver_t>
-  auto InitializePortVI(const SpaceOperator &fem_op)
-      -> std::enable_if_t<U == ProblemType::EIGENMODE || U == ProblemType::DRIVEN ||
-                              U == ProblemType::TRANSIENT,
-                          void>;
-  template <ProblemType U = solver_t>
-  auto PrintPortVI(const LumpedPortOperator &lumped_port_op, const Units &units)
-      -> std::enable_if_t<U == ProblemType::EIGENMODE || U == ProblemType::DRIVEN ||
-                              U == ProblemType::TRANSIENT,
-                          void>;
+
+  void InitializePortVI(const SpaceOperator &fem_op)
+    requires(solver_t == ProblemType::EIGENMODE || solver_t == ProblemType::DRIVEN ||
+             solver_t == ProblemType::TRANSIENT);
+
+  void PrintPortVI(const LumpedPortOperator &lumped_port_op, const Units &units)
+    requires(solver_t == ProblemType::EIGENMODE || solver_t == ProblemType::DRIVEN ||
+             solver_t == ProblemType::TRANSIENT);
 
   // Driven.
   std::optional<TableWithCSVFile> port_S;
-  template <ProblemType U = solver_t>
-  auto InitializePortS(const SpaceOperator &fem_op)
-      -> std::enable_if_t<U == ProblemType::DRIVEN, void>;
-  template <ProblemType U = solver_t>
-  auto PrintPortS() -> std::enable_if_t<U == ProblemType::DRIVEN, void>;
+
+  void InitializePortS(const SpaceOperator &fem_op)
+    requires(solver_t == ProblemType::DRIVEN);
+  void PrintPortS()
+    requires(solver_t == ProblemType::DRIVEN);
 
   // Driven: wave port impedance.
   std::optional<TableWithCSVFile> port_Z;
-  template <ProblemType U = solver_t>
-  auto InitializePortZ(const SpaceOperator &fem_op)
-      -> std::enable_if_t<U == ProblemType::DRIVEN, void>;
-  template <ProblemType U = solver_t>
-  auto PrintPortZ() -> std::enable_if_t<U == ProblemType::DRIVEN, void>;
+  void InitializePortZ(const SpaceOperator &fem_op)
+    requires(solver_t == ProblemType::DRIVEN);
+  void PrintPortZ()
+    requires(solver_t == ProblemType::DRIVEN);
+
+  // Driven: Floquet port S-parameters.
+  std::optional<TableWithCSVFile> floquet_port_S;
+  void InitializeFloquetPortS(const SpaceOperator &fem_op)
+    requires(solver_t == ProblemType::DRIVEN);
+  void PrintFloquetPortS()
+    requires(solver_t == ProblemType::DRIVEN);
 
   // Driven + Eigenmode.
   std::optional<TableWithCSVFile> farfield_E;
-  template <ProblemType U = solver_t>
-  auto InitializeFarFieldE(const SurfacePostOperator &surf_post_op)
-      -> std::enable_if_t<U == ProblemType::DRIVEN || U == ProblemType::EIGENMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintFarFieldE(const SurfacePostOperator &surf_post_op)
-      -> std::enable_if_t<U == ProblemType::DRIVEN || U == ProblemType::EIGENMODE, void>;
+
+  void InitializeFarFieldE(const SurfacePostOperator &surf_post_op)
+    requires(solver_t == ProblemType::DRIVEN || solver_t == ProblemType::EIGENMODE);
+  void PrintFarFieldE(const SurfacePostOperator &surf_post_op)
+    requires(solver_t == ProblemType::DRIVEN || solver_t == ProblemType::EIGENMODE);
 
   // Eigenmode.
   std::optional<TableWithCSVFile> eig;
-  template <ProblemType U = solver_t>
-  auto InitializeEig() -> std::enable_if_t<U == ProblemType::EIGENMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintEig() -> std::enable_if_t<U == ProblemType::EIGENMODE, void>;
+
+  void InitializeEig()
+    requires(solver_t == ProblemType::EIGENMODE);
+  void PrintEig()
+    requires(solver_t == ProblemType::EIGENMODE);
 
   // Mode Analysis.
   std::optional<TableWithCSVFile> mode_kn;
-  template <ProblemType U = solver_t>
-  auto InitializeModeKn() -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintModeKn() -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, void>;
+  void InitializeModeKn()
+    requires(solver_t == ProblemType::BOUNDARYMODE);
+  void PrintModeKn()
+    requires(solver_t == ProblemType::BOUNDARYMODE);
 
   std::optional<TableWithCSVFile> mode_Z;
-  template <ProblemType U = solver_t>
-  auto InitializeModeZ(const std::vector<int> &indices, bool has_current)
-      -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintModeZ() -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, void>;
+  void InitializeModeZ(const std::vector<int> &indices, bool has_current)
+    requires(solver_t == ProblemType::BOUNDARYMODE);
+  void PrintModeZ()
+    requires(solver_t == ProblemType::BOUNDARYMODE);
 
   std::optional<TableWithCSVFile> mode_V;
-  template <ProblemType U = solver_t>
-  auto InitializeModeV(const std::vector<int> &indices)
-      -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintModeV() -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, void>;
+  void InitializeModeV(const std::vector<int> &indices)
+    requires(solver_t == ProblemType::BOUNDARYMODE);
+  void PrintModeV()
+    requires(solver_t == ProblemType::BOUNDARYMODE);
 
   std::vector<int> ports_with_L;
   std::vector<int> ports_with_R;
   std::optional<TableWithCSVFile> port_EPR;
-  template <ProblemType U = solver_t>
-  auto InitializeEigPortEPR(const LumpedPortOperator &lumped_port_op)
-      -> std::enable_if_t<U == ProblemType::EIGENMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintEigPortEPR() -> std::enable_if_t<U == ProblemType::EIGENMODE, void>;
+
+  void InitializeEigPortEPR(const LumpedPortOperator &lumped_port_op)
+    requires(solver_t == ProblemType::EIGENMODE);
+  void PrintEigPortEPR()
+    requires(solver_t == ProblemType::EIGENMODE);
 
   std::optional<TableWithCSVFile> port_Q;
-  template <ProblemType U = solver_t>
-  auto InitializeEigPortQ(const LumpedPortOperator &lumped_port_op)
-      -> std::enable_if_t<U == ProblemType::EIGENMODE, void>;
-  template <ProblemType U = solver_t>
-  auto PrintEigPortQ() -> std::enable_if_t<U == ProblemType::EIGENMODE, void>;
+
+  void InitializeEigPortQ(const LumpedPortOperator &lumped_port_op)
+    requires(solver_t == ProblemType::EIGENMODE);
+  void PrintEigPortQ()
+    requires(solver_t == ProblemType::EIGENMODE);
 
   // Diagnostics for mesh/FESpace boundary-dof counts.
   void PrintInterfaceDoF(const PostOperator<solver_t> &post_op,
                          const SurfacePostOperator &surf_post_op);
 
 public:
+  // Flush tables buffered during an adaptive driven sweep. Other solver modes write eagerly
+  // and this is a no-op for them.
+  void FinalizeCSVData();
+
   // Print all data from nondim_measurement_cache.
   void PrintAllCSVData(const PostOperator<solver_t> &post_op,
                        const Measurement &nondim_measurement_cache,
                        double idx_value_dimensionful, int step);
 
   // Driven specific overload for specifying excitation index.
-  template <ProblemType U = solver_t>
-  auto PrintAllCSVData(const PostOperator<solver_t> &post_op,
+  void PrintAllCSVData(const PostOperator<solver_t> &post_op,
                        const Measurement &nondim_measurement_cache,
                        double idx_value_dimensionful, int step, int ex_idx)
-      -> std::enable_if_t<U == ProblemType::DRIVEN, void>
+    requires(solver_t == ProblemType::DRIVEN)
   {
     m_ex_idx = ex_idx;
     PrintAllCSVData(post_op, nondim_measurement_cache, idx_value_dimensionful, step);
+  }
+
+  // Adaptive reduced-order path preserving the default domain-energy and S tables.
+  void PrintReducedCSVData(const PostOperator<solver_t> &post_op,
+                           const Measurement &nondim_measurement_cache,
+                           double idx_value_dimensionful, int step, int ex_idx)
+    requires(solver_t == ProblemType::DRIVEN)
+  {
+    if (!Mpi::Root(post_op.fem_op->GetComm()))
+    {
+      return;
+    }
+    row_idx_v = idx_value_dimensionful;
+    row_i = step;
+    m_ex_idx = ex_idx;
+    measurement_cache =
+        Measurement::Dimensionalize(post_op.units, nondim_measurement_cache);
+    PrintDomainE();
+    PrintPortVI(post_op.fem_op->GetLumpedPortOp(), post_op.units);
+    PrintPortS();
+    MaybeFlushDeferredTables();
   }
 
   // Special case of global indicator — init and print all at once.

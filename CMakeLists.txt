@@ -5,9 +5,8 @@
 # CMake superbuild for Palace and its dependencies
 #
 
-# CMake 3.21 was released in Jul. 2021 (required for HIP support)
-# Cmake 3.24 was released in Aug. 2022 (required for portable WHOLE_ARCHIVE linking of tests)
-cmake_minimum_required(VERSION 3.24)
+# CMake 3.27 was released in Jul. 2023 (required for AOCL in FindBLAS/FindLAPACK)
+cmake_minimum_required(VERSION 3.27)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -17,7 +16,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 # Initialize the project
-project(palace-superbuild LANGUAGES CXX C VERSION 0.16.1)
+project(palace-superbuild LANGUAGES CXX C VERSION 0.18.1)
 
 # Define build settings and defaults
 set(PALACE_WITH_64BIT_INT OFF CACHE BOOL "Use 64 bit integers")
@@ -31,6 +30,7 @@ set(PALACE_BUILD_EXTERNAL_DEPS ON CACHE BOOL "Build external third-party depende
 set(PALACE_WITH_SUPERLU ON CACHE BOOL "Build with SuperLU_DIST sparse direct solver")
 set(PALACE_WITH_STRUMPACK OFF CACHE BOOL "Build with STRUMPACK sparse direct solver")
 set(PALACE_WITH_MUMPS OFF CACHE BOOL "Build with MUMPS sparse direct solver")
+set(PALACE_WITH_CUDSS OFF CACHE BOOL "Build with cuDSS sparse direct solver")
 set(PALACE_WITH_SLEPC ON CACHE BOOL "Build with SLEPc eigenvalue solver")
 set(PALACE_WITH_ARPACK OFF CACHE BOOL "Build with ARPACK eigenvalue solver")
 set(PALACE_WITH_LIBXSMM ON CACHE BOOL "Build with LIBXSMM backend for libCEED")
@@ -47,6 +47,11 @@ set(ANALYZE_SOURCES_CPPCHECK OFF CACHE BOOL "Run static analysis checks using cp
 
 set(PALACE_BUILD_WITH_COVERAGE OFF CACHE BOOL "Compile Palace with coverage flags (source-based for LLVM; gcov for GCC)")
 set(PALACE_BUILD_WITH_SANITIZERS OFF CACHE BOOL "Compile Palace with sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer)")
+set(PALACE_TESTS_NUMPROC 2 CACHE STRING "MPI ranks per [Parallel] unit-test case")
+set(PALACE_REGRESSION_NUMPROC 2 CACHE STRING "MPI ranks per [Regression]/[Long] case")
+set(PALACE_TESTS_OMP_THREADS 1 CACHE STRING "OpenMP threads per test process")
+set(PALACE_GIT_COMMIT_ID "" CACHE STRING "Version string to embed instead of git describe")
+set(PALACE_BUILD_ID "" CACHE STRING "Build identifier to embed (e.g. Spack DAG hash)")
 
 # Enable Fortran if required
 if(PALACE_WITH_STRUMPACK OR PALACE_WITH_MUMPS OR PALACE_WITH_ARPACK)
@@ -70,7 +75,7 @@ if(PALACE_WITH_CUDA)
         string(REGEX REPLACE "\\." "" CUDA_CAPS "${CUDA_CAPS}")
         string(REGEX REPLACE "\n" ";" CUDA_CAPS "${CUDA_CAPS}")
         list(REMOVE_DUPLICATES CUDA_CAPS)
-        string(REPLACE ";" "," CMAKE_CUDA_ARCHITECTURES "${CUDA_CAPS}")
+        set(CMAKE_CUDA_ARCHITECTURES "${CUDA_CAPS}")
         message(STATUS "Detected CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
       else()
         set(CMAKE_CUDA_ARCHITECTURES "70")
@@ -84,6 +89,12 @@ if(PALACE_WITH_CUDA)
   endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  # Fail before building dependencies: Palace's C++20 device code needs nvcc 12.0
+  if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.0)
+    message(FATAL_ERROR
+      "PALACE_WITH_CUDA requires CUDA 12.0 or later (found ${CMAKE_CUDA_COMPILER_VERSION})")
+  endif()
 elseif(PALACE_WITH_HIP)
   enable_language(HIP)
   get_filename_component(HIPCC_DIR ${CMAKE_HIP_COMPILER} DIRECTORY)
@@ -142,12 +153,18 @@ endif()
 
 # Add extra CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(ArchitectureHelpers)
 
 # Intel classic compilers no longer supported (prior to CMake 3.20, the new compilers are
 # detected as Clang instead of IntelLLVM)
 if(CMAKE_C_COMPILER_ID STREQUAL "Intel" OR CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
   message(WARNING "The Intel classic compilers (icc/icpc) are no longer supported and \
 have been replaced by the newer Clang-based icx/icpx from Intel oneAPI")
+endif()
+
+# cuDSS is only for CUDA builds
+if(PALACE_WITH_CUDSS AND NOT PALACE_WITH_CUDA)
+  message(FATAL_ERROR "PALACE_WITH_CUDSS requires PALACE_WITH_CUDA")
 endif()
 
 # MAGMA is only for GPU builds
@@ -206,12 +223,6 @@ if(NOT "${CMAKE_INSTALL_RPATH_USE_LINK_PATH}" STREQUAL "")
   list(APPEND PALACE_SUPERBUILD_DEFAULT_ARGS
     "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=${CMAKE_INSTALL_RPATH_USE_LINK_PATH}"
   )
-endif()
-
-include(ExternalGitTags)
-# Avoid DOWNLOAD_EXTRACT_TIMESTAMP warning
-if(POLICY CMP0135)
-  cmake_policy(SET CMP0135 NEW)
 endif()
 
 # Add other third-party dependency builds

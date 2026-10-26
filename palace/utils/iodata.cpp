@@ -6,6 +6,7 @@
 #include <charconv>
 #include <fstream>
 #include <iostream>
+#include <numbers>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -106,7 +107,24 @@ std::stringstream PreprocessFile(const char *filename)
     bool inside = false;
     for (auto it = start; it != file.end(); ++it)
     {
-      if (inside)
+      if (*it == '"')
+      {
+        // Skip string literals: brackets inside strings (e.g. file paths) are not arrays. A
+        // quote also ends any candidate array, which then passes through unexpanded.
+        inside = false;
+        while (++it != file.end() && *it != '"')
+        {
+          if (*it == '\\' && it + 1 != file.end())
+          {
+            ++it;
+          }
+        }
+        if (it == file.end())
+        {
+          break;
+        }
+      }
+      else if (inside)
       {
         if (*it == ']')
         {
@@ -155,9 +173,52 @@ IoData::IoData(const Units &units) : units(units), init(false)
   fem::DefaultIntegrationOrder::p_trial = -1;
 }
 
-IoData::IoData(nlohmann::json &&config_, bool print) : units(1.0, 1.0), init(false)
+json IoData::ParseAndValidate(const char *filename)
 {
-  auto config = std::move(config_);
+  // Open configuration file and preprocess: strip whitespace, comments, and expand integer
+  // ranges.
+  std::stringstream buffer = PreprocessFile(filename);
+
+  // Parse the configuration file. Use a callback function to detect and throw errors for
+  // duplicate keys.
+  json config;
+  std::stack<std::set<json>> parse_stack;
+  json::parser_callback_t check_duplicate_keys =
+      [&](int, json::parse_event_t event, json &parsed)
+  {
+    switch (event)
+    {
+      case json::parse_event_t::object_start:
+        parse_stack.push(std::set<json>());
+        break;
+      case json::parse_event_t::object_end:
+        parse_stack.pop();
+        break;
+      case json::parse_event_t::key:
+        {
+          const auto result = parse_stack.top().insert(parsed);
+          if (!result.second)
+          {
+            MFEM_ABORT("Error parsing configuration file!\nDuplicate key "
+                       << parsed << " was already seen in this object!");
+            return false;
+          }
+        }
+        break;
+      default:
+        break;
+    }
+    return true;
+  };
+  try
+  {
+    config = json::parse(buffer, check_duplicate_keys);
+  }
+  catch (json::parse_error &e)
+  {
+    MFEM_ABORT("Error parsing configuration file!\n  " << e.what());
+  }
+
   // Validate against JSON schema.
   {
     std::string err = ValidateConfig(config);
@@ -170,6 +231,11 @@ IoData::IoData(nlohmann::json &&config_, bool print) : units(1.0, 1.0), init(fal
     }
   }
 
+  return config;
+}
+
+IoData::IoData(const nlohmann::json &config, bool print) : units(1.0, 1.0), init(false)
+{
   if (print)
   {
     Mpi::Print("\n{}\n", config.dump(2));
@@ -201,74 +267,64 @@ IoData::IoData(nlohmann::json &&config_, bool print) : units(1.0, 1.0), init(fal
     solver = config::SolverData(*solver_it);
   }
 
-  // Cleanup and error checking.
-  config.erase("Problem");
-  config.erase("Model");
-  config.erase("Domains");
-  config.erase("Boundaries");
-  config.erase("Solver");
-  MFEM_VERIFY(config.empty(), "Found an unsupported configuration file section!\n"
-                                  << config.dump(2));
+  // Check for unsupported sections. Work on a copy since we don't own the input.
+  {
+    json remaining = config;
+    remaining.erase("Problem");
+    remaining.erase("Model");
+    remaining.erase("Domains");
+    remaining.erase("Boundaries");
+    remaining.erase("Solver");
+    MFEM_VERIFY(remaining.empty(), "Found an unsupported configuration file section!\n"
+                                       << remaining.dump(2));
+  }
 
   // Check compatibility of configuration file and problem type.
   CheckConfiguration();
 }
 
-IoData::IoData(const char *filename, bool print)
-  : IoData(
-        [&filename]()
-        {
-          // Open configuration file and preprocess: strip whitespace, comments, and expand
-          // integer ranges.
-          std::stringstream buffer = PreprocessFile(filename);
-
-          // Parse the configuration file. Use a callback function to detect and throw
-          // errors for duplicate keys.
-          json config;
-          std::stack<std::set<json>> parse_stack;
-          json::parser_callback_t check_duplicate_keys =
-              [&](int, json::parse_event_t event, json &parsed)
-          {
-            switch (event)
-            {
-              case json::parse_event_t::object_start:
-                parse_stack.emplace();
-                break;
-              case json::parse_event_t::object_end:
-                parse_stack.pop();
-                break;
-              case json::parse_event_t::key:
-                {
-                  const auto result = parse_stack.top().insert(parsed);
-                  if (!result.second)
-                  {
-                    MFEM_ABORT("Error parsing configuration file!\nDuplicate key "
-                               << parsed << " was already seen in this object!");
-                    return false;
-                  }
-                }
-                break;
-              default:
-                break;
-            }
-            return true;
-          };
-          try
-          {
-            config = json::parse(buffer, check_duplicate_keys);
-          }
-          catch (json::parse_error &e)
-          {
-            MFEM_ABORT("Error parsing configuration file!\n  " << e.what());
-          }
-          return config;
-        }(),
-        print)
+IoData::IoData(const char *filename, bool print) : IoData(ParseAndValidate(filename), print)
 {
 }
 
 void IoData::CheckConfiguration()
 {
+  // Mixed current/flux inductance extraction has one complete-matrix contract: every
+  // parallel current element supplies its oriented aperture, and every current port remains
+  // open during the flux excitations. Reject partial or silently overridden configurations
+  // before any operator is constructed.
+  const bool mixed_magnetostatic = problem.type == ProblemType::MAGNETOSTATIC &&
+                                   !boundaries.current.empty() &&
+                                   !boundaries.fluxloop.empty();
+  const InactivePortMode global_inactive_mode = solver.magnetostatic.inactive_port_mode;
+  for (const auto &[idx, data] : boundaries.current)
+  {
+    for (std::size_t e = 0; e < data.elements.size(); e++)
+    {
+      if (mixed_magnetostatic)
+      {
+        MFEM_VERIFY(data.elements[e].aperture.has_value(),
+                    "Mixed SurfaceCurrent/FluxLoop magnetostatic extraction requires an "
+                    "\"Aperture\" for element "
+                        << e << " of SurfaceCurrent index " << idx << "!");
+      }
+      else
+      {
+        MFEM_VERIFY(!data.elements[e].aperture.has_value(),
+                    "SurfaceCurrent \"Aperture\" is only valid for a magnetostatic "
+                    "simulation combining SurfaceCurrent and FluxLoop excitations!");
+      }
+    }
+    if (mixed_magnetostatic)
+    {
+      const auto inactive_mode = data.inactive_port_mode.value_or(global_inactive_mode);
+      MFEM_VERIFY(inactive_mode == InactivePortMode::OPEN,
+                  "Mixed SurfaceCurrent/FluxLoop magnetostatic extraction requires "
+                  "SurfaceCurrent index "
+                      << idx << " to use \"InactiveMode\": \"Open\"!");
+    }
+  }
+
   // Check that the provided domain and boundary objects are all supported by the requested
   // problem type.
   if (problem.type == ProblemType::DRIVEN)
@@ -279,16 +335,34 @@ void IoData::CheckConfiguration()
                     solver.driven.adaptive_tol > 0.0,
                 "Driven system with circuit synthesis (AdaptiveCircuitSynthesis) requires "
                 "adaptive frequency sweep (AdaptiveTol > 0.0)!\n");
-    MFEM_VERIFY(!solver.driven.adaptive_circuit_synthesis || !boundaries.lumpedport.empty(),
-                "Driven system with circuit synthesis (AdaptiveCircuitSynthesis) requires "
-                "at least one LumpedPort boundary condition!\n");
+    // DrivenSolver reverts an adaptive sweep with too few samples to a uniform sweep, but
+    // circuit synthesis has no such fallback: PROM initialization and the error indicator
+    // need two distinct samples (sample_f is deduplicated when parsed).
     MFEM_VERIFY(!solver.driven.adaptive_circuit_synthesis ||
-                    (boundaries.auxpec.empty() && boundaries.waveport.empty() &&
-                     (boundaries.farfield.empty() || boundaries.farfield.order == 1) &&
-                     boundaries.conductivity.empty()),
-                "Driven system with circuit synthesis (AdaptiveCircuitSynthesis) is not "
-                "supported in systems with any of: "
-                "WavePort, Absorbing (order > 1), or Conductivity boundary conditions!\n");
+                    solver.driven.sample_f.size() >= 2,
+                "Driven system with circuit synthesis (AdaptiveCircuitSynthesis) requires "
+                "at least two distinct frequency samples!\n");
+    MFEM_VERIFY(!solver.driven.adaptive_circuit_synthesis ||
+                    !boundaries.lumpedport.empty() || !boundaries.waveport.empty(),
+                "Driven system with circuit synthesis (AdaptiveCircuitSynthesis) requires "
+                "at least one port (LumpedPort or WavePort) boundary condition!\n");
+    MFEM_VERIFY(!solver.driven.adaptive_circuit_synthesis || boundaries.floquetport.empty(),
+                "Driven system with circuit synthesis (AdaptiveCircuitSynthesis) does not "
+                "yet support Floquet port boundaries. The Floquet Robin dispersion is "
+                "handled in the online PROM sweep but has not been folded into the "
+                "synthesised circuit pencil.\n");
+    // Second-order absorbing (farfield), surface-conductivity, and rational surface
+    // impedance boundaries are supported in circuit synthesis: their frequency-dependent
+    // contributions are folded into the synthesised pencil via the same auxiliary-state
+    // path as the wave ports (the 2nd-order ABC's 0.5/ω as an exact pole at ω=0; surface
+    // conductivity's iω/Z(ω) and the rational impedance's Robin coefficient s·D(s)/N(s)
+    // by a polynomial + AAA fit). See RomOperator::CalculateNormalizedPROMMatrices.
+    // Wave ports are supported via an automatic polynomial fit of the modal dispersion,
+    // augmented with AAA residual poles when the polynomial residual exceeds AdaptiveTol.
+    // The runtime check is in RomOperator::CalculateNormalizedPROMMatrices.
+    // WavePortPEC (boundaries.auxpec) is also supported: it only affects the per-port
+    // cross-section eigenvalue problem (forces the port submesh outer rim to PEC) and
+    // does not change the parent FE system, so synthesis works correctly with it.
   }
   else if (problem.type == ProblemType::EIGENMODE)
   {
@@ -310,6 +384,11 @@ void IoData::CheckConfiguration()
     {
       Mpi::Warning("Electrostatic problem type does not support surface impedance boundary "
                    "conditions!\n");
+    }
+    if (!boundaries.rational_impedance.empty())
+    {
+      Mpi::Warning("Electrostatic problem type does not support rational surface "
+                   "impedance boundary conditions!\n");
     }
     if (!boundaries.auxpec.empty() || !boundaries.waveport.empty())
     {
@@ -339,6 +418,11 @@ void IoData::CheckConfiguration()
       Mpi::Warning("Magnetostatic problem type does not support surface impedance boundary "
                    "conditions!\n");
     }
+    if (!boundaries.rational_impedance.empty())
+    {
+      Mpi::Warning("Magnetostatic problem type does not support rational surface "
+                   "impedance boundary conditions!\n");
+    }
     if (!boundaries.lumpedport.empty())
     {
       Mpi::Warning(
@@ -361,6 +445,11 @@ void IoData::CheckConfiguration()
     {
       Mpi::Warning("Transient problem type does not support surface conductivity boundary "
                    "conditions!\n");
+    }
+    if (!boundaries.rational_impedance.empty())
+    {
+      Mpi::Warning("Transient problem type does not support rational surface "
+                   "impedance boundary conditions!\n");
     }
     if (!boundaries.auxpec.empty() || !boundaries.waveport.empty())
     {
@@ -387,6 +476,15 @@ void IoData::CheckConfiguration()
       Mpi::Warning(
           "BoundaryMode problem type does not support surface current excitation!\n");
     }
+  }
+
+  // Superconductor sheet boundaries (kinetic inductance) are only meaningful for the
+  // magnetostatic total-inductance extraction.
+  if (!boundaries.superconductor.empty() && problem.type != ProblemType::MAGNETOSTATIC)
+  {
+    Mpi::Warning(
+        "Only the Magnetostatic problem type supports Superconductor sheet boundary "
+        "conditions!\n");
   }
 
   // Resolve default values in configuration file.
@@ -485,21 +583,9 @@ void IoData::CheckConfiguration()
       solver.linear.pc_mat_shifted = 0;
     }
   }
-  // Compute matrix symmetry type for sparse direct solvers.
-  if (solver.linear.pc_mat_shifted || problem.type == ProblemType::TRANSIENT ||
-      problem.type == ProblemType::ELECTROSTATIC ||
-      problem.type == ProblemType::MAGNETOSTATIC)
-  {
-    solver.linear.pc_mat_sym = MatrixSymmetry::SPD;
-  }
-  else if (boundaries.periodic.wave_vector == std::array<double, 3>{0.0, 0.0, 0.0})
-  {
-    solver.linear.pc_mat_sym = MatrixSymmetry::SYMMETRIC;
-  }
-  else
-  {
-    solver.linear.pc_mat_sym = MatrixSymmetry::UNSYMMETRIC;
-  }
+  // The preconditioner matrix symmetry for sparse direct solvers is a derived runtime
+  // property; it is computed at Ksp construction (see GetPreconditionerMatrixSymmetry)
+  // rather than stored on LinearSolverData.
   if (solver.linear.mg_smooth_aux < 0)
   {
     if (problem.type == ProblemType::ELECTROSTATIC ||
@@ -518,9 +604,41 @@ void IoData::CheckConfiguration()
   {
     solver.linear.mg_smooth_order = std::max(2 * solver.order, 4);
   }
+  // A FilmAttributes boundary not declared a Superconductor is the λ→0 London limit:
+  // register it as a sheet with small effective L_ksq = λ⊥ = pec_lperp. The sheet
+  // inductance is L_ksq = λ·coth(d/λ); take λ = pec_lperp in its thick-film limit d ≫ λ
+  // (coth → 1) so L_ksq = pec_lperp independent of the finite-thickness correction. Must
+  // run before the ams_singular_op default below.
+  if (problem.type == ProblemType::MAGNETOSTATIC)
+  {
+    std::set<int> sc_attrs;
+    for (const auto &sc : boundaries.superconductor)
+    {
+      sc_attrs.insert(sc.attributes.begin(), sc.attributes.end());
+    }
+    for (const auto &[idx, fl] : boundaries.fluxloop)
+    {
+      for (auto attr : fl.film_attributes)
+      {
+        if (sc_attrs.insert(attr).second)
+        {
+          config::SuperconductorData sc;
+          sc.lambda_L = fl.pec_lperp;
+          sc.thickness = 50.0 * fl.pec_lperp;  // d >> λ: coth(d/λ) → 1, L_ksq → pec_lperp
+          sc.attributes = {attr};
+          boundaries.superconductor.push_back(sc);
+        }
+      }
+    }
+  }
   if (solver.linear.ams_singular_op < 0)
   {
-    solver.linear.ams_singular_op = (problem.type == ProblemType::MAGNETOSTATIC);
+    // A Superconductor sheet's (1/L_ksq) M_sheet penalty leaves a residual gradient null
+    // space, so K̃ is not the pure singular curl-curl operator; use full AMS (G-space
+    // corrections) rather than singular-AMS, which stalls in parallel.
+    const bool has_london_film = !boundaries.superconductor.empty();
+    solver.linear.ams_singular_op =
+        (problem.type == ProblemType::MAGNETOSTATIC && !has_london_film);
   }
   if (solver.linear.amg_agg_coarsen < 0)
   {
@@ -557,6 +675,57 @@ void IoData::CheckConfiguration()
     // subsequent preconditioners with complex coefficients.
     solver.linear.reorder_reuse = false;
   }
+
+  // EigenSolverBackend::DEFAULT and TimeSteppingScheme::DEFAULT are header-level
+  // aliases for the concrete values, so default-constructed fields are already at
+  // their resolved values and no runtime resolution is needed here.
+
+  // Validate build-availability of requested solver backends. Centralized here so
+  // downstream code never encounters an unavailable backend at runtime.
+#if !defined(PALACE_WITH_SLEPC)
+  MFEM_VERIFY(solver.eigenmode.type != EigenSolverBackend::SLEPC,
+              "Eigenmode solver backend SLEPc requested but Palace was not built with "
+              "SLEPc support!");
+  for (const auto &[idx, data] : boundaries.waveport)
+  {
+    MFEM_VERIFY(data.eigen_solver != EigenSolverBackend::SLEPC,
+                "Wave port " << idx
+                             << " eigen solver SLEPc requested but Palace was not built "
+                                "with SLEPc support!");
+  }
+#endif
+#if !defined(PALACE_WITH_ARPACK)
+  MFEM_VERIFY(solver.eigenmode.type != EigenSolverBackend::ARPACK,
+              "Eigenmode solver backend ARPACK requested but Palace was not built with "
+              "ARPACK support!");
+  for (const auto &[idx, data] : boundaries.waveport)
+  {
+    MFEM_VERIFY(data.eigen_solver != EigenSolverBackend::ARPACK,
+                "Wave port " << idx
+                             << " eigen solver ARPACK requested but Palace was not built "
+                                "with ARPACK support!");
+  }
+#endif
+#if !defined(MFEM_USE_SUPERLU)
+  MFEM_VERIFY(solver.linear.type != LinearSolver::SUPERLU,
+              "Linear solver SuperLU requested but Palace was not built with SuperLU "
+              "support!");
+#endif
+#if !defined(MFEM_USE_STRUMPACK)
+  MFEM_VERIFY(solver.linear.type != LinearSolver::STRUMPACK &&
+                  solver.linear.type != LinearSolver::STRUMPACK_MP,
+              "Linear solver STRUMPACK requested but Palace was not built with STRUMPACK "
+              "support!");
+#endif
+#if !defined(MFEM_USE_MUMPS)
+  MFEM_VERIFY(solver.linear.type != LinearSolver::MUMPS,
+              "Linear solver MUMPS requested but Palace was not built with MUMPS support!");
+#endif
+#if !defined(MFEM_USE_CUDSS)
+  MFEM_VERIFY(solver.linear.type != LinearSolver::CUDSS,
+              "Linear solver cuDSS requested but Palace was not built with cuDSS support!");
+#endif
+
   // Configure settings for quadrature rules and partial assembly.
   BilinearForm::pa_order_threshold = solver.pa_order_threshold;
   fem::DefaultIntegrationOrder::p_trial = solver.order;
@@ -608,6 +777,14 @@ void IoData::NondimensionalizeInputs(std::unique_ptr<mfem::Mesh> &mesh)
 
   // Impedance boundaries and lumped ports.
   for (auto &data : boundaries.impedance)
+  {
+    config::Nondimensionalize(units, data);
+  }
+  for (auto &data : boundaries.rational_impedance)
+  {
+    config::Nondimensionalize(units, data);
+  }
+  for (auto &data : boundaries.superconductor)
   {
     config::Nondimensionalize(units, data);
   }
@@ -673,6 +850,16 @@ void IoData::NondimensionalizeInputs(std::unique_ptr<mfem::Mesh> &mesh)
   config::Nondimensionalize(units, solver.eigenmode);
   config::Nondimensionalize(units, solver.driven);
   config::Nondimensionalize(units, solver.transient);
+
+  // Nondimensionalize Floquet reference frequency (GHz -> nondimensional angular
+  // frequency).
+  if (boundaries.periodic.floquet_reference_freq > 0.0)
+  {
+    boundaries.periodic.floquet_reference_freq =
+        2 * std::numbers::pi *
+        units.Nondimensionalize<Units::ValueType::FREQUENCY>(
+            boundaries.periodic.floquet_reference_freq);
+  }
 
   // Scale the serial mesh vertices on ranks that hold one. The ParMesh constructed later
   // by mesh::Partition inherits the scaled coordinates.

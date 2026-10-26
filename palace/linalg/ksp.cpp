@@ -7,6 +7,7 @@
 #include "fem/fespace.hpp"
 #include "linalg/amg.hpp"
 #include "linalg/ams.hpp"
+#include "linalg/cudss.hpp"
 #include "linalg/gmg.hpp"
 #include "linalg/jacobi.hpp"
 #include "linalg/mumps.hpp"
@@ -23,7 +24,7 @@ namespace palace
 namespace
 {
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<IterativeSolver<OperType>>
 ConfigureKrylovSolver(const config::LinearSolverData &linear, int verbose, MPI_Comm comm)
 {
@@ -58,6 +59,7 @@ ConfigureKrylovSolver(const config::LinearSolverData &linear, int verbose, MPI_C
   }
   ksp->SetInitialGuess(linear.initial_guess);
   ksp->SetRelTol(linear.tol);
+  ksp->SetAbsTol(linear.abs_tol);
   ksp->SetMaxIter(linear.max_it);
 
   // Configure preconditioning side (only for GMRES).
@@ -107,14 +109,17 @@ auto MakeWrapperSolver(const config::LinearSolverData &linear, U &&...args)
   // parallel assembled operator.
   constexpr bool save_assembled = !(false ||
 #if defined(MFEM_USE_SUPERLU)
-                                    std::is_same<T, SuperLUSolver>::value ||
+                                    std::is_same_v<T, SuperLUSolver> ||
 #endif
 #if defined(MFEM_USE_STRUMPACK)
-                                    std::is_same<T, StrumpackSolver>::value ||
-                                    std::is_same<T, StrumpackMixedPrecisionSolver>::value ||
+                                    std::is_same_v<T, StrumpackSolver> ||
+                                    std::is_same_v<T, StrumpackMixedPrecisionSolver> ||
 #endif
 #if defined(MFEM_USE_MUMPS)
-                                    std::is_same<T, MumpsSolver>::value ||
+                                    std::is_same_v<T, MumpsSolver> ||
+#endif
+#if defined(MFEM_USE_CUDSS)
+                                    std::is_same_v<T, CuDSSSolver> ||
 #endif
                                     false);
   return std::make_unique<MfemWrapperSolver<OperType>>(
@@ -122,10 +127,11 @@ auto MakeWrapperSolver(const config::LinearSolverData &linear, U &&...args)
       linear.complex_coarse_solve, linear.drop_small_entries, linear.reorder_reuse);
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 std::unique_ptr<Solver<OperType>>
-ConfigurePreconditionerSolver(const config::LinearSolverData &linear, int verbose,
-                              MPI_Comm comm, FiniteElementSpaceHierarchy &fespaces,
+ConfigurePreconditionerSolver(const config::LinearSolverData &linear,
+                              MatrixSymmetry pc_mat_sym, int verbose, MPI_Comm comm,
+                              FiniteElementSpaceHierarchy &fespaces,
                               FiniteElementSpaceHierarchy *aux_fespaces)
 {
   // Create the real-valued solver first.
@@ -155,9 +161,6 @@ ConfigurePreconditionerSolver(const config::LinearSolverData &linear, int verbos
       pc = MakeWrapperSolver<OperType, SuperLUSolver>(
           linear, comm, linear.sym_factorization, linear.superlu_3d, linear.reorder_reuse,
           print);
-#else
-      MFEM_ABORT("Solver was not built with SuperLU_DIST support, please choose a "
-                 "different solver!");
 #endif
       break;
     case LinearSolver::STRUMPACK:
@@ -166,9 +169,6 @@ ConfigurePreconditionerSolver(const config::LinearSolverData &linear, int verbos
           linear, comm, linear.sym_factorization, linear.strumpack_compression_type,
           linear.strumpack_lr_tol, linear.strumpack_butterfly_l,
           linear.strumpack_lossy_precision, linear.reorder_reuse, print);
-#else
-      MFEM_ABORT("Solver was not built with STRUMPACK support, please choose a "
-                 "different solver!");
 #endif
       break;
     case LinearSolver::STRUMPACK_MP:
@@ -177,26 +177,26 @@ ConfigurePreconditionerSolver(const config::LinearSolverData &linear, int verbos
           linear, comm, linear.sym_factorization, linear.strumpack_compression_type,
           linear.strumpack_lr_tol, linear.strumpack_butterfly_l,
           linear.strumpack_lossy_precision, linear.reorder_reuse, print);
-#else
-      MFEM_ABORT("Solver was not built with STRUMPACK support, please choose a "
-                 "different solver!");
 #endif
       break;
     case LinearSolver::MUMPS:
 #if defined(MFEM_USE_MUMPS)
       pc = MakeWrapperSolver<OperType, MumpsSolver>(
-          linear, comm, linear.pc_mat_sym, linear.sym_factorization,
+          linear, comm, pc_mat_sym, linear.sym_factorization,
           (linear.strumpack_compression_type == SparseCompression::BLR)
               ? linear.strumpack_lr_tol
               : 0.0,
           linear.reorder_reuse, print);
-#else
-      MFEM_ABORT(
-          "Solver was not built with MUMPS support, please choose a different solver!");
 #endif
       break;
     case LinearSolver::JACOBI:
       pc = std::make_unique<JacobiSmoother<OperType>>(comm);
+      break;
+    case LinearSolver::CUDSS:
+#if defined(MFEM_USE_CUDSS)
+      pc = MakeWrapperSolver<OperType, CuDSSSolver>(
+          linear, comm, pc_mat_sym, linear.sym_factorization, linear.reorder_reuse, print);
+#endif
       break;
     case LinearSolver::DEFAULT:
       MFEM_ABORT("Unexpected solver type for preconditioner configuration!");
@@ -241,28 +241,47 @@ ConfigurePreconditionerSolver(const config::LinearSolverData &linear, int verbos
 
 }  // namespace
 
-template <typename OperType>
-BaseKspSolver<OperType>::BaseKspSolver(const config::LinearSolverData &linear, int verbose,
+MatrixSymmetry GetPreconditionerMatrixSymmetry(const IoData &iodata)
+{
+  // Mirrors the prior derivation that used to be stored on LinearSolverData::pc_mat_sym.
+  const auto &linear = iodata.solver.linear;
+  if (linear.pc_mat_shifted || iodata.problem.type == ProblemType::TRANSIENT ||
+      iodata.problem.type == ProblemType::ELECTROSTATIC ||
+      iodata.problem.type == ProblemType::MAGNETOSTATIC)
+  {
+    return MatrixSymmetry::SPD;
+  }
+  if (iodata.boundaries.periodic.wave_vector == std::array<double, 3>{0.0, 0.0, 0.0})
+  {
+    return MatrixSymmetry::SYMMETRIC;
+  }
+  return MatrixSymmetry::UNSYMMETRIC;
+}
+
+template <OperatorType OperType>
+BaseKspSolver<OperType>::BaseKspSolver(const config::LinearSolverData &linear,
+                                       MatrixSymmetry pc_mat_sym, int verbose,
                                        FiniteElementSpaceHierarchy &fespaces,
                                        FiniteElementSpaceHierarchy *aux_fespaces)
-  : BaseKspSolver(
-        ConfigureKrylovSolver<OperType>(linear, verbose,
-                                        fespaces.GetFinestFESpace().GetComm()),
-        ConfigurePreconditionerSolver<OperType>(
-            linear, verbose, fespaces.GetFinestFESpace().GetComm(), fespaces, aux_fespaces))
+  : BaseKspSolver(ConfigureKrylovSolver<OperType>(linear, verbose,
+                                                  fespaces.GetFinestFESpace().GetComm()),
+                  ConfigurePreconditionerSolver<OperType>(
+                      linear, pc_mat_sym, verbose, fespaces.GetFinestFESpace().GetComm(),
+                      fespaces, aux_fespaces))
 {
   use_timer = true;
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 BaseKspSolver<OperType>::BaseKspSolver(const IoData &iodata,
                                        FiniteElementSpaceHierarchy &fespaces,
                                        FiniteElementSpaceHierarchy *aux_fespaces)
-  : BaseKspSolver(iodata.solver.linear, iodata.problem.verbose, fespaces, aux_fespaces)
+  : BaseKspSolver(iodata.solver.linear, GetPreconditionerMatrixSymmetry(iodata),
+                  iodata.problem.verbose, fespaces, aux_fespaces)
 {
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 BaseKspSolver<OperType>::BaseKspSolver(std::unique_ptr<IterativeSolver<OperType>> &&ksp,
                                        std::unique_ptr<Solver<OperType>> &&pc)
   : ksp(std::move(ksp)), pc(std::move(pc)), ksp_mult(0), ksp_mult_it(0), use_timer(false)
@@ -273,7 +292,7 @@ BaseKspSolver<OperType>::BaseKspSolver(std::unique_ptr<IterativeSolver<OperType>
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 void BaseKspSolver<OperType>::SetOperators(const OperType &op, const OperType &pc_op)
 {
   BlockTimer bt(Timer::KSP_SETUP, use_timer);
@@ -293,7 +312,7 @@ void BaseKspSolver<OperType>::SetOperators(const OperType &op, const OperType &p
   }
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 void BaseKspSolver<OperType>::Mult(const VecType &x, VecType &y) const
 {
   BlockTimer bt(Timer::KSP, use_timer);

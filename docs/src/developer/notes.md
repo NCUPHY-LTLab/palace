@@ -16,7 +16,7 @@ given *Palace* simulation.
 
 First, the mesh comes with its own unit of length. Users specify the conversion
 between one unit of length on the mesh to meters through the
-[`config["Model"]["L0"]`](../config/problem.md#config%5B%Model%22%5D) parameter.
+[`config["Model"]["L0"]`](../config/reference.md#config-model) parameter.
 
 Second, *Palace* defines a system of non-dimensional units where the actual
 solver operates.
@@ -34,7 +34,7 @@ The non-dimensional unit system is constructed as follows:
 
 Length: Lengths are measured in units of the characteristic length `Lc`, which
 is the mesh size in mesh units, unless `Lc` is manually specified in
-[`config["Model"]["Lc"]`](../config/problem.md#config%5B%Model%22%5D). The extent
+[`config["Model"]["Lc"]`](../config/reference.md#config-model). The extent
 of the mesh is 1 in these units, with extent defined as the largest single
 dimension (e.g., for a cuboid of size 10m x 20m x 40m, this would be 40m).
 
@@ -103,13 +103,13 @@ Automated source code formatting is performed using
 [`clang-format`](https://clang.llvm.org/docs/ClangFormat.html). Run:
 
 ```bash
-./scripts/format_source
+./scripts/format-source
 ```
 
 in the repository root directory to automatically use `clang-format` to format `C++` source
 as well as [`JuliaFormatter.jl`](https://github.com/domluna/JuliaFormatter.jl) for Julia and
 Markdown files. The script can be viewed
-[in the repository](https://github.com/awslabs/palace/blob/main/scripts/format_source).
+[in the repository](https://github.com/awslabs/palace/blob/main/scripts/format-source).
 
 The following conventions also apply:
 
@@ -145,15 +145,173 @@ A JSON format [configuration file](../config/config.md), for example named
 `config.json`, can be validated against the provided Schema using:
 
 ```bash
-./scripts/validate_config config.json
+./scripts/validate-config config.json
 ```
 
-[This script](https://github.com/awslabs/palace/blob/main/scripts/validate_config) uses
+[This script](https://github.com/awslabs/palace/blob/main/scripts/validate-config) uses
 Julia's [`JSONSchema.jl`](https://github.com/fredo-dedup/JSONSchema.jl) and the Schema
 provided in [`scripts/schema/`](https://github.com/awslabs/palace/blob/main/scripts/schema)
 to parse the configuration file and check that the fields are correctly specified. This
 script and the associated Schema are also installed and can be accessed in
 `<INSTALL_DIR>/bin`.
+
+### Automatic documentation generation
+
+The [configuration file reference](../config/reference.md) is generated from the same JSON Schema
+files, using the script
+[`docs/generate_config_docs.jl`](https://github.com/awslabs/palace/blob/main/docs/generate_config_docs.jl).
+When adding a new configuration key in C++, add a corresponding Schema entry, including `"title"`,
+`"description"`, `"type"`, and `"default"`/`"required"` where applicable. The generated
+`docs/src/config/reference.md` file is intentionally not committed; `docs/make.jl` regenerates it
+at the start of every documentation build, and `make docs-generate-config` is available for local
+preview while editing descriptions.
+
+The `"default"` values in the Schema are documentation and validation metadata; they are not
+read by the C++ solver, but they must still be real concrete values that mirror the parser's
+fixed defaults. A Schema default must validate against its own field schema and must not be a
+sentinel or placeholder such as `0`, `-1`, `""`, or `"Default"` when that value only means
+"choose later". For context-sensitive or derived defaults that Palace resolves based on the
+problem type, build options, mesh, or other settings, omit `"default"` from the Schema and
+describe the omission-based behavior in `"description"` instead; the resolved config is the
+authoritative record of any chosen value that can be known at parse time. If a fixed parser
+default changes in C++, update the corresponding Schema default in the same change.
+
+The generator reads the following JSON Schema fields:
+
+  - `"title"`: Human-readable section or field name. Falls back to the JSON key if absent.
+  - `"description"`: Extended documentation rendered below the field name.
+  - `"type"`: Shown in type badge (`integer`, `number`, etc.)
+  - `"default"`: Shown in `default` badge when present. Fields with fixed defaults should encode
+    them here. Context-sensitive defaults should omit `"default"` and explain the resolution
+    behavior in `"description"`; the generated docs then omit the default badge entirely.
+  - `"required"`: Fields listed here receive a `required` badge instead of a default.
+  - `"enum"` / `"oneOf"` with `"const"`: Renders an inline enumeration table with per-value
+    descriptions within the field's description.
+  - `"minimum"`, `"maximum"`, `"exclusiveMinimum"`, `"exclusiveMaximum"`: Shown in constraint badge.
+  - `"x-palace-advanced"`: Custom field; shows `advanced` badge if `true`.
+  - `"x-palace-deprecated"`: Custom field; shows `deprecated` badge if `true`.
+
+### Schema versioning
+
+The root schema (`scripts/schema/config-schema.json`) carries a standard `"$id"` field
+with a URN that embeds a [SchemaVer](https://docs.snowplow.io/docs/pipeline-components-and-non-pipeline-components/iglu/common-architecture/schemaver/) version, e.g.
+`"urn:palace:schema:1-0-0"`. This version tracks the configuration *contract*
+independently of the *Palace* release version, so downstream tooling can reason about
+configuration compatibility. Using the standard `"$id"` keyword means any JSON Schema
+tooling can identify the schema without custom extensions.
+
+SchemaVer uses the format `MODEL-REVISION-ADDITION`:
+
+  - MODEL: a breaking change to the schema's model — e.g. removing or renaming a field,
+    tightening validation so a previously-working config is rejected, or changing the
+    meaning or the default of a value.
+  - REVISION: a backward-compatible change that extends the model — e.g. a new optional
+    field, a new allowed enum value, or relaxing a constraint so previously-invalid
+    configs are now accepted.
+  - ADDITION: a change that does not affect which configurations are accepted and working
+    — e.g. updating a `description`, `title`, or other annotation.
+
+#### Relationship to the *Palace* version
+
+The two versions move independently: the schema's `MODEL-REVISION-ADDITION` is not tied
+numerically to *Palace*'s release version. The coupling is one-directional:
+
+  - A MODEL or REVISION schema change always bumps the *Palace* version.
+  - A *Palace* release does not imply a schema change. Most releases (bug fixes,
+    solver work, performance, docs) leave the configuration contract untouched and so do
+    not bump the schema version.
+
+Because the schema is versioned independently, a single schema version generally spans
+several *Palace* releases. The table below records the first *Palace* release shipping
+each schema version; a schema version applies to that release and all later ones up to
+(but not including) the next entry. Its source is the machine-readable
+[`schema-compatibility.json`](https://github.com/awslabs/palace/blob/main/scripts/schema/schema-compatibility.json)
+file. Add an entry there whenever a release introduces a new schema version; the
+documentation build generates this table from that file.
+
+```@raw html
+<!-- BEGIN GENERATED SCHEMA COMPATIBILITY TABLE -->
+```
+
+| Schema version | First *Palace* release | Notes                              |
+|:--------------:|:----------------------:|:---------------------------------- |
+| `1-0-0`        | `0.17.0`               | First explicitly-versioned schema. |
+| `1-6-0`        | `0.18.0`               |                                    |
+| `1-7-0`        | `0.18.1`               |                                    |
+
+```@raw html
+<!-- END GENERATED SCHEMA COMPATIBILITY TABLE -->
+```
+
+#### When and how to bump (PR checklist)
+
+Any pull request that modifies `scripts/schema/config-schema.json` must include the
+schema version bump in that same PR. This means the repository will accumulate many
+`0-x-0` and `0-0-y` bumps, but it makes every schema change individually trackable.
+
+ 1. Determine the bump size. Classify your schema change using the table above:
+
+      + MODEL: removing/renaming a field, tightening validation so a previously-working
+        config is rejected, changing defaults or semantics (breaking).
+      + REVISION: new optional field, new enum value, relaxing a constraint
+        (backward-compatible extension).
+      + ADDITION: updating a `description`, `title`, or other annotation (no effect on
+        accepted configurations). Tightening validation is also an ADDITION, not a MODEL
+        bump, when the newly rejected configurations never produced valid solver output:
+        ones the parser already rejected, or ones that only ran through a silent error
+        (turning a silent error into a loud one is a bug fix, and the accepted set of
+        *working* configurations is unchanged).
+
+ 2. Bump the `"$id"` version in `scripts/schema/config-schema.json`.
+    For example, going from `1-0-0` to `1-1-0`:
+
+    ```json
+    "$id": "urn:palace:schema:1-1-0",
+    ```
+
+ 3. Add a changelog entry in
+    [`CHANGELOG.md`](https://github.com/awslabs/palace/blob/main/CHANGELOG.md) under the
+    appropriate section for the current development version. The entry must include the
+    `SchemaVer` tag at the end, in the format:
+
+    ```
+    - <description of the change>. SchemaVer X-Y-Z [PR NNN](https://github.com/awslabs/palace/pull/NNN).
+    ```
+
+    Place the entry in the section that best describes the *motivation* (typically `New Features` for additions, `Interface Changes` for breaking changes).
+
+ 4. Do NOT update `scripts/schema/schema-compatibility.json`.
+    The compatibility data maps schema versions to *Palace* releases and is updated only
+    when a release is cut, not per-PR.
+
+##### Example changelog entry
+
+```markdown
+  - Introduced `"AbsTol"` option for linear solvers, defaulting to 0.0 to allow using an
+    absolute tolerance when defining convergence. SchemaVer 1-1-0
+    [PR 734](https://github.com/awslabs/palace/pull/734).
+```
+
+##### Handling merge conflicts on the version
+
+Multiple PRs bumping the schema version concurrently will conflict on the `"$id"` line.
+The last PR to merge must rebase and re-bump on top of the already-merged version. If
+several schema-changing PRs cluster together:
+
+  - Prefer rebasing quickly once the prior PR lands.
+  - Alternatively, land a single follow-up PR that consolidates the version bump and
+    changelog entries for the batch.
+
+#### Enforcement
+
+A CI check (the `check-schema-version` job in
+[`.github/workflows/style.yml`](https://github.com/awslabs/palace/blob/main/.github/workflows/style.yml))
+fails a pull request that modifies `scripts/schema/config-schema.json` without also
+changing the version in `"$id"`. This catches the common mistake of editing the
+contract but forgetting to bump the version; it does not (and cannot) verify that the
+size of the bump matches the change, so the MODEL/REVISION/ADDITION judgment above
+remains a code-review responsibility. When a change is genuinely annotation-only the bump
+is just an ADDITION, so the rule still applies.
 
 ## Timing
 
@@ -172,9 +330,21 @@ objects may be created for local timing purposes, but these will not count towar
 reported at the end of a log file or in the metadata JSON.
 
 For each *Palace* simulation, a table of timing statistics is printed out before the program
-terminates. The minimum, maximum, and average times across all MPI processes are included in
-the table. Timer categories are exclusive, they do not overlap. The categories for breaking
-down the total simulation time are:
+terminates. The Min., Max., and Avg. columns are reductions across MPI ranks (useful for
+spotting load imbalance). They are not statistics over repeated calls of a given block.
+
+Timer categories are exclusive: only one is active at a time, and they do not overlap.
+Indentation in the table groups related categories, but it is not a parent/child sum. An
+unindented row is the remainder: time spent in that category that was not captured by any
+of the indented rows beneath it. Adding a remainder to its indented neighbors recovers the
+total time for that group. For example, `Estimation + Construction + Solve` is the full
+error-estimation cost; a large `Estimation` remainder means work outside estimator
+construction and solve. Those remainder rows are meant to be small in a good breakdown,
+since they are the leftover after calling out the informative sub-pieces.
+
+The (average) rows in the table should add up to the Total line at the bottom.
+
+The categories for breaking down the total simulation time are:
 
 ```
 Initialization                  // < Time spent parsing the configuration file,
@@ -351,7 +521,67 @@ spack spec local.palace@develop
 will show you the spec for your most recent `palace` package, which you can
 compare with the one for `builtin.palace@develop`.
 
+## Publishing containers
+
+Palace containers are built by the `Containers` workflow. Publishing is handled
+by a separate `Publish Containers` workflow that runs after a build completes:
+the build only produces artifacts and makes no publishing decision, and the
+publish workflow decides (from the triggering event) whether and what to
+publish. Which channel a build publishes to depends on the event:
+
+| Event                                       | Published channel |
+|:------------------------------------------- |:----------------- |
+| Push to `main`                              | `main` (rolling)  |
+| Push of a release tag `vX.Y.Z`              | `X.Y.Z` (release) |
+| Manual dispatch of `Containers` on a branch | `dev-<branch>`    |
+| Pull request labeled `push-containers`      | `dev-<branch>`    |
+
+### What gets built
+
+Regular builds (push to `main`, pull requests, and manual dispatches) build only
+each runner's native microarchitecture:
+
+  - `sapphirerapids` (x64)
+  - `neoverse_v1` (arm64)
+
+Release tags (`vX.Y.Z`) build the full microarchitecture matrix instead, so
+a release publishes a tuned image for each target:
+
+  - `x86_64_v3`, `x86_64_v4`, `sapphirerapids` (x64)
+  - `aarch64`, `neoverse_v1`, `neoverse_v2` (arm64)
+
+### Publishing a `dev-<branch>` prototype from a branch
+
+To publish a `dev-<branch>` container, trigger the `Containers` workflow. The
+branch must be named `prefix/name`, with exactly one `/`: the prefix may contain
+only letters, numbers, `_`, or `.`, and the name must start with a letter or
+number and may also contain `_`, `.`, or `-` (for example,
+`yourname/my-feature`). Other names build fine but are refused at publication,
+because the `dev-<branch>` selector has to stay collision-free once the name is
+sanitized for ECR. `main` and release-tag publishing are unaffected.
+
+Using the [GitHub CLI](https://cli.github.com/):
+
+```bash
+# Build and publish a dev-<branch> prototype from the current branch.
+branch=$(git branch --show-current)
+gh workflow run containers.yml --ref "$branch"
+
+# Then follow the run (give it a moment to register), and note that publication
+# happens afterward in the separate Publish Containers workflow:
+gh run list --workflow=containers.yml --branch "$branch" --limit 1
+gh run watch <run-id-from-above>
+```
+
+From the web UI the same control is under `Actions → Containers → Run workflow`, where you pick the branch.
+
+Alternatively, apply the `push-containers` label to a pull request to publish
+its `dev-<branch>` prototype and keep it updated as you push new commits.
+
 ## Changelog
 
 Code contributions should generally be accompanied by an entry in the
-[changelog](https://github.com/awslabs/palace/blob/main/CHANGELOG.md).
+[changelog](https://github.com/awslabs/palace/blob/main/CHANGELOG.md). If your PR
+modifies the configuration schema, the changelog entry **must** include the `SchemaVer`
+tag — see [When and how to bump](#when-and-how-to-bump-pr-checklist) above for the
+format and workflow.

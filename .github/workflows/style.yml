@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 name: Style
 
 permissions:
@@ -19,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Install more recent clang-format from LLVM (match Homebrew v16)
+      # Install clang-format-19 from LLVM (newer than the distro package)
       - name: Install clang-format
         run: |
           wget -O- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
@@ -61,19 +64,38 @@ jobs:
             exit 0
           fi
 
+  check-schema-version:
+    runs-on: ubuntu-latest
+    # Only meaningful for pull requests, where there is a base branch to diff against.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check schema version bump
+        run: |
+          git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}"
+          ./scripts/check-schema-version "origin/${GITHUB_BASE_REF}"
+
+  check-changelog-schema-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check changelog schema versions
+        run: ./scripts/check-changelog-schema-versions
+
   check-tests-tags:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Check test tags
-        run: |
-          # Find TEST_CASE lines that don't have any of the required tags.
-          if grep -r "TEST_CASE(" test/unit | grep -v "\[Serial\]" | grep -v "\[Parallel\]" | grep -v "\[GPU\]" | grep -q "TEST_CASE("; then
-            echo "Error: Found TEST_CASE without required execution tags:"
-            grep -r "TEST_CASE(" test/unit | grep -v "\[Serial\]" | grep -v "\[Parallel\]" | grep -v "\[GPU\]"
-          exit 1
-          fi
+        run: ./scripts/check-test-tags test/unit
+
+      - name: Test CMake architecture helpers
+        run: cmake -P cmake/tests/MultiArchitecture.cmake
 
   check-license:
     runs-on: ubuntu-latest
@@ -83,3 +105,13 @@ jobs:
         with:
           config: .github/license-check/config.json
           strict: false
+
+  # Unit tests for the trusted container-publish scripts (.github/publish_containers/).
+  # These guard the publish authorization decision, so they must run on every
+  # change. Stdlib unittest only — no dependencies to install.
+  check-publish-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run publish script tests
+        run: python3 -m unittest discover -s .github/publish_containers -p 'test_*.py' -v

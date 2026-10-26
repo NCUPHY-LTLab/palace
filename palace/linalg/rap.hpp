@@ -153,7 +153,9 @@ private:
 
 public:
   // Construct the complex-valued parallel operator from the separate real and imaginary
-  // parts, inheriting ownership of the local operator.
+  // parts, inheriting ownership of the local operator. Owned CEED operators may be
+  // specialized: finalize them before construction and keep their structure and
+  // multiplicity unchanged afterward. Their passive QData values may still be updated.
   ComplexParOperator(std::unique_ptr<Operator> &&Ar, std::unique_ptr<Operator> &&Ai,
                      const FiniteElementSpace &trial_fespace,
                      const FiniteElementSpace &test_fespace, bool test_restrict);
@@ -238,6 +240,29 @@ std::unique_ptr<ComplexParOperator>
 BuildParSumOperator(const std::array<std::complex<double>, N> &coeff,
                     const std::array<const ComplexParOperator *, N> &ops,
                     bool set_essential = true);
+
+// Runtime-sized overload for when the number of summands is not known at compile time
+// (e.g. a variable number of frozen seed-correction terms in the NLEPS interpolation).
+std::unique_ptr<ComplexParOperator>
+BuildParSumOperator(const std::vector<std::complex<double>> &coeff,
+                    const std::vector<const ComplexParOperator *> &ops,
+                    bool set_essential = true);
+
+// Runtime-sized dispatcher taking abstract ComplexOperator pointers (each must be a
+// ComplexParOperator underneath).
+std::unique_ptr<ComplexParOperator>
+BuildParSumOperator(const std::vector<std::complex<double>> &coeff,
+                    const std::vector<const ComplexOperator *> &ops,
+                    bool set_essential = true);
+
+// Build (Σ coeff[i]·ops[i]) + A2, where A2 may be matrix-free (e.g. the wave-port modal
+// correction) and would otherwise be dropped by BuildParSumOperator's dynamic_cast. A
+// sparse ComplexParOperator A2 folds into the sum directly; an abstract ComplexOperator is
+// appended via a non-owning SumComplexOperator. Mirrors SpaceOperator::GetSystemMatrix.
+std::unique_ptr<ComplexOperator>
+BuildOperatorWithA2(const std::vector<std::complex<double>> &coeff,
+                    const std::vector<const ComplexOperator *> &ops,
+                    const ComplexOperator *A2);
 
 // Dispatcher to convert initializer list or C arrays into std::array whilst deducing sizes
 // and types.

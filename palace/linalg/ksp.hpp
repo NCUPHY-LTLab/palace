@@ -9,6 +9,7 @@
 #include "linalg/iterative.hpp"
 #include "linalg/operator.hpp"
 #include "linalg/solver.hpp"
+#include "utils/labels.hpp"
 
 namespace palace
 {
@@ -23,18 +24,20 @@ struct LinearSolverData;
 
 }  // namespace config
 
+// Derive the preconditioner matrix symmetry (used by sparse direct solvers) from the
+// problem type, shifted-preconditioner flag, and periodicity. This is a derived runtime
+// property, not a configuration field, so it is computed here rather than stored on
+// LinearSolverData.
+MatrixSymmetry GetPreconditionerMatrixSymmetry(const IoData &iodata);
+
 //
 // Linear solver class composing an iterative solver and preconditioner object.
 //
-template <typename OperType>
+template <OperatorType OperType>
 class BaseKspSolver
 {
-  static_assert(std::is_same<OperType, Operator>::value ||
-                    std::is_same<OperType, ComplexOperator>::value,
-                "Solver can only be defined for OperType = Operator or ComplexOperator!");
-
-  using VecType = typename std::conditional<std::is_same<OperType, ComplexOperator>::value,
-                                            ComplexVector, Vector>::type;
+  using VecType =
+      std::conditional_t<std::is_same_v<OperType, ComplexOperator>, ComplexVector, Vector>;
 
 protected:
   // The actual solver and preconditioner objects.
@@ -49,8 +52,8 @@ protected:
   bool use_timer;
 
 public:
-  BaseKspSolver(const config::LinearSolverData &linear, int verbose,
-                FiniteElementSpaceHierarchy &fespaces,
+  BaseKspSolver(const config::LinearSolverData &linear, MatrixSymmetry pc_mat_sym,
+                int verbose, FiniteElementSpaceHierarchy &fespaces,
                 FiniteElementSpaceHierarchy *aux_fespaces = nullptr);
   BaseKspSolver(const IoData &iodata, FiniteElementSpaceHierarchy &fespaces,
                 FiniteElementSpaceHierarchy *aux_fespaces = nullptr);
@@ -59,6 +62,9 @@ public:
 
   int NumTotalMult() const { return ksp_mult; }
   int NumTotalMultIterations() const { return ksp_mult_it; }
+
+  // Whether the most recent Mult converged to the requested tolerance.
+  bool GetConverged() const { return ksp->GetConverged(); }
 
   // Forward tolerance access to the underlying iterative solver.
   double GetRelTol() const { return ksp->GetRelTol(); }

@@ -11,12 +11,12 @@ SPDX-License-Identifier: Apache-2.0
 
 The perfect electric conductor (PEC) boundary condition (zero tangential electric field) is
 specified using the `"PEC"` boundary keyword under
-[`config["Boundaries"]`](../config/boundaries.md#boundaries%5B%22PEC%22%5D). It is a
+[`config["Boundaries"]`](../config/reference.md#config-boundaries-pec). It is a
 homogeneous Dirichlet boundary condition for the frequency or time domain finite element
 formulation, as well as the magnetostatic formulation.
 
 For electrostatic simulations, the homogeneous Dirichlet boundary condition is prescribed
-using the [`"Ground"`](../config/boundaries.md#boundaries%5B%22Ground%22%5D) boundary
+using the [`"Ground"`](../config/reference.md#config-boundaries-ground) boundary
 keyword which prescribes zero voltage at the boundary.
 
 ## Perfect magnetic conductor (PMC) boundary
@@ -26,28 +26,44 @@ a homogeneous Neumann boundary condition for the frequency or time domain finite
 formulation, as well as the magnetostatic formulation. It is the natural boundary condition
 and thus it has the same effect as not specifying any additional boundary condition on
 external boundary surfaces. It can also be explicitly specified using the `"PMC"` boundary
-keyword under [`config["Boundaries"]`](../config/boundaries.md#boundaries%5B%22PMC%22%5D).
+keyword under [`config["Boundaries"]`](../config/reference.md#config-boundaries-pmc).
 
 Likewise, for electrostatic simulations, the homogeneous Neumann boundary condition implies
 a zero-charge boundary, and thus zero gradient of the voltage in the direction normal to the
 boundary. This is specified using the `"ZeroCharge"` boundary keyword under
-[`config["Boundaries"]`](../config/boundaries.md#boundaries%5B%22ZeroCharge%22%5D).
+[`config["Boundaries"]`](../config/reference.md#config-boundaries-zerocharge).
 
 ## Impedance boundary
 
 The impedance boundary condition is a mixed (Robin) boundary condition and is available for
 the frequency or time domain finite element formulations and thus for eigenmode or frequency
 or time domain driven simulation types. It is specified using the
-[`"Impedance"`](../config/boundaries.md#boundaries%5B%22Impedance%22%5D) boundary keyword.
+[`"Impedance"`](../config/reference.md#config-boundaries-impedance) boundary keyword.
 The surface impedance relating the tangential electric and magnetic fields on the boundary
 is computed from the parallel impedances due to the specified resistance, inductance, and
 capacitance per square.
+
+## Rational impedance boundary
+
+A surface impedance boundary whose per-square impedance is an arbitrary rational function
+of frequency can be specified using the
+[`"RationalImpedance"`](../config/reference.md#config-boundaries-rationalimpedance)
+boundary keyword. The surface impedance ``Z_s(s) = N(s)/D(s)``, with ``s = i\omega``, is
+given by the real coefficients of the numerator and denominator polynomials, ordered from
+highest to lowest degree (the roots of ``N`` and ``D`` are the zeros and poles of ``Z_s``).
+This generalizes the parallel-RLC [impedance boundary](#Impedance-boundary) to any passive
+lumped-network response, for example a fitted rational approximation of a measured or
+synthesized surface impedance. Warnings are emitted for inputs that cannot correspond to a
+passive (positive-real) impedance. It is available only for frequency domain driven,
+eigenmode, and boundary mode simulations. In eigenmode simulations, when the resulting
+contribution to the system matrix is not polynomial in frequency, it is handled by the
+nonlinear eigenvalue solver.
 
 ## Absorbing (scattering) boundary
 
 Absorbing boundary conditions at farfield boundaries, also referred to as scattering
 boundary conditions, can be applied using the `"Absorbing"` boundary keyword under
-[`config["Boundaries"]`](../config/boundaries.md#boundaries%5B%22Absorbing%22%5D). The
+[`config["Boundaries"]`](../config/reference.md#config-boundaries-absorbing). The
 first-order absorbing boundary condition is a special case of the above impedance boundary
 and is available for eigenmode or frequency or time domain driven simulation types. The
 second-order absorbing boundary condition is only available for frequency domain
@@ -62,7 +78,7 @@ for computational electromagnetics and will be a useful addition.
 ## Finite conductivity boundary
 
 A finite conductivity boundary condition can be specified using the
-[`"Conductivity"`](../config/boundaries.md#boundaries%5B%22Conductivity%22%5D) boundary
+[`"Conductivity"`](../config/reference.md#config-boundaries-conductivity) boundary
 keyword. This boundary condition models the effect of a boundary with non-infinite
 conductivity (an imperfect conductor) for conductors with thickness much larger than the
 skin depth. It is available only for frequency domain driven and eigenmode simulations. For more
@@ -73,7 +89,7 @@ reference.
 ## Periodic boundary
 
 Periodic boundary conditions on an existing mesh can be specified using the
-["Periodic"](../config/boundaries.md#boundaries%5B%22Periodic%22%5D) boundary keyword. This
+["Periodic"](../config/reference.md#config-boundaries-periodic) boundary keyword. This
 boundary condition enforces that the solution on the specified boundaries be exactly equal,
 and requires that the surface meshes on the donor and receiver boundaries be identical up to
 translation or rotation. Periodicity in *Palace* is also supported through meshes generated
@@ -88,7 +104,7 @@ for implementation details.
 
 ## Lumped and wave port excitation
 
-  - [`config["Boundaries"]["LumpedPort"]`](../config/boundaries.md#boundaries%5B%22LumpedPort%22%5D) :
+  - [`config["Boundaries"]["LumpedPort"]`](../config/reference.md#config-boundaries-lumpedport) :
     A lumped port applies a similar boundary condition to a
     [surface impedance](#Impedance-boundary) boundary, but takes on a special meaning for
     each simulation type.
@@ -105,9 +121,9 @@ for implementation details.
     Note that a single lumped port (given by a single integer `"Index"`) can be made up of
     multiple boundary attributes in the mesh in order to model, for example, a multielement
     lumped port. To use this functionality, use the `"Elements"` object under
-    [`"LumpedPort"`](../config/boundaries.md#boundaries%5B%22LumpedPort%22%5D).
+    [`"LumpedPort"`](../config/reference.md#config-boundaries-lumpedport).
 
-  - [`config["Boundaries"]["WavePort"]`](../config/boundaries.md#boundaries%5B%22WavePort%22%5D) :
+  - [`config["Boundaries"]["WavePort"]`](../config/reference.md#config-boundaries-waveport) :
     Numeric wave ports are available for frequency domain driven and eigenmode simulations. In this case,
     a port boundary condition is applied with an optional excitation using a modal field
     shape which is computed by solving a 2D boundary mode eigenproblem on each wave port
@@ -120,24 +136,89 @@ for implementation details.
     analysis. Impedance (`"Impedance"`), absorbing (`"Absorbing"`), and conductivity
     (`"Conductivity"`) boundaries are treated as Robin boundary conditions in the wave port
     eigenvalue problem, matching the standalone boundary mode solver.
-    [`config["Boundaries"]["WavePortPEC"`](../config/boundaries.md#boundaries%5B%22WavePortPEC%22%5D)
+    [`config["Boundaries"]["WavePortPEC"`](../config/reference.md#config-boundaries-waveportpec)
     allows forcing specific boundary attributes to act as PEC in the wave port solve,
     overriding any other boundary condition (e.g. impedance or absorbing) that may be
     assigned to the same attributes. In addition, boundaries of wave ports other than the
     wave port currently being considered, in the case wave ports are touching and share one
     or more edges, are also considered as PEC for the wave port boundary mode analysis.
 
+    The port modes are ranked by their distance to a target, by default just above the
+    bulk propagation constants of the port materials, which ranks the modes below it by
+    decreasing wave number. The kinetic inductance of superconducting lines makes their
+    modes slower than bulk waves, above the default target; they are found too, but on a
+    cross-section with several modes, set
+    [`"Target"`](../config/reference.md#config-boundaries-waveport-target) to an estimate
+    of the effective index of the desired mode.
+    The driven wave port boundary condition models a lossless port line: for a lossy line,
+    the reflection coefficient of a matched port is of the order of the ratio of the
+    attenuation to the phase constant.
+
     Unlike lumped ports, wave port boundaries cannot be defined internal to the
     computational domain and instead must exist only on the outer boundary of the domain
     (they are to be "one-sided" in the sense that mesh elements only exist on one side of
-    the boundary).
+    the boundary). A wave port boundary must also be planar; both the 2D boundary mode
+    formulation and coordinate-based `"VoltagePath"` postprocessing use a single tangent
+    frame and surface normal for the complete port face.
+
+    The overall sign of the wave port mode E-field is internally fixed by an arbitrary
+    convention that does not necessarily match the polarity convention of lumped ports
+    in the same simulation. As a result, when mixing lumped and wave ports in a driven
+    simulation, the cross-type S-parameters (e.g. `S_{ij}` where one port is lumped and
+    the other is a wave port) may appear 180° out of phase relative to what would be
+    obtained with all-lumped or all-wave ports. To pin the wave-port polarity, specify
+    one of the following on each wave port — both list the **signal** (high-potential)
+    terminal first and the **ground** (low-potential) terminal second:
+
+      + [`"VoltagePath"`](../config/reference.md#config-boundaries-waveport-voltagepath): an
+        ordered list of coordinate points across the port face, directed signal → ground.
+        The mode is flipped so that `\int E_{\text{mode}} \cdot dl > 0` along this path.
+        Also enables ``Z_{PV}`` postprocessing. Requires GSLIB.
+      + [`"PolarityAttributes"`](../config/reference.md#config-boundaries-waveport-polarityattributes):
+        a pair of parent-mesh boundary attributes `[signal, ground]` (e.g. distinct PEC
+        attributes for the two terminals). The mode is flipped so that the modal E-field
+        points from the signal attribute toward the ground attribute. Lightweight
+        polarity-only alternative to `"VoltagePath"` (no GSLIB).
+
+  - [`config["Boundaries"]["FloquetPort"]`](../config/reference.md#config-boundaries-floquetport) :
+    Floquet ports are available for frequency domain driven simulations on periodic
+    structures (gratings, metasurfaces, photonic crystals). They provide an absorbing
+    boundary condition that decomposes the scattered field into Floquet diffraction orders
+    and extracts power-normalized S-parameters for each propagating order.
+
+    Floquet ports require periodic boundary conditions to be configured under
+    [`config["Boundaries"]["Periodic"]`](../config/reference.md#config-boundaries-periodic).
+    The `"FloquetWaveVector"` in the periodic configuration specifies the tangential
+    component of the incident wave vector, which determines the angle of incidence. For
+    normal incidence, set the wave vector to zero. For frequency sweeps at a fixed angle
+    of incidence, set `"FloquetReferenceFrequency"` to the frequency (in GHz) at which the
+    wave vector is defined. The wave vector then scales linearly with frequency according
+    to ``\bm{k}_F(f) = \bm{k}_{F,\mathrm{ref}} f / f_\mathrm{ref}``, where
+    ``\bm{k}_{F,\mathrm{ref}}`` is `"FloquetWaveVector"` and ``f_\mathrm{ref}`` is
+    `"FloquetReferenceFrequency"`, maintaining a constant incidence angle across the sweep.
+
+    The incident field is a plane wave in the specular (0,0) diffraction order with
+    user-specified polarization (TE, TM, or circular RHC/LHC). S-parameters are extracted
+    for all propagating diffraction orders within `"MaxOrder"` and reported in the
+    `port-floquet-S.csv` output file. Each mode is labeled as
+    `S[P<port>(<m>,<n>)<pol>][<exc>]` where `<port>` is the port index, `(<m>,<n>)` is
+    the diffraction order, `<pol>` is the polarization (TE/TM or RHC/LHC for circular
+    excitation), and `<exc>` is the excitation index. Values of `nan` are given to non-propagating
+    modes.
+
+    The port boundary must be planar and on the true boundary of the computational domain.
+    The medium adjacent to the port must be homogeneous and isotropic.
 
 For each port, the excitation is normalized to have unit incident power over the port boundary
-surface.
+surface. Lumped ports with reactive elements (`"L"` and/or `"C"`, or the surface-parameter
+equivalents `"Ls"` and/or `"Cs"`) may also be excited, including purely reactive ports with
+`"R": 0` (`"Rs": 0`). For a purely reactive port (`R = 0`) the power normalization
+references an internal unit impedance; see the [mathematical reference](../reference.md#Lumped-ports-and-wave-ports)
+for the S-parameter interpretation in this case.
 
 The presence of an incident excitation at a port is controlled by the settings
-[`config["Boundaries"]["LumpedPort"][]["Excitation"]`](../config/boundaries.md#boundaries%5B%22LumpedPort%22%5D)
-and [`config["WavePort"][]["Excitation"]`](../config/boundaries.md#boundaries%5B%22WavePort%22%5D).
+[`config["Boundaries"]["LumpedPort"][]["Excitation"]`](../config/reference.md#config-boundaries-lumpedport)
+and [`config["WavePort"][]["Excitation"]`](../config/reference.md#config-boundaries-waveport).
 The `Excitation` settings can either be specified as non-negative integers or booleans.
 
   - *Boolean setting*: `true`/`false` indicates the presence / absence of an incident excitation.
@@ -154,24 +235,68 @@ For frequency domain driven simulations only, it is possible to specify multiple
 same simulation using different positive integers ("multi-excitation"). These excitations are
 simulated consecutively during the Palace run. The results are printed to shared csv files. When
 there are multiple excitations, the columns of the csv files are post-indexed by the excitation
-index (e.g. `Φ_elec[1][5] (C)` denoting the flux through surface 1 of excitation 5). Note that a
-port can only be part of one excitation.
+index (e.g. `Φ_elec[1][5] (C)` denoting the flux through surface 1 of excitation 5). The far-field
+file (`farfield-rE.csv`) is the exception: it has one row per (frequency, angle) pair so the
+excitation index is encoded as a row column (`exc`) rather than a column suffix. Note that a port
+can only be part of one excitation.
 
 !!! warning "Indexing"
 
-    Any `"Index"` of [`"LumpedPort"`](../config/boundaries.md#boundaries%5B%22LumpedPort%22%5D),
-    [`"WavePort"`](../config/boundaries.md#boundaries%5B%22WavePort%22%5D),
-    [`"SurfaceCurrent"`](../config/boundaries.md#boundaries%5B%22SurfaceCurrent%22%5D), or
-    [`"Terminal"`](../config/boundaries.md#boundaries%5B%22Terminal%22%5D) must be unique, including between
-    different boundary conditions types (e.g. you can not have an lumped port and wave port both with
+    Any `"Index"` of [`"LumpedPort"`](../config/reference.md#config-boundaries-lumpedport),
+    [`"WavePort"`](../config/reference.md#config-boundaries-waveport),
+    [`"FloquetPort"`](../config/reference.md#config-boundaries-floquetport),
+    [`"SurfaceCurrent"`](../config/reference.md#config-boundaries-surfacecurrent), or
+    [`"Terminal"`](../config/reference.md#config-boundaries-terminal) must be unique, including between
+    different boundary conditions types (e.g. you can not have a lumped port and wave port both with
     `Index: 5`).
 
 ## Surface current excitation
 
 An alternative source excitation to lumped or wave ports for frequency and time domain
 driven simulations is a surface current excitation, specified under
-[`config["Boundaries"]["SurfaceCurrent"]`](../config/boundaries.md#boundaries%5B%22SurfaceCurrent%22%5D).
+[`config["Boundaries"]["SurfaceCurrent"]`](../config/reference.md#config-boundaries-surfacecurrent).
 This is the excitation used for magnetostatic simulation types as well. This option
 prescribes a unit source surface current excitation on the given boundary in order to
 excite the model. It does does not prescribe any boundary condition to the model and only
 affects the source term on the right hand side.
+
+## Flux boundary
+
+Flux loop boundary conditions are available for magnetostatic simulations and are specified
+using the [`"FluxLoop"`](../config/reference.md#config-boundaries-fluxloop) boundary
+keyword. This boundary condition prescribes magnetic flux through specified holes in
+conducting surfaces, enabling inductance matrix extraction for flux-based excitations. The
+flux loop boundary condition works by:
+
+ 1. **Identifying holes**: Mesh boundary attributes specify holes through which flux is
+    prescribed
+ 2. **Constraining the fluxoid**: The fluxoid through each hole (the magnetic flux plus the
+    London kinetic term, reducing to the magnetic flux in the perfect-conductor limit) is set
+    to the specified nondimensional excitation amplitude
+ 3. **Building the drive**: A curl-free cohomology generator on the film carries that fluxoid
+    around the hole and drives the shifted London penalty
+ 4. **Computing inductance**: The resulting 3D field solutions enable inductance matrix
+    extraction
+
+Flux-loop excitations can be combined with surface-current excitations in the same
+magnetostatic simulation, in which case Palace reports a single inductance matrix covering
+both port types. Every surface-current element must provide an oriented `"Aperture"` with
+`"Attributes"` and a Cartesian `"Direction"`, and all current ports must be `"Open"` when
+inactive; see [Magnetostatic problems](problem.md#Magnetostatic-problems) for details. The
+`"FluxAmounts"` entries are nondimensional internal excitation amplitudes, analogous to
+unit-current excitations for current-driven magnetostatic solves. Palace reports
+`terminal-Phi.csv` in physical webers.
+
+!!! note "Flux loop requirements"
+
+    Flux loop boundaries require:
+
+      - Metal surface attributes defining the conducting surface containing the holes
+      - Hole attributes specifying the boundaries through which flux is prescribed
+      - Flux amounts defining the magnetic flux through each hole
+      - Loop normal vector defining the flux orientation
+
+The mesh must be topologically compatible with the flux loop geometry, with holes properly
+defined as boundary surfaces within the conducting region. Currently, only planar holes are
+supported; the hole axis is taken from the flux loop `"Direction"` and may point along any
+Cartesian direction. Both conformal and nonconformal adaptive mesh refinement are supported.

@@ -11,15 +11,20 @@
 #include <optional>
 #include <type_traits>
 #include <vector>
+#include <Eigen/Dense>
 #include <mfem.hpp>
+#include "fem/boundary_derived_field_bundle.hpp"
+#include "fem/boundary_physical_trace.hpp"
 #include "fem/gridfunction.hpp"
 #include "fem/interpolator.hpp"
+#include "fem/point_field_evaluator.hpp"
 #include "linalg/operator.hpp"
 #include "linalg/vector.hpp"
 #include "models/domainpostoperator.hpp"
 #include "models/lumpedportoperator.hpp"
 #include "models/postoperatorcsv.hpp"
 #include "models/surfacepostoperator.hpp"
+#include "utils/ceedparaviewdatacollection.hpp"
 #include "utils/configfile.hpp"
 #include "utils/filesystem.hpp"
 #include "utils/units.hpp"
@@ -28,7 +33,9 @@ namespace palace
 {
 
 class CurlCurlOperator;
+class RomOperator;
 class ErrorIndicator;
+class FaceSamplingPlan;
 class IoData;
 class LaplaceOperator;
 class MaterialOperator;
@@ -49,35 +56,34 @@ struct SolverData;
 // Statically specify if solver uses real or complex fields.
 
 template <ProblemType solver_t>
-constexpr bool HasComplexGridFunction()
+consteval bool HasComplexGridFunction()
 {
   return solver_t == ProblemType::DRIVEN || solver_t == ProblemType::EIGENMODE ||
          solver_t == ProblemType::BOUNDARYMODE;
 }
 
 // Statically specify what fields a solver uses
-// TODO(C++20): Change these to inline consteval and use with requires.
 
 template <ProblemType solver_t>
-constexpr bool HasVGridFunction()
+consteval bool HasVGridFunction()
 {
   return solver_t == ProblemType::ELECTROSTATIC;
 }
 
 template <ProblemType solver_t>
-constexpr bool HasAGridFunction()
+consteval bool HasAGridFunction()
 {
   return solver_t == ProblemType::MAGNETOSTATIC;
 }
 
 template <ProblemType solver_t>
-constexpr bool HasEGridFunction()
+consteval bool HasEGridFunction()
 {
   return solver_t != ProblemType::MAGNETOSTATIC;
 }
 
 template <ProblemType solver_t>
-constexpr bool HasBGridFunction()
+consteval bool HasBGridFunction()
 {
   return solver_t != ProblemType::ELECTROSTATIC;
 }
@@ -109,7 +115,6 @@ protected:
   // Pointer to operator handling discretization and FEM space appropriate to solver. It
   // also contains the reference to all domains, boundary conditions, etc. needed for
   // measurement and printing.
-  // TODO(C++20): Use std::reference_wrapper with incomplete types.
   fem_op_t<solver_t> *fem_op;
 
   // Unit converter from IOData to scale mesh and measurements. Lightweight class so it is
@@ -130,6 +135,7 @@ protected:
   // Field output format control flags.
   bool enable_paraview_output = false;
   bool enable_gridfunction_output = false;
+  bool field_coefficients_initialized = false;
 
   // How many / which fields to output.
   int output_delta_post = 0;                          // printing rate (TRANSIENT)
@@ -180,7 +186,8 @@ protected:
   // ParaView data collection: writing fields to disk for visualization.
   // This is an optional, since ParaViewDataCollection has no default (empty) ctor,
   // and we only want initialize it if ShouldWriteParaviewFields() returns true.
-  std::optional<mfem::ParaViewDataCollection> paraview, paraview_bdr;
+  std::optional<CeedParaViewDataCollection> paraview;
+  std::optional<CeedParaViewDataCollection> paraview_bdr;
 
   // MFEM grid function output details.
   std::string gridfunction_output_dir;
@@ -188,16 +195,42 @@ protected:
 
   // Measurements of field solution for ParaView files (full domain or surfaces).
 
-  // Poynting Coefficient (vector for 3D, scalar Sn for boundary mode), Electric Boundary
-  // Field (re+im), Magnetic Boundary Field (re+im), Vector Potential Boundary Field,
-  // Surface Current (re+im).
-  std::unique_ptr<mfem::VectorCoefficient> S, E_sr, E_si, B_sr, B_si, A_s, J_sr, J_si;
-  std::unique_ptr<mfem::Coefficient> Sn;
-  bool sn_registered = false;
+  // Poynting Coefficient (vector for 3D), Electric Boundary Field (re+im), Magnetic
+  // Boundary Field (re+im), Surface Current (re+im).
+  std::unique_ptr<mfem::VectorCoefficient> S, E_sr, E_si, B_sr, B_si, J_sr, J_si;
 
-  // Electric Energy Density, Magnetic Energy Density, Scalar Potential Boundary Field,
-  // Surface Charge (re+im).
-  std::unique_ptr<mfem::Coefficient> U_e, U_m, V_s, Q_sr, Q_si;
+  // Electric Energy Density, Magnetic Energy Density, Surface Charge (re+im).
+  std::unique_ptr<mfem::Coefficient> U_e, U_m, Q_sr, Q_si;
+
+  // libCEED evaluators and optional output grid functions for the domain coefficient
+  // fields (U_e, U_m, S), replacing per-point host coefficient evaluation at ParaView
+  // save time when supported. ParaView output uses lazy component-major point buffers;
+  // gridfunction output still uses the GridFunction path when requested.
+  std::unique_ptr<mfem::L2_FECollection> viz_fec;
+  std::unique_ptr<mfem::ParFiniteElementSpace> viz_scalar_fespace, viz_vector_fespace;
+  std::unique_ptr<mfem::ParGridFunction> U_e_gf, U_m_gf, S_gf, Sn_gf;
+  std::unique_ptr<PointFieldEvaluator> E_domain_eval, B_domain_eval, En_domain_eval,
+      Bt_domain_eval, V_domain_eval, A_domain_eval, U_e_eval, U_m_eval, S_eval, Sn_eval;
+
+  // libCEED evaluators for boundary collection fields (E_s, B_s, Q_s, J_s, U_e, U_m,
+  // S). CeedParaViewDataCollection evaluates these lazily into one temporary buffer per
+  // field in the same integer boundary-element/refined-point order used for writing,
+  // avoiding coefficient adapters or floating-point point lookup at save time.
+  std::unique_ptr<PointFieldEvaluator> E_bdr_eval, B_bdr_eval, V_bdr_eval, A_bdr_eval,
+      Q_bdr_eval, J_bdr_eval, Ue_bdr_eval, Um_bdr_eval, S_bdr_eval;
+  // Im{ε}-weighted surface charge evaluator for complex fields in lossy dielectrics
+  // (Q_s = (Re{ε} + i Im{ε}) E ⋅ n), used when the fused boundary bundle is unavailable.
+  std::unique_ptr<PointFieldEvaluator> Q_bdr_eval_imag;
+  // One immutable boundary lattice/trace plan is shared by every compatible ParaView
+  // evaluator built for this PostOperator setup.
+  std::shared_ptr<const FaceSamplingPlan> bdr_sampling_plan;
+  // Save-generation-scoped physical ND/RT/scalar traces shared by every compatible
+  // boundary point evaluator. The cache keeps canonical side traces device-resident;
+  // individual fields retain their legacy output routing.
+  std::shared_ptr<BoundaryPhysicalTraceCache> bdr_trace_cache;
+  // 3D E/B boundary family bundle. Compatible direct-VTU fields register non-owning
+  // packed slices from this result; unrelated fields retain individual evaluators.
+  std::shared_ptr<BoundaryDerivedFieldBundle> bdr_derived_bundle;
 
   // Wave port boundary mode field postprocessing.
   struct WavePortFieldData
@@ -206,18 +239,28 @@ protected:
   };
   std::map<int, WavePortFieldData> port_E0;
 
-  // Setup coefficients for field postprocessing.
+  // Setup coefficients/evaluators for field output after the first solution is ready.
+  // Construction-only FE staging is detached and freed immediately; assembled libCEED
+  // operators remain cached for later writes in a frequency or mode sweep.
   void SetupFieldCoefficients();
+  void EnsureFieldCoefficientsSetup();
 
   // Initialize Paraview, register all fields to write.
   void InitializeParaviewDataCollection(const fs::path &sub_folder_name = "");
+  void EnsureParaviewDataCollection();
 
 public:
   // Public overload for the driven solver only, that takes in an excitation index and
   // sets the correct sub_folder_name path for the primary function above.
-  template <ProblemType U = solver_t>
-  auto InitializeParaviewDataCollection(int ex_idx)
-      -> std::enable_if_t<U == ProblemType::DRIVEN, void>;
+  void InitializeParaviewDataCollection(int ex_idx)
+    requires(solver_t == ProblemType::DRIVEN);
+
+  // Whether this solve requests any field output. Drivers use this to release solver
+  // memory before constructing the field-output evaluators only when necessary, and the
+  // adaptive online sweep uses it to choose an ordering that keeps frequency-dependent port
+  // state hot across excitations.
+  bool WillWriteFields() const { return ShouldWriteFields(); }
+  bool WillWriteFields(int step) const { return ShouldWriteFields(step); }
 
 protected:
   // Write to disk the E- and B-fields extracted from the solution vectors. Note that
@@ -247,6 +290,12 @@ protected:
   mutable InterpolationOperator interp_op;  // E & B fields: mutates during measure
 
   mutable Measurement measurement_cache;
+
+  // Exact reduced-coordinate domain-energy forms for adaptive online postprocessing.
+  bool reduced_postprocessing_ready = false;
+  bool reduced_postprocessing_checked = false;
+  Eigen::MatrixXd reduced_energy_E, reduced_energy_H;
+  std::map<int, std::pair<Eigen::MatrixXd, Eigen::MatrixXd>> reduced_domain_energy;
 
   // Per-entry impedance postprocessing configuration (keyed by config index).
   struct ImpedancePostproConfig
@@ -279,8 +328,9 @@ protected:
   void MeasureDomainFieldEnergy() const;
   void MeasureLumpedPorts() const;
   void MeasureWavePorts() const;
+  void MeasureFloquetPorts() const;
   void MeasureLumpedPortsEig() const;  // Depends: DomainFieldEnergy, LumpedPorts
-  void MeasureSParameter() const;      // Depends: LumpedPorts, WavePorts
+  void MeasureSParameter() const;      // Depends: LumpedPorts, WavePorts, FloquetPorts
   void MeasureSurfaceFlux() const;
   void MeasureFarField() const;
   void MeasureInterfaceEFieldEnergy() const;  // Depends: LumpedPorts
@@ -293,6 +343,7 @@ protected:
     MeasureDomainFieldEnergy();
     MeasureLumpedPorts();
     MeasureWavePorts();
+    MeasureFloquetPorts();
     MeasureLumpedPortsEig();
     MeasureSParameter();
     MeasureSurfaceFlux();
@@ -311,12 +362,9 @@ protected:
   // These functions are private helper functions. We want to enforce that a caller passes
   // the appropriate ones as part of the MeasureAndPrintAll interface, rather than do a
   // runtime check to see that they have been set.
-  //
-  // TODO(C++20): Switch SFINAE to requires.
 
-  template <ProblemType U = solver_t>
-  auto SetEGridFunction(const ComplexVector &e, bool exchange_face_nbr_data = true)
-      -> std::enable_if_t<HasEGridFunction<U>() && HasComplexGridFunction<U>(), void>
+  void SetEGridFunction(const ComplexVector &e, bool exchange_face_nbr_data = true)
+    requires(HasEGridFunction<solver_t>() && HasComplexGridFunction<solver_t>())
   {
     E->Real().SetFromTrueDofs(e.Real());  // Parallel distribute
     E->Imag().SetFromTrueDofs(e.Imag());
@@ -327,9 +375,8 @@ protected:
     }
   }
 
-  template <ProblemType U = solver_t>
-  auto SetEGridFunction(const Vector &e, bool exchange_face_nbr_data = true)
-      -> std::enable_if_t<HasEGridFunction<U>() && !HasComplexGridFunction<U>(), void>
+  void SetEGridFunction(const Vector &e, bool exchange_face_nbr_data = true)
+    requires(HasEGridFunction<solver_t>() && !HasComplexGridFunction<solver_t>())
   {
     E->Real().SetFromTrueDofs(e);
     if (exchange_face_nbr_data)
@@ -338,9 +385,8 @@ protected:
     }
   }
 
-  template <ProblemType U = solver_t>
-  auto SetBGridFunction(const ComplexVector &b, bool exchange_face_nbr_data = true)
-      -> std::enable_if_t<HasBGridFunction<U>() && HasComplexGridFunction<U>(), void>
+  void SetBGridFunction(const ComplexVector &b, bool exchange_face_nbr_data = true)
+    requires(HasBGridFunction<solver_t>() && HasComplexGridFunction<solver_t>())
   {
     B->Real().SetFromTrueDofs(b.Real());  // Parallel distribute
     B->Imag().SetFromTrueDofs(b.Imag());
@@ -351,9 +397,8 @@ protected:
     }
   }
 
-  template <ProblemType U = solver_t>
-  auto SetBGridFunction(const Vector &b, bool exchange_face_nbr_data = true)
-      -> std::enable_if_t<HasBGridFunction<U>() && !HasComplexGridFunction<U>(), void>
+  void SetBGridFunction(const Vector &b, bool exchange_face_nbr_data = true)
+    requires(HasBGridFunction<solver_t>() && !HasComplexGridFunction<solver_t>())
   {
     B->Real().SetFromTrueDofs(b);
     if (exchange_face_nbr_data)
@@ -362,9 +407,8 @@ protected:
     }
   }
 
-  template <ProblemType U = solver_t>
-  auto SetVGridFunction(const Vector &v, bool exchange_face_nbr_data = true)
-      -> std::enable_if_t<HasVGridFunction<U>() && !HasComplexGridFunction<U>(), void>
+  void SetVGridFunction(const Vector &v, bool exchange_face_nbr_data = true)
+    requires(HasVGridFunction<solver_t>() && !HasComplexGridFunction<solver_t>())
   {
     V->Real().SetFromTrueDofs(v);
     if (exchange_face_nbr_data)
@@ -373,9 +417,8 @@ protected:
     }
   }
 
-  template <ProblemType U = solver_t>
-  auto SetAGridFunction(const Vector &a, bool exchange_face_nbr_data = true)
-      -> std::enable_if_t<HasAGridFunction<U>() && !HasComplexGridFunction<U>(), void>
+  void SetAGridFunction(const Vector &a, bool exchange_face_nbr_data = true)
+    requires(HasAGridFunction<solver_t>() && !HasComplexGridFunction<solver_t>())
   {
     A->Real().SetFromTrueDofs(a);
     if (exchange_face_nbr_data)
@@ -407,43 +450,42 @@ public:
   // therefore).
   //
   // The measure functions will also do logging of (some) measurements to stdout.
-  //
-  // TODO(C++20): Upgrade SFINAE to C++20 concepts to simplify static selection since we can
-  // just write `MeasureAndPrintAll(...) requires (solver_t == Type::A)` without extra
-  // template.
+  double MeasureAndPrintAll(int ex_idx, int step, const ComplexVector &e,
+                            const ComplexVector &b, std::complex<double> omega)
+    requires(solver_t == ProblemType::DRIVEN);
 
-  template <ProblemType U = solver_t>
-  auto MeasureAndPrintAll(int ex_idx, int step, const ComplexVector &e,
-                          const ComplexVector &b, std::complex<double> omega)
-      -> std::enable_if_t<U == ProblemType::DRIVEN, double>;
+  // Configure and evaluate the exact reduced-coordinate default output path (domain
+  // energies plus port S-parameters). Unsupported configured measurements leave the path
+  // disabled and use full postprocessing.
+  void ConfigureReducedPostprocessing(const RomOperator &rom_op)
+    requires(solver_t == ProblemType::DRIVEN);
+  void MeasureAndPrintReduced(int ex_idx, int step, const ComplexVector &e,
+                              std::complex<double> omega, const Eigen::VectorXcd &y)
+    requires(solver_t == ProblemType::DRIVEN);
+  bool HasReducedPostprocessing() const { return reduced_postprocessing_ready; }
 
-  template <ProblemType U = solver_t>
-  auto MeasureAndPrintAll(int step, const ComplexVector &e, const ComplexVector &b,
-                          std::complex<double> omega, double error_abs, double error_bkwd,
-                          int num_conv)
-      -> std::enable_if_t<U == ProblemType::EIGENMODE, double>;
+  double MeasureAndPrintAll(int step, const ComplexVector &e, const ComplexVector &b,
+                            std::complex<double> omega, double error_abs, double error_bkwd,
+                            int num_conv)
+    requires(solver_t == ProblemType::EIGENMODE);
 
-  template <ProblemType U = solver_t>
-  auto MeasureAndPrintAll(int step, const Vector &v, const Vector &e, int idx)
-      -> std::enable_if_t<U == ProblemType::ELECTROSTATIC, double>;
+  double MeasureAndPrintAll(int step, const Vector &v, const Vector &e, int idx)
+    requires(solver_t == ProblemType::ELECTROSTATIC);
 
-  template <ProblemType U = solver_t>
-  auto MeasureAndPrintAll(int step, const Vector &a, const Vector &b, int idx)
-      -> std::enable_if_t<U == ProblemType::MAGNETOSTATIC, double>;
+  double MeasureAndPrintAll(int step, const Vector &a, const Vector &b, int idx)
+    requires(solver_t == ProblemType::MAGNETOSTATIC);
 
-  template <ProblemType U = solver_t>
-  auto MeasureAndPrintAll(int step, const Vector &e, const Vector &b, double t,
-                          double J_coef)
-      -> std::enable_if_t<U == ProblemType::TRANSIENT, double>;
+  double MeasureAndPrintAll(int step, const Vector &e, const Vector &b, double time,
+                            double J_coef)
+    requires(solver_t == ProblemType::TRANSIENT);
 
   // Mode analysis: complex E-field tangential (ND) and normal (H1) eigenvectors,
   // propagation constant kn, and eigensolver error estimates. The Poynting power is
   // computed internally via fem_op->ComputePoyntingPower.
-  template <ProblemType U = solver_t>
-  auto MeasureAndPrintAll(int step, const ComplexVector &et, const ComplexVector &en,
-                          std::complex<double> kn, double omega, double error_abs,
-                          double error_bkwd, int num_conv)
-      -> std::enable_if_t<U == ProblemType::BOUNDARYMODE, double>;
+  double MeasureAndPrintAll(int step, const ComplexVector &et, const ComplexVector &en,
+                            std::complex<double> kn, double omega, double error_abs,
+                            double error_bkwd, int num_conv)
+    requires(solver_t == ProblemType::BOUNDARYMODE);
 
   // Write error indicator into ParaView file and print summary statistics to csv. Should be
   // called once at the end of the solver loop.
@@ -452,11 +494,9 @@ public:
   // Measurement of the domain energy without printing. This is needed during the driven
   // simulation with PROM. There samples are taken and we need the total domain energy for
   // the error indicator, but no other measurement / printing should be done.
-  //
-  // TODO(C++20): SFINAE to requires.
-  template <ProblemType U = solver_t>
-  auto MeasureDomainFieldEnergyOnly(const ComplexVector &e, const ComplexVector &b)
-      -> std::enable_if_t<U == ProblemType::DRIVEN, double>;
+
+  double MeasureDomainFieldEnergyOnly(const ComplexVector &e, const ComplexVector &b)
+    requires(solver_t == ProblemType::DRIVEN);
 
   // Access grid functions for field solutions. Note that these are NOT const functions. The
   // electrostatics / magnetostatics solver do measurements of the capacitance/ inductance
@@ -465,28 +505,27 @@ public:
   //
   // Future: Consider moving those cap/ind measurements into this class and MeasureFinalize?
   // Would need to store vector of V,A.
-  //
-  // TODO(C++20): Switch SFINAE to requires.
-  template <ProblemType U = solver_t>
-  auto GetEGridFunction() -> std::enable_if_t<HasEGridFunction<U>(), decltype(*E) &>
+
+  GridFunction &GetEGridFunction()
+    requires(HasEGridFunction<solver_t>())
   {
     return *E;
   }
 
-  template <ProblemType U = solver_t>
-  auto GetBGridFunction() -> std::enable_if_t<HasBGridFunction<U>(), decltype(*B) &>
+  GridFunction &GetBGridFunction()
+    requires(HasBGridFunction<solver_t>())
   {
     return *B;
   }
 
-  template <ProblemType U = solver_t>
-  auto GetVGridFunction() -> std::enable_if_t<HasVGridFunction<U>(), decltype(*V) &>
+  GridFunction &GetVGridFunction()
+    requires(HasVGridFunction<solver_t>())
   {
     return *V;
   }
 
-  template <ProblemType U = solver_t>
-  auto GetAGridFunction() -> std::enable_if_t<HasAGridFunction<U>(), decltype(*A) &>
+  GridFunction &GetAGridFunction()
+    requires(HasAGridFunction<solver_t>())
   {
     return *A;
   }

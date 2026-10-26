@@ -5,6 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Palace: 3D Finite Element Solver for Computational Electromagnetics
 
+This fork's `main` branch mirrors `awslabs/palace` `main`. Customized solver features
+are developed on `develop`; use `develop` when installing this fork.
+
 [![CI (Linux)](https://github.com/awslabs/palace/actions/workflows/build-and-test-linux.yml/badge.svg)](https://github.com/awslabs/palace/actions/workflows/build-and-test-linux.yml)
 [![CI (macOS)](https://github.com/awslabs/palace/actions/workflows/build-and-test-macos.yml/badge.svg)](https://github.com/awslabs/palace/actions/workflows/build-and-test-macos.yml)
 [![](https://img.shields.io/badge/docs-stable-blue.svg)](https://awslabs.github.io/palace/stable)
@@ -60,10 +63,15 @@ Finally, instructions for obtaining *Palace* and building from source can be fou
 process, most dependencies are downloaded and installed automatically and thus an internet
 connection is required.
 
+For reproducible CPU installations on NCHC Forerunner 1 and LT Lab, the repository also
+provides a locked [clone, offline build/install, and bundled-case validation
+guide](scripts/spack-cpu/README.md). The retired `scripts/f1` workflow remains available only in the
+[historical fixed-base tree](https://github.com/arfiligol/palace/tree/5168949c8312dde19cbc4c74cdd858b9ecff74e6/scripts/f1).
+
 System requirements:
 
-  - CMake version 3.24 or later
-  - C++17 compatible C++ compiler
+  - CMake version 3.27 or later
+  - C++20 compatible C++ compiler
   - C and Fortran (optional) compilers for dependency builds
   - MPI distribution
   - BLAS, LAPACK libraries

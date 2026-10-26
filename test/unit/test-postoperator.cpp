@@ -1,7 +1,12 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
+#include <cmath>
 #include <complex>
+#include <fstream>
+#include <iterator>
+#include <numbers>
 #include <fmt/format.h>
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -9,9 +14,10 @@
 #include <catch2/generators/catch_generators_all.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_vector.hpp>
-#include <fstream>
 #include <sstream>
+#include "fem/gridfunction.hpp"
 #include "fem/integrator.hpp"
+#include "fixtures.hpp"
 #include "models/postoperator.hpp"
 #include "utils/communication.hpp"
 #include "utils/filesystem.hpp"
@@ -23,6 +29,23 @@ using namespace palace;
 using namespace Catch::Matchers;
 using json = nlohmann::json;
 // Helpers
+
+class DrivenPostOperatorTest : public PostOperator<ProblemType::DRIVEN>
+{
+public:
+  using PostOperator<ProblemType::DRIVEN>::PostOperator;
+
+  Measurement::PortPostData MeasureLumpedPortForTest(int idx, const ComplexVector &e,
+                                                     const ComplexVector &b,
+                                                     std::complex<double> omega)
+  {
+    measurement_cache.freq = omega;
+    SetEGridFunction(e);
+    SetBGridFunction(b);
+    MeasureLumpedPorts();
+    return measurement_cache.lumped_port_vi.at(idx);
+  }
+};
 
 // random integer between 0 and n as a double.
 auto randd(int n)
@@ -141,9 +164,31 @@ auto RandomMeasurement(int ndomain = 5)
   {
     cache.interface_eps_i.emplace_back(
         Measurement::InterfaceData{i, 1 + randd(100), (1 + randd(9999)) / 10000,
-                                   (1 + randd(9999) / 10000), 1e9 / (1 + randd(9999))});
+                                   (1 + randd(9999)) / 10000, 1e9 / (1 + randd(9999))});
     cache.interface_eps_mask_i.emplace_back(cache.interface_eps_i.back());
     cache.interface_eps_mask_i.back().energy *= 0.5;
+  }
+
+  int nfarfield = 5;
+  for (int i = 0; i < nfarfield; i++)
+  {
+    cache.farfield.thetaphis.emplace_back(randd(180), randd(360));
+    cache.farfield.E_field.push_back(
+        {std::complex((1 + randd(99)) / 100, randd(100) / 100),
+         std::complex((1 + randd(99)) / 100, randd(100) / 100),
+         std::complex((1 + randd(99)) / 100, randd(100) / 100)});
+  }
+
+  cache.mode_data.kn = std::complex((1 + randd(99)) / 100, randd(100) / 100);
+  cache.mode_data.n_eff = std::complex(1 + randd(100) / 100, randd(100) / 1000);
+  int nmode_postpro = 2;
+  for (int i = 0; i < nmode_postpro; i++)
+  {
+    // The first mode has no V/I impedance and the second no Z0, which must be left
+    // unscaled.
+    cache.mode_data.impedance[i] = {(1 + randd(99)) / 100, (1 + randd(99)) / 100, i == 0,
+                                    i == 1};
+    cache.mode_data.voltage[i] = {std::complex((1 + randd(99)) / 100, randd(100) / 100)};
   }
 
   return cache;
@@ -367,9 +412,66 @@ TEST_CASE("PostOperator", "[idempotent][Serial]")
     CHECK_THAT(c.energy_participation, Catch::Matchers::WithinRel(dc.energy_participation));
     CHECK_THAT(c.quality_factor, Catch::Matchers::WithinRel(dc.quality_factor));
   }
+
+  REQUIRE(dim_cache.farfield.E_field.size() == cache.farfield.E_field.size());
+  REQUIRE(non_dim_cache.farfield.E_field.size() == cache.farfield.E_field.size());
+  for (std::size_t i = 0; i < cache.farfield.E_field.size(); i++)
+  {
+    CHECK(cache.farfield.thetaphis[i] == dim_cache.farfield.thetaphis[i]);
+    CHECK(cache.farfield.thetaphis[i] == non_dim_cache.farfield.thetaphis[i]);
+    for (std::size_t d = 0; d < 3; d++)
+    {
+      const auto &c = cache.farfield.E_field[i][d];
+      const auto &ndc = non_dim_cache.farfield.E_field[i][d];
+      CHECK_THAT(std::abs(c), Catch::Matchers::WithinRel(std::abs(ndc)));
+      CHECK_THAT(std::arg(c), Catch::Matchers::WithinRel(std::arg(ndc)));
+
+      // The far field r E_∞ is a field times a distance: it must dimensionalize like the
+      // probe E field (V/m) times the length scale (m), i.e. as a voltage.
+      const auto &dc = dim_cache.farfield.E_field[i][d];
+      const auto e_scale = units.GetScaleFactor<Units::ValueType::FIELD_E>();
+      const auto l_scale = units.GetScaleFactor<Units::ValueType::LENGTH>();
+      CHECK_THAT(std::abs(dc), Catch::Matchers::WithinRel(std::abs(c) * e_scale * l_scale));
+      CHECK_THAT(std::arg(dc), Catch::Matchers::WithinRel(std::arg(c)));
+    }
+  }
+
+  // Mode analysis data: kn [1/m], V [V], and Z [Ω] dimensionalize; n_eff is dimensionless.
+  const auto l_scale = units.GetScaleFactor<Units::ValueType::LENGTH>();
+  const auto v_scale = units.GetScaleFactor<Units::ValueType::VOLTAGE>();
+  const auto z_scale = units.GetScaleFactor<Units::ValueType::IMPEDANCE>();
+  const auto &m = cache.mode_data;
+  const auto &dm = dim_cache.mode_data;
+  const auto &ndm = non_dim_cache.mode_data;
+  CHECK_THAT(std::abs(m.kn), Catch::Matchers::WithinRel(std::abs(ndm.kn)));
+  CHECK_THAT(std::arg(m.kn), Catch::Matchers::WithinRel(std::arg(ndm.kn)));
+  CHECK_THAT(std::abs(dm.kn), Catch::Matchers::WithinRel(std::abs(m.kn) / l_scale));
+  CHECK_THAT(std::arg(dm.kn), Catch::Matchers::WithinRel(std::arg(m.kn)));
+  CHECK(m.n_eff == ndm.n_eff);
+  CHECK(m.n_eff == dm.n_eff);
+  REQUIRE(ndm.voltage.size() == m.voltage.size());
+  for (const auto &[idx, v] : m.voltage)
+  {
+    CHECK_THAT(std::abs(v.V), Catch::Matchers::WithinRel(std::abs(ndm.voltage.at(idx).V)));
+    CHECK_THAT(std::arg(v.V), Catch::Matchers::WithinRel(std::arg(ndm.voltage.at(idx).V)));
+    CHECK_THAT(std::abs(dm.voltage.at(idx).V),
+               Catch::Matchers::WithinRel(std::abs(v.V) * v_scale));
+    CHECK_THAT(std::arg(dm.voltage.at(idx).V), Catch::Matchers::WithinRel(std::arg(v.V)));
+  }
+  REQUIRE(ndm.impedance.size() == m.impedance.size());
+  for (const auto &[idx, z] : m.impedance)
+  {
+    CHECK_THAT(ndm.impedance.at(idx).Z0, Catch::Matchers::WithinRel(z.Z0));
+    CHECK_THAT(ndm.impedance.at(idx).Z_VI, Catch::Matchers::WithinRel(z.Z_VI));
+    CHECK_THAT(dm.impedance.at(idx).Z0,
+               Catch::Matchers::WithinRel(z.has_impedance ? z.Z0 * z_scale : z.Z0));
+    CHECK_THAT(dm.impedance.at(idx).Z_VI,
+               Catch::Matchers::WithinRel(z.has_vi_impedance ? z.Z_VI * z_scale : z.Z_VI));
+  }
 }
 
-TEST_CASE("GridFunction export", "[gridfunction][Serial][Parallel]")
+TEST_CASE_METHOD(test::SharedTempDir, "Field export",
+                 "[gridfunction][paraview][Serial][Parallel]")
 {
   // Create iodata.
   Units units(0.496, 1.453);
@@ -378,6 +480,10 @@ TEST_CASE("GridFunction export", "[gridfunction][Serial][Parallel]")
   iodata.domains.materials.emplace_back().attributes = {1};
   iodata.boundaries.pec.attributes = {1};
   iodata.problem.output_formats.gridfunction = true;
+  // Direct output into a shared temporary directory. The default Problem.Output
+  // ("postpro") is relative to the working directory, which is not guaranteed to be
+  // writable during the test run.
+  iodata.problem.output = temp_dir.string();
   iodata.CheckConfiguration();  // initializes quadrature
 
   // Setup lumped port boundary data for driven and transient.
@@ -407,6 +513,9 @@ TEST_CASE("GridFunction export", "[gridfunction][Serial][Parallel]")
   auto check_files = [&](const std::string &subdir, int step, int pad_digits,
                          const std::vector<std::string> &fields)
   {
+    // Root-owned metadata and every rank's payload must be complete before any rank
+    // inspects the shared output tree.
+    Mpi::Barrier(comm);
     for (int i = 0; i < size; i++)
     {
       for (const auto &field : fields)
@@ -495,6 +604,96 @@ TEST_CASE("GridFunction export", "[gridfunction][Serial][Parallel]")
     post_op.MeasureAndPrintAll(1, 0, E, B, 1.0);
     check_files("driven", 1, post_op.GetPadDigitsDefault(),
                 {"E_real", "E_imag", "B_real", "B_imag", "S", "U_e", "U_m"});
+
+    // The ParaView "Time" field for a driven solve is the physical frequency in
+    // GHz, not the nondimensional angular frequency omega passed above.
+    std::ifstream pvd(fs::path(iodata.problem.output) / "paraview" / "driven" /
+                      "driven.pvd");
+    std::string contents(std::istreambuf_iterator<char>(pvd), {});
+    auto pos = contents.find("timestep=\"") + std::string("timestep=\"").size();
+    double pvd_time = std::stod(contents.substr(pos, contents.find('"', pos) - pos));
+    const double expected_freq =
+        iodata.units.Dimensionalize<Units::ValueType::FREQUENCY>(1.0) /
+        (2.0 * std::numbers::pi);
+    CHECK_THAT(pvd_time, Catch::Matchers::WithinRel(expected_freq, 1.0e-5));
+  }
+
+  SECTION("Driven multiple excitations")
+  {
+    // Create operator with two excitations.
+    iodata.problem.type = ProblemType::DRIVEN;
+    iodata.solver.driven.save_indices = {0};
+    iodata.solver.driven.sample_f = {1.0};
+    json multi_port_boundaries = {{"LumpedPort",
+                                   {{{"Attributes", {2}},
+                                     {"Index", 1},
+                                     {"R", 50.0},
+                                     {"Direction", "+X"},
+                                     {"Excitation", 1}},
+                                    {{"Attributes", {3}},
+                                     {"Index", 2},
+                                     {"R", 50.0},
+                                     {"Direction", "+Y"},
+                                     {"Excitation", 2}}}}};
+    config::BoundaryData multi_port(multi_port_boundaries);
+    iodata.boundaries.lumpedport = multi_port.lumpedport;
+    SpaceOperator space_op(iodata, mesh);
+    PostOperator<ProblemType::DRIVEN> post_op(iodata, space_op);
+
+    ComplexVector E(space_op.GetNDSpace().GetTrueVSize()),
+        B(space_op.GetRTSpace().GetTrueVSize());
+    E = 0.0;
+    B = 0.0;
+    post_op.InitializeParaviewDataCollection(1);
+    post_op.MeasureAndPrintAll(1, 0, E, B, 1.0);
+    post_op.InitializeParaviewDataCollection(2);
+    post_op.MeasureAndPrintAll(2, 0, E, B, 1.0);
+
+    // Switching excitations must preserve both collections.
+    auto root = fs::path(iodata.problem.output) / "paraview";
+    for (int excitation : {1, 2})
+    {
+      auto folder = fmt::format("excitation_{}", excitation);
+      CHECK(fs::is_regular_file(root / "driven" / folder / (folder + ".pvd")));
+      CHECK(fs::is_regular_file(root / "driven_boundary" / folder / (folder + ".pvd")));
+    }
+  }
+
+  SECTION("Driven reactive lumped port measurement")
+  {
+    // Purely reactive ports use the unit real reference resistance for excitation and
+    // S-parameter normalization. Exercise the batched PostOperator measurement path,
+    // which must agree with LumpedPortData::GetSParameter rather than special-case R = 0.
+    json reactive_boundaries = {{"LumpedPort",
+                                 {{{"Attributes", {2}},
+                                   {"Index", 1},
+                                   {"L", 1.0},
+                                   {"Direction", "+X"},
+                                   {"Excitation", true}}}}};
+    config::BoundaryData reactive_port(reactive_boundaries);
+
+    iodata.problem.type = ProblemType::DRIVEN;
+    iodata.solver.driven.sample_f = {1.0};
+    iodata.boundaries.lumpedport = reactive_port.lumpedport;
+    SpaceOperator space_op(iodata, mesh);
+    DrivenPostOperatorTest post_op(iodata, space_op);
+
+    ComplexVector E(space_op.GetNDSpace().GetTrueVSize()),
+        B(space_op.GetRTSpace().GetTrueVSize());
+    E = 1.0;
+    B = 0.0;
+    const auto vi = post_op.MeasureLumpedPortForTest(1, E, B, 1.0);
+    const auto &port = space_op.GetLumpedPortOp().GetPort(1);
+    REQUIRE(std::abs(vi.V) > 0.0);
+    CHECK_THAT(std::abs(vi.S - vi.V / std::sqrt(port.GetExcitationRefResistance())),
+               Catch::Matchers::WithinAbs(0.0, 1.0e-12 * std::abs(vi.V)));
+
+    GridFunction E_gf(space_op.GetNDSpace(), true);
+    E_gf.Real().SetFromTrueDofs(E.Real());
+    E_gf.Imag().SetFromTrueDofs(E.Imag());
+    const auto S_legacy = port.GetSParameter(E_gf);
+    CHECK_THAT(std::abs(vi.S - S_legacy),
+               Catch::Matchers::WithinAbs(0.0, 1.0e-12 * std::abs(S_legacy)));
   }
 
   SECTION("Eigenmode")
@@ -511,9 +710,28 @@ TEST_CASE("GridFunction export", "[gridfunction][Serial][Parallel]")
         B(space_op.GetRTSpace().GetTrueVSize());
     E = 0.0;
     B = 0.0;
-    post_op.MeasureAndPrintAll(0, E, B, 1.0, 0.0, 0.0, 1);
+    constexpr int num_conv = 3;
+    for (int i = 0; i < num_conv; i++)
+    {
+      post_op.MeasureAndPrintAll(i, E, B, 1.0 + i, 0.0, 0.0, num_conv);
+    }
     check_files("eigenmode", 1, post_op.GetPadDigitsDefault(),
                 {"E_real", "E_imag", "B_real", "B_imag", "S", "U_e", "U_m"});
+
+    // Every converged mode is reported, while Save = 1 limits field data to the first
+    // requested mode.
+    std::ifstream eig_csv(fs::path(iodata.problem.output) / "eig.csv");
+    REQUIRE(eig_csv.good());
+    const int num_lines = static_cast<int>(std::count(
+        std::istreambuf_iterator<char>(eig_csv), std::istreambuf_iterator<char>(), '\n'));
+    CHECK(num_lines == num_conv + 1);  // Header plus one row per converged mode.
+    for (int rank = 0; rank < size; rank++)
+    {
+      auto extra_field =
+          fs::path(iodata.problem.output) / "gridfunction" / "eigenmode" /
+          fmt::format("E_real_{:0{}d}.gf.{:0{}d}", 2, pad_digits, rank, pad_digits);
+      CHECK_FALSE(fs::exists(extra_field));
+    }
   }
 }
 

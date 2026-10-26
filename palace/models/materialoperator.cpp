@@ -3,9 +3,12 @@
 
 #include "materialoperator.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include <unordered_set>
+#include <fmt/format.h>
 #include "linalg/densematrix.hpp"
 #include "utils/communication.hpp"
 #include "utils/geodata.hpp"
@@ -32,7 +35,7 @@ bool IsOrthonormal(const config::SymmetricMatrixData<N> &data)
     }
     return std::abs(s) < tol;
   };
-  bool valid = std::all_of(data.v.begin(), data.v.end(), UnitNorm);
+  bool valid = std::ranges::all_of(data.v, UnitNorm);
 
   // All the vectors are orthogonal.
   for (std::size_t i1 = 0; i1 < N; i1++)
@@ -55,22 +58,22 @@ bool IsOrthonormal(const config::SymmetricMatrixData<N> &data)
 template <std::size_t N>
 bool IsValid(const config::SymmetricMatrixData<N> &data)
 {
-  return IsOrthonormal(data) && std::all_of(data.s.begin(), data.s.end(),
-                                            [](auto d) { return std::abs(d) > 0.0; });
+  return IsOrthonormal(data) &&
+         std::ranges::all_of(data.s, [](auto d) { return std::abs(d) > 0.0; });
 }
 
 template <std::size_t N>
 bool IsIsotropic(const config::SymmetricMatrixData<N> &data)
 {
   return IsOrthonormal(data) &&
-         std::all_of(data.s.begin(), data.s.end(), [&](auto d) { return d == data.s[0]; });
+         std::ranges::all_of(data.s, [&](auto d) { return d == data.s[0]; });
 }
 
 template <std::size_t N>
 bool IsIdentity(const config::SymmetricMatrixData<N> &data)
 {
   return IsOrthonormal(data) &&
-         std::all_of(data.s.begin(), data.s.end(), [](auto d) { return d == 1.0; });
+         std::ranges::all_of(data.s, [](auto d) { return d == 1.0; });
 }
 
 template <std::size_t N>
@@ -155,7 +158,7 @@ void MaterialOperator::SetUpMaterialProperties(
     const auto &data = materials[i];
     for (auto attr : data.attributes)
     {
-      if (loc_attr.find(attr) != loc_attr.end())
+      if (loc_attr.contains(attr))
       {
         mat_marker[i] = 1;
         nmats++;
@@ -175,6 +178,7 @@ void MaterialOperator::SetUpMaterialProperties(
     mat_muinv_scalar.SetSize(1, 1, nmats);
     mat_epsilon_scalar.SetSize(1, 1, nmats);
     mat_epsilon_imag_scalar.SetSize(1, 1, nmats);
+    mat_sigma_scalar.SetSize(1, 1, nmats);
     mat_invLondon_scalar.SetSize(1, 1, nmats);
   }
   mat_epsilon.SetSize(sdim, sdim, nmats);
@@ -186,6 +190,7 @@ void MaterialOperator::SetUpMaterialProperties(
   mat_invLondon.SetSize(sdim, sdim, nmats);
   mat_c0_min.SetSize(nmats);
   mat_c0_max.SetSize(nmats);
+  mat_mu_eps_max.SetSize(nmats);
   mat_muinvkx.SetSize(sdim, sdim, nmats);
   mat_kxTmuinvkx.SetSize(sdim, sdim, nmats);
   mat_kx.SetSize(sdim, sdim, nmats);
@@ -202,6 +207,14 @@ void MaterialOperator::SetUpMaterialProperties(
       continue;
     }
     const auto &data = materials[i];
+    double mu_max = 0.0, eps_max = 0.0;
+    for (std::size_t d = 0; d < data.mu_r.s.size(); d++)
+    {
+      mu_max = std::max(mu_max, std::abs(data.mu_r.s[d]));
+      eps_max = std::max(eps_max, std::abs(data.epsilon_r.s[d]));
+    }
+    mat_mu_eps_max[count] = mu_max * eps_max;
+
     if (problem_type == ProblemType::ELECTROSTATIC)
     {
       MFEM_VERIFY(internal::mat::IsValid(data.epsilon_r),
@@ -292,6 +305,9 @@ void MaterialOperator::SetUpMaterialProperties(
       mfem::DenseMatrix epstd_3d(3, 3);
       Mult(mat_eps_3d, mat_td_3d, epstd_3d);
       mat_epsilon_imag_scalar(count)(0, 0) = -ProjectNormal(epstd_3d);
+
+      mfem::DenseMatrix mat_sigma_3d = internal::mat::ToDenseMatrix(data.sigma);
+      mat_sigma_scalar(count)(0, 0) = ProjectNormal(mat_sigma_3d);
     }
 
     // Material permittivity: Re{ε} = ε, Im{ε} = -ε * tan(δ)
@@ -359,6 +375,34 @@ void MaterialOperator::SetUpMaterialProperties(
 
     count++;
   }
+
+  // Every retained domain needs a material. loc_attr also holds ghost/neighbor attributes
+  // that carry no material yet are not retained domains. Collect the material-less
+  // attributes first, usually none, then flag only those on a locally-owned volume element
+  // and reduce for the smallest globally-missing one.
+  std::unordered_set<int> unmatched_attrs;
+  for (const auto &[attr, idx] : loc_attr)
+  {
+    if (attr_mat[idx - 1] < 0)
+    {
+      unmatched_attrs.insert(attr);
+    }
+  }
+  int missing_attr = std::numeric_limits<int>::max();
+  for (int i = 0; i < mesh.GetNE() && !unmatched_attrs.empty(); i++)
+  {
+    const int attr = mesh.GetAttribute(i);
+    if (unmatched_attrs.contains(attr))
+    {
+      missing_attr = std::min(missing_attr, attr);
+    }
+  }
+  Mpi::GlobalMin(1, &missing_attr, mesh.GetComm());
+  MFEM_VERIFY(missing_attr == std::numeric_limits<int>::max(),
+              fmt::format("Mesh domain attribute {:d} has no corresponding entry in "
+                          "config[\"Domains\"][\"Materials\"]!",
+                          missing_attr));
+
   bool has_attr[4] = {has_losstan_attr, has_conductivity_attr, has_london_attr,
                       has_wave_attr};
   Mpi::GlobalOr(4, has_attr, mesh.GetComm());
@@ -368,6 +412,15 @@ void MaterialOperator::SetUpMaterialProperties(
   has_wave_attr = has_attr[3];
 }
 
+double MaterialOperator::GetMaxMuEpsilon() const
+{
+  double mu_eps_max = mat_mu_eps_max.Size() > 0 ? mat_mu_eps_max.Max() : 0.0;
+  Mpi::GlobalMax(1, &mu_eps_max, mesh.GetComm());
+  MFEM_VERIFY(mu_eps_max > 0.0 && mu_eps_max < mfem::infinity(),
+              "Invalid material permeability or permittivity!");
+  return mu_eps_max;
+}
+
 void MaterialOperator::SetUpFloquetWaveVector(const config::PeriodicBoundaryData &periodic,
                                               ProblemType problem_type,
                                               const mfem::ParMesh &mesh)
@@ -375,8 +428,8 @@ void MaterialOperator::SetUpFloquetWaveVector(const config::PeriodicBoundaryData
   const int sdim = mesh.SpaceDimension();
   const double tol = std::numeric_limits<double>::epsilon();
 
-  // Get Floquet wave vector.
-  mfem::Vector wave_vector(sdim);
+  // Get Floquet wave vector (stored as member for access by FloquetPortData).
+  wave_vector.SetSize(sdim);
   wave_vector = 0.0;
   MFEM_VERIFY(static_cast<int>(periodic.wave_vector.size()) >= sdim,
               "Floquet wave vector size must be at least the spatial dimension.");
@@ -391,27 +444,42 @@ void MaterialOperator::SetUpFloquetWaveVector(const config::PeriodicBoundaryData
               "Quasi-periodic Floquet periodic boundary conditions are only available "
               " in 3D!");
 
+  // Store nondimensional reference angular frequency for frequency-dependent k_F scaling.
+  // Already nondimensionalized in IoData::NondimensionalizeStandard.
+  floquet_omega_ref = periodic.floquet_reference_freq;
+  MFEM_VERIFY(floquet_omega_ref == 0.0 || problem_type == ProblemType::DRIVEN,
+              "FloquetReferenceFrequency (frequency-dependent k_F) is only supported for "
+              "driven simulations!");
+
   // Get mesh dimensions in x/y/z coordinates.
   mfem::Vector bbmin, bbmax;
   mesh::GetAxisAlignedBoundingBox(mesh, bbmin, bbmax);
   bbmax -= bbmin;
 
-  // Ensure Floquet wave vector components are in range [-π/L, π/L].
-  for (int i = 0; i < sdim; i++)
+  // BZ wrapping: wrap Floquet wave vector to the first Brillouin zone [-π/L, π/L].
+  // DISABLED when frequency scaling is active: the BZ offset is frequency-independent
+  // but kF scales with ω, creating a mismatch at frequencies away from the reference.
+  // Without wrapping, both volume and Floquet port use the unwrapped kF consistently.
+  if (floquet_omega_ref == 0.0)
   {
-    if (wave_vector[i] > M_PI / bbmax[i])
+    for (int i = 0; i < sdim; i++)
     {
-      wave_vector[i] =
-          -M_PI / bbmax[i] + fmod(wave_vector[i] + M_PI / bbmax[i], 2 * M_PI / bbmax[i]);
-    }
-    else if (wave_vector[i] < M_PI / bbmax[i])
-    {
-      wave_vector[i] =
-          M_PI / bbmax[i] + fmod(wave_vector[i] - M_PI / bbmax[i], 2 * M_PI / bbmax[i]);
+      double half_bz = std::numbers::pi / bbmax[i];
+      if (wave_vector[i] > half_bz || wave_vector[i] < -half_bz)
+      {
+        wave_vector[i] = std::remainder(wave_vector[i], 2.0 * half_bz);
+      }
     }
   }
 
-  // Matrix representation of cross product with wave vector (3D only).
+  // Save BZ-wrapped k_F, then convert to k₀ = k_F/ω for frequency-independent tensors.
+  wave_vector_bz = wave_vector;
+  if (floquet_omega_ref > 0.0)
+  {
+    wave_vector *= 1.0 / floquet_omega_ref;
+  }
+
+  // Matrix representation of cross product with wave vector (or k₀ when scaling active).
   // [k x] = | 0  -k3  k2|
   //         | k3  0  -k1|
   //         |-k2  k1  0 |
@@ -438,11 +506,11 @@ mfem::Array<int> MaterialOperator::GetBdrAttributeToMaterial() const
   bdr_attr_mat = -1;
   for (const auto &[attr, bdr_attr_map] : mesh.GetCeedBdrAttributes())
   {
-    for (auto it = bdr_attr_map.begin(); it != bdr_attr_map.end(); ++it)
+    for (const auto &[nbr_attr, ceed_attr] : bdr_attr_map)
     {
-      MFEM_ASSERT(it->second > 0 && it->second <= bdr_attr_mat.Size(),
-                  "Invalid libCEED boundary attribute " << it->second << "!");
-      bdr_attr_mat[it->second - 1] = AttrToMat(it->first);
+      MFEM_ASSERT(ceed_attr > 0 && ceed_attr <= bdr_attr_mat.Size(),
+                  "Invalid libCEED boundary attribute " << ceed_attr << "!");
+      bdr_attr_mat[ceed_attr - 1] = AttrToMat(nbr_attr);
     }
   }
   return bdr_attr_mat;
@@ -527,6 +595,45 @@ MaterialPropertyCoefficient::MaterialPropertyCoefficient(
   : attr_mat(attr_mat_), mat_coeff(mat_coeff_)
 {
   *this *= a;
+}
+
+bool MaterialPropertyCoefficient::IsExactlyZero() const
+{
+  const auto *data = mat_coeff.Data();
+  for (int i = 0; i < mat_coeff.TotalSize(); i++)
+  {
+    if (data[i] != 0.0)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void MaterialPropertyCoefficient::AddNonzeroAttributes(std::vector<int> &attr_list) const
+{
+  const int mat_size = mat_coeff.SizeI() * mat_coeff.SizeJ();
+  const auto *data = mat_coeff.Data();
+  for (int i = 0; i < attr_mat.Size(); i++)
+  {
+    const int k = attr_mat[i];
+    if (k < 0)
+    {
+      // Attributes with no assigned material use a zero coefficient.
+      continue;
+    }
+    MFEM_ASSERT(k < mat_coeff.SizeK(),
+                "Invalid attribute material property for MaterialPropertyCoefficient ("
+                    << k << " vs. " << mat_coeff.SizeK() << ")!");
+    for (int j = 0; j < mat_size; j++)
+    {
+      if (data[mat_size * k + j] != 0.0)
+      {
+        attr_list.push_back(i + 1);
+        break;
+      }
+    }
+  }
 }
 
 namespace
@@ -679,35 +786,58 @@ template <typename T>
 void MaterialPropertyCoefficient::AddMaterialProperty(const mfem::Array<int> &attr_list,
                                                       const T &coeff, double a)
 {
-  // Preprocess the attribute list. If any of the given attributes already have material
-  // properties assigned, then they all need to point to the same material and it is
-  // updated in place. Otherwise a new material is added for these attributes.
+  // Preprocess the attribute list. If the given attributes already have material properties
+  // assigned, then they all need to point to the same material, which is updated (after
+  // being split off if other attributes share it). Otherwise a new material is added for
+  // these attributes.
   if (attr_list.Size() == 0)
   {
     // No attributes, nothing to add.
     return;
   }
 
-  int mat_idx = -1;
   for (auto attr : attr_list)
   {
-    MFEM_VERIFY(attr <= attr_mat.Size(),
+    MFEM_VERIFY(attr >= 1 && attr <= attr_mat.Size(),
                 "Out of bounds access for attribute "
                     << attr << " in MaterialPropertyCoefficient::AddMaterialProperty!");
-    if (mat_idx < 0)
-    {
-      mat_idx = attr_mat[attr - 1];
-    }
-    else
-    {
-      MFEM_VERIFY(mat_idx == attr_mat[attr - 1],
-                  "All attributes for MaterialPropertyCoefficient::AddMaterialProperty "
-                  "must correspond to the same "
-                  "existing material if it exists!");
-    }
+  }
+  int mat_idx = attr_mat[attr_list[0] - 1];
+  for (auto attr : attr_list)
+  {
+    MFEM_VERIFY(mat_idx == attr_mat[attr - 1],
+                "All attributes for MaterialPropertyCoefficient::AddMaterialProperty "
+                "must correspond to the same existing material, or all to none!");
   }
 
-  if (mat_idx < 0)
+  if (mat_idx >= 0)
+  {
+    // The material may be shared with attributes outside of the list (equal properties
+    // share an entry). Updating it in place would add the term to those attributes too, so
+    // give the listed attributes their own copy first.
+    bool shared = false;
+    for (int i = 0; i < attr_mat.Size() && !shared; i++)
+    {
+      shared = (attr_mat[i] == mat_idx && attr_list.Find(i + 1) < 0);
+    }
+    if (shared)
+    {
+      const mfem::DenseTensor mat_coeff_backup(mat_coeff);
+      mat_coeff.SetSize(mat_coeff_backup.SizeI(), mat_coeff_backup.SizeJ(),
+                        mat_coeff_backup.SizeK() + 1);
+      for (int k = 0; k < mat_coeff_backup.SizeK(); k++)
+      {
+        mat_coeff(k).Set(1.0, mat_coeff_backup(k));
+      }
+      mat_coeff(mat_coeff.SizeK() - 1).Set(1.0, mat_coeff_backup(mat_idx));
+      mat_idx = mat_coeff.SizeK() - 1;
+      for (auto attr : attr_list)
+      {
+        attr_mat[attr - 1] = mat_idx;
+      }
+    }
+  }
+  else
   {
     // Check if we can reuse an existing material.
     for (int k = 0; k < mat_coeff.SizeK(); k++)

@@ -36,7 +36,7 @@ namespace palace
 namespace
 {
 
-template <typename OperType>
+template <OperatorType OperType>
 auto BuildLevelParOperator(std::unique_ptr<Operator> &&a,
                            const FiniteElementSpace &trial_fespace,
                            const FiniteElementSpace &test_fespace);
@@ -58,13 +58,13 @@ auto BuildLevelParOperator<ComplexOperator>(std::unique_ptr<Operator> &&a,
                                               test_fespace, false);
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 auto BuildLevelParOperator(std::unique_ptr<Operator> &&a, const FiniteElementSpace &fespace)
 {
   return BuildLevelParOperator<OperType>(std::move(a), fespace, fespace);
 }
 
-template <typename OperType>
+template <OperatorType OperType>
 auto ConfigureLinearSolver(const FiniteElementSpaceHierarchy &fespaces, double tol,
                            int max_it, int print, bool use_mg)
 {
@@ -191,7 +191,7 @@ Vector ComputeErrorEstimates(const VecType &F, VecType &F_gf, VecType &G, VecTyp
   // (recovery) and populate the corresponding grid functions.
   BlockTimer bt(Timer::ESTIMATION);
   projector.Mult(F, G);
-  if constexpr (std::is_same<VecType, ComplexVector>::value)
+  if constexpr (std::is_same_v<VecType, ComplexVector>)
   {
     fespace.GetProlongationMatrix()->Mult(F.Real(), F_gf.Real());
     fespace.GetProlongationMatrix()->Mult(F.Imag(), F_gf.Imag());
@@ -209,13 +209,19 @@ Vector ComputeErrorEstimates(const VecType &F, VecType &F_gf, VecType &G, VecTyp
   Vector estimates(mesh.GetNE());
   estimates.UseDevice(true);
   estimates = 0.0;
+  if (mesh.GetNE() == 0)  // Possible for a submesh, with an empty libCEED operator
+  {
+    return estimates;
+  }
   PalacePragmaOmp(parallel if (ceed::internal::NumCeeds() > 1))
   {
     Ceed ceed = ceed::internal::GetCeedObjects()[utils::GetThreadNum()];
 
     // We need to update the state of the underlying libCEED vectors to indicate that the
-    // data has changed. Each thread has it's own vector, referencing the same underlying
-    // data.
+    // data has changed. Each thread has its own pair of vectors, referencing the same
+    // underlying data, and every sub-operator of the thread's composite (one per element
+    // geometry type) shares that pair, so re-pointing the vectors of the first sub-operator
+    // updates all of them.
     CeedVector F_gf_vec, G_gf_vec;
     {
       CeedInt nsub_ops;
@@ -230,7 +236,7 @@ Vector ComputeErrorEstimates(const VecType &F, VecType &F_gf, VecType &G, VecTyp
       PalaceCeedCall(ceed, CeedOperatorFieldGetVector(field, &F_gf_vec));
       PalaceCeedCall(ceed, CeedOperatorGetFieldByName(sub_ops[0], "u_2", &field));
       PalaceCeedCall(ceed, CeedOperatorFieldGetVector(field, &G_gf_vec));
-      if constexpr (std::is_same<VecType, ComplexVector>::value)
+      if constexpr (std::is_same_v<VecType, ComplexVector>)
       {
         ceed::InitCeedVector(F_gf.Real(), ceed, &F_gf_vec, false);
         ceed::InitCeedVector(G_gf.Real(), ceed, &G_gf_vec, false);
@@ -251,7 +257,7 @@ Vector ComputeErrorEstimates(const VecType &F, VecType &F_gf, VecType &G, VecTyp
     PalaceCeedCall(ceed,
                    CeedOperatorApplyAdd(integ_op[utils::GetThreadNum()], CEED_VECTOR_NONE,
                                         estimates_vec, CEED_REQUEST_IMMEDIATE));
-    if constexpr (std::is_same<VecType, ComplexVector>::value)
+    if constexpr (std::is_same_v<VecType, ComplexVector>)
     {
       ceed::InitCeedVector(F_gf.Imag(), ceed, &F_gf_vec, false);
       ceed::InitCeedVector(G_gf.Imag(), ceed, &G_gf_vec, false);
@@ -260,8 +266,11 @@ Vector ComputeErrorEstimates(const VecType &F, VecType &F_gf, VecType &G, VecTyp
                                           estimates_vec, CEED_REQUEST_IMMEDIATE));
     }
 
-    // Cleanup.
+    // Cleanup (the field vectors are reference counted, the operator keeps its own
+    // references).
     PalaceCeedCall(ceed, CeedVectorDestroy(&estimates_vec));
+    PalaceCeedCall(ceed, CeedVectorDestroy(&F_gf_vec));
+    PalaceCeedCall(ceed, CeedVectorDestroy(&G_gf_vec));
   }
 
   return estimates;
@@ -291,25 +300,28 @@ GradFluxErrorEstimator<VecType>::GradFluxErrorEstimator(
   PalacePragmaOmp(parallel if (ceed::internal::NumCeeds() > 1))
   {
     Ceed ceed = ceed::internal::GetCeedObjects()[utils::GetThreadNum()];
+
+    // Create libCEED vector wrappers for use with libCEED operators. One pair of vectors
+    // per Ceed context is shared by the sub-operators of every element geometry type, so
+    // that ComputeErrorEstimates can re-point the passive inputs once through any
+    // sub-operator (in particular between the real and imaginary parts of complex fields).
+    CeedVector E_gf_vec, D_gf_vec;
+    if constexpr (std::is_same_v<VecType, ComplexVector>)
+    {
+      ceed::InitCeedVector(E_gf.Real(), ceed, &E_gf_vec);
+      ceed::InitCeedVector(D_gf.Real(), ceed, &D_gf_vec);
+    }
+    else
+    {
+      ceed::InitCeedVector(E_gf, ceed, &E_gf_vec);
+      ceed::InitCeedVector(D_gf, ceed, &D_gf_vec);
+    }
     for (const auto &[geom, data] : mesh.GetCeedGeomFactorData(ceed))
     {
       // Only integrate over domain elements (not on the boundary).
       if (mfem::Geometry::Dimension[geom] < mesh.Dimension())
       {
         continue;
-      }
-
-      // Create libCEED vector wrappers for use with libCEED operators.
-      CeedVector E_gf_vec, D_gf_vec;
-      if constexpr (std::is_same<VecType, ComplexVector>::value)
-      {
-        ceed::InitCeedVector(E_gf.Real(), ceed, &E_gf_vec);
-        ceed::InitCeedVector(D_gf.Real(), ceed, &D_gf_vec);
-      }
-      else
-      {
-        ceed::InitCeedVector(E_gf, ceed, &E_gf_vec);
-        ceed::InitCeedVector(D_gf, ceed, &D_gf_vec);
       }
 
       // Construct mesh element restriction for elements of this element geometry type.
@@ -320,10 +332,8 @@ GradFluxErrorEstimator<VecType>::GradFluxErrorEstimator(
                                data.indices.data(), &mesh_elem_restr));
 
       // Element restriction and basis objects for inputs.
-      CeedElemRestriction nd_restr =
-          nd_fespace.GetCeedElemRestriction(ceed, geom, data.indices);
-      CeedElemRestriction rt_restr =
-          rt_fespace.GetCeedElemRestriction(ceed, geom, data.indices);
+      CeedElemRestriction nd_restr = nd_fespace.GetCeedElemRestriction(ceed, geom, data);
+      CeedElemRestriction rt_restr = rt_fespace.GetCeedElemRestriction(ceed, geom, data);
       CeedBasis nd_basis = nd_fespace.GetCeedBasis(ceed, geom);
       CeedBasis rt_basis = rt_fespace.GetCeedBasis(ceed, geom);
 
@@ -366,11 +376,13 @@ GradFluxErrorEstimator<VecType>::GradFluxErrorEstimator(
           data.geom_data_restr, &sub_op);
       integ_op.AddSubOperator(sub_op);  // Sub-operator owned by ceed::Operator
 
-      // Element restriction and passive input vectors are owned by the operator.
+      // Element restriction is owned by the operator.
       PalaceCeedCall(ceed, CeedElemRestrictionDestroy(&mesh_elem_restr));
-      PalaceCeedCall(ceed, CeedVectorDestroy(&E_gf_vec));
-      PalaceCeedCall(ceed, CeedVectorDestroy(&D_gf_vec));
     }
+
+    // Passive input vectors are owned (shared) by the sub-operators.
+    PalaceCeedCall(ceed, CeedVectorDestroy(&E_gf_vec));
+    PalaceCeedCall(ceed, CeedVectorDestroy(&D_gf_vec));
   }
 
   // Finalize the operator (call CeedOperatorCheckReady).
@@ -406,28 +418,35 @@ CurlFluxErrorEstimator<VecType>::CurlFluxErrorEstimator(
   // Construct the libCEED operator used for integrating the element-wise error. The
   // discontinuous flux is μ⁻¹ B ≃ μ⁻¹ ∇ × E.
   const auto &mesh = rt_fespace.GetMesh();
+  MFEM_VERIFY(mesh.Dimension() == 3 ||
+                  rt_fespace.GetFEColl().GetMapType(mesh.Dimension()) ==
+                      mfem::FiniteElement::INTEGRAL,
+              "CurlFluxErrorEstimator in 2D requires an L2 space with INTEGRAL map type!");
   PalacePragmaOmp(parallel if (ceed::internal::NumCeeds() > 1))
   {
     Ceed ceed = ceed::internal::GetCeedObjects()[utils::GetThreadNum()];
+
+    // Create libCEED vector wrappers for use with libCEED operators. One pair of vectors
+    // per Ceed context is shared by the sub-operators of every element geometry type, so
+    // that ComputeErrorEstimates can re-point the passive inputs once through any
+    // sub-operator (in particular between the real and imaginary parts of complex fields).
+    CeedVector B_gf_vec, H_gf_vec;
+    if constexpr (std::is_same_v<VecType, ComplexVector>)
+    {
+      ceed::InitCeedVector(B_gf.Real(), ceed, &B_gf_vec);
+      ceed::InitCeedVector(H_gf.Real(), ceed, &H_gf_vec);
+    }
+    else
+    {
+      ceed::InitCeedVector(B_gf, ceed, &B_gf_vec);
+      ceed::InitCeedVector(H_gf, ceed, &H_gf_vec);
+    }
     for (const auto &[geom, data] : mesh.GetCeedGeomFactorData(ceed))
     {
       // Only integrate over domain elements (not on the boundary).
       if (mfem::Geometry::Dimension[geom] < mesh.Dimension())
       {
         continue;
-      }
-
-      // Create libCEED vector wrappers for use with libCEED operators.
-      CeedVector B_gf_vec, H_gf_vec;
-      if constexpr (std::is_same<VecType, ComplexVector>::value)
-      {
-        ceed::InitCeedVector(B_gf.Real(), ceed, &B_gf_vec);
-        ceed::InitCeedVector(H_gf.Real(), ceed, &H_gf_vec);
-      }
-      else
-      {
-        ceed::InitCeedVector(B_gf, ceed, &B_gf_vec);
-        ceed::InitCeedVector(H_gf, ceed, &H_gf_vec);
       }
 
       // Construct mesh element restriction for elements of this element geometry type.
@@ -438,10 +457,8 @@ CurlFluxErrorEstimator<VecType>::CurlFluxErrorEstimator(
                                data.indices.data(), &mesh_elem_restr));
 
       // Element restriction and basis objects for inputs.
-      CeedElemRestriction rt_restr =
-          rt_fespace.GetCeedElemRestriction(ceed, geom, data.indices);
-      CeedElemRestriction nd_restr =
-          nd_fespace.GetCeedElemRestriction(ceed, geom, data.indices);
+      CeedElemRestriction rt_restr = rt_fespace.GetCeedElemRestriction(ceed, geom, data);
+      CeedElemRestriction nd_restr = nd_fespace.GetCeedElemRestriction(ceed, geom, data);
       CeedBasis rt_basis = rt_fespace.GetCeedBasis(ceed, geom);
       CeedBasis nd_basis = nd_fespace.GetCeedBasis(ceed, geom);
 
@@ -480,6 +497,10 @@ CurlFluxErrorEstimator<VecType>::CurlFluxErrorEstimator(
                      << ") for CurlFluxErrorEstimator!");
       }
       info.trial_ops = info.test_ops = ceed::EvalMode::Interp;
+      if (scalar_curl)
+      {
+        info.trial_ops |= ceed::EvalMode::Weight;
+      }
 
       CeedOperator sub_op;
       ceed::AssembleCeedElementErrorIntegrator(
@@ -488,11 +509,13 @@ CurlFluxErrorEstimator<VecType>::CurlFluxErrorEstimator(
           data.geom_data_restr, &sub_op);
       integ_op.AddSubOperator(sub_op);  // Sub-operator owned by ceed::Operator
 
-      // Element restriction and passive input vectors are owned by the operator.
+      // Element restriction is owned by the operator.
       PalaceCeedCall(ceed, CeedElemRestrictionDestroy(&mesh_elem_restr));
-      PalaceCeedCall(ceed, CeedVectorDestroy(&B_gf_vec));
-      PalaceCeedCall(ceed, CeedVectorDestroy(&H_gf_vec));
     }
+
+    // Passive input vectors are owned (shared) by the sub-operators.
+    PalaceCeedCall(ceed, CeedVectorDestroy(&B_gf_vec));
+    PalaceCeedCall(ceed, CeedVectorDestroy(&H_gf_vec));
   }
 
   // Finalize the operator (call CeedOperatorCheckReady).

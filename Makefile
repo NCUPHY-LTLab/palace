@@ -4,7 +4,8 @@
 CLANG_FORMAT ?= clang-format
 JULIA ?= julia
 
-.PHONY: format format-cpp format-jl docs tests
+.PHONY: format format-cpp format-jl docs docs-generate-config \
+	docs-generate-schema-compatibility tests
 
 # Style/format
 format: format-cpp format-jl
@@ -21,7 +22,17 @@ docs:
 	$(JULIA) --project=docs -e 'using Pkg; Pkg.instantiate()'
 	$(JULIA) --project=docs --color=yes docs/make.jl
 
+docs-generate-config:
+	$(JULIA) --project=docs --color=yes docs/generate_config_docs.jl
+
+docs-generate-schema-compatibility:
+	$(JULIA) --project=docs --color=yes docs/generate_schema_compatibility.jl
+
 # Tests
+#
+# Runs the [Regression] cases against an existing CMake build tree.
+# Override BUILD_DIR if your build lives elsewhere; PALACE_TESTS_NUMPROC
+# (default 2, set in test/unit/CMakeLists.txt) controls per-case rank count.
+BUILD_DIR ?= build
 tests:
-	$(JULIA) --project=test/examples -e 'using Pkg; Pkg.instantiate()'
-	$(JULIA) --project=test/examples --color=yes test/examples/runtests.jl
+	cd $(BUILD_DIR)/palace-build/test/unit && ctest -L "^regression$$" --output-on-failure

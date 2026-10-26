@@ -4,6 +4,7 @@
 #ifndef PALACE_FEM_COEFFICIENT_HPP
 #define PALACE_FEM_COEFFICIENT_HPP
 
+#include <cmath>
 #include <complex>
 #include <memory>
 #include <utility>
@@ -169,16 +170,49 @@ private:
   const MaterialOperator &mat_op;
   bool two_sided;
   const mfem::Vector &x0;
+  const mfem::Vector *ref_dir;  // Optional reference direction for normal orientation
+  // ELECTRIC flux with Im{ε} instead of Re{ε}, for assembling the complex D = ε E of a
+  // lossy dielectric from real-valued evaluations (see
+  // SurfacePostOperator::GetSurfaceFlux).
+  bool imag_permittivity;
+
   void GetLocalFlux(mfem::ElementTransformation &T, mfem::Vector &V) const;
 
 public:
+  // Orientation modes
+  enum class OrientationMode
+  {
+    CENTER_BASED,
+    DIRECTION_BASED
+  };
+
+  // Constructor with center-based orientation
   BdrSurfaceFluxCoefficient(const mfem::ParGridFunction *E, const mfem::ParGridFunction *B,
                             const MaterialOperator &mat_op, bool two_sided,
-                            const mfem::Vector &x0, double scaling = 1.0)
+                            const mfem::Vector &x0, double scaling = 1.0,
+                            bool imag_permittivity = false)
     : mfem::Coefficient(),
       BdrGridFunctionCoefficient(
           E ? *E->ParFESpace()->GetParMesh() : *B->ParFESpace()->GetParMesh(), scaling),
-      E(E), B(B), mat_op(mat_op), two_sided(two_sided), x0(x0)
+      E(E), B(B), mat_op(mat_op), two_sided(two_sided), x0(x0), ref_dir(nullptr),
+      imag_permittivity(imag_permittivity)
+  {
+    MFEM_VERIFY((E || (Type != SurfaceFlux::ELECTRIC && Type != SurfaceFlux::POWER)) &&
+                    (B || (Type != SurfaceFlux::MAGNETIC && Type != SurfaceFlux::POWER)),
+                "Missing E or B field grid function for surface flux coefficient!");
+  }
+
+  // Constructor with direction-based orientation
+  BdrSurfaceFluxCoefficient(const mfem::ParGridFunction *E, const mfem::ParGridFunction *B,
+                            const MaterialOperator &mat_op, bool two_sided,
+                            const mfem::Vector &reference_direction, OrientationMode mode,
+                            double scaling = 1.0)
+    : mfem::Coefficient(),
+      BdrGridFunctionCoefficient(
+          E ? *E->ParFESpace()->GetParMesh() : *B->ParFESpace()->GetParMesh(), scaling),
+      E(E), B(B), mat_op(mat_op), two_sided(two_sided), x0(reference_direction),
+      ref_dir(mode == OrientationMode::DIRECTION_BASED ? &reference_direction : nullptr),
+      imag_permittivity(false)
   {
     MFEM_VERIFY((E || (Type != SurfaceFlux::ELECTRIC && Type != SurfaceFlux::POWER)) &&
                     (B || (Type != SurfaceFlux::MAGNETIC && Type != SurfaceFlux::POWER)),
@@ -230,12 +264,27 @@ public:
     }
     else
     {
-      // Orient outward from the surface with the given center.
-      double x_data[3];
-      mfem::Vector x(x_data, vdim);
-      T.Transform(ip, x);
-      x -= x0;
-      return (x * normal < 0.0) ? -flux : flux;
+      if (ref_dir && Type == SurfaceFlux::MAGNETIC)
+      {
+        // The reference direction selects the sign of the geometric normal; it is not a
+        // projection axis for the field. This preserves the B ⋅ n surface-flux magnitude
+        // for tilted and curved surfaces.
+        const double alignment = normal * (*ref_dir);
+        MFEM_VERIFY(
+            std::abs(alignment) > 1.0e-12 * ref_dir->Norml2(),
+            "Surface flux reference direction is tangent to the surface and cannot orient "
+            "its normal!");
+        return (alignment < 0.0) ? -flux : flux;
+      }
+      else
+      {
+        // Orient outward from the surface with the given center
+        double x_data[3];
+        mfem::Vector x(x_data, vdim);
+        T.Transform(ip, x);
+        x -= x0;
+        return (x * normal < 0.0) ? -flux : flux;
+      }
     }
   }
 };
@@ -244,11 +293,18 @@ template <>
 inline void BdrSurfaceFluxCoefficient<SurfaceFlux::ELECTRIC>::GetLocalFlux(
     mfem::ElementTransformation &T, mfem::Vector &V) const
 {
-  // Flux D.
+  // Flux D = ε E, with the real or imaginary part of the permittivity.
   double W_data[3];
   mfem::Vector W(W_data, T.GetSpaceDim());
   E->GetVectorValue(T, T.GetIntPoint(), W);
-  mat_op.GetPermittivityReal(T.Attribute).Mult(W, V);
+  if (imag_permittivity)
+  {
+    mat_op.GetPermittivityImag(T.Attribute).Mult(W, V);
+  }
+  else
+  {
+    mat_op.GetPermittivityReal(T.Attribute).Mult(W, V);
+  }
   V *= scaling;
 }
 
@@ -562,6 +618,19 @@ template <>
 inline double EnergyDensityCoefficient<EnergyDensityType::MAGNETIC>::GetLocalEnergyDensity(
     mfem::ElementTransformation &T) const
 {
+  if (T.GetSpaceDim() == 2)
+  {
+    // In 2D, B is the scalar out-of-plane component Bz (L2). The magnetic energy density
+    // is 1/2 μ⁻¹_zz |Bz|², matching the integrated domain energy.
+    double Bz = U.Real().GetValue(T, T.GetIntPoint());
+    double dot = Bz * Bz;
+    if (U.HasImag())
+    {
+      Bz = U.Imag().GetValue(T, T.GetIntPoint());
+      dot += Bz * Bz;
+    }
+    return 0.5 * mat_op.GetInvPermeabilityZZ(T.Attribute) * dot * scaling;
+  }
   double V_data[3];
   mfem::Vector V(V_data, T.GetSpaceDim());
   U.Real().GetVectorValue(T, T.GetIntPoint(), V);
@@ -1006,40 +1075,6 @@ public:
       V(0) = (kn_r * eti(1) + kn_i * etr(1) - grad_ezr(1)) * inv_omega;
       V(1) = (-kn_r * eti(0) - kn_i * etr(0) + grad_ezr(0)) * inv_omega;
     }
-  }
-};
-
-// Compute z-directed Poynting power density for a waveguide mode on a 2D cross-section:
-//   Sn = Re{Ex Hy* - Ey Hx*} where Ht = μ⁻¹ Bt.
-// No 1/2 factor, consistent with the 3D PoyntingVectorCoefficient convention.
-class ModeSnCoefficient : public mfem::Coefficient
-{
-  const mfem::ParGridFunction &et_r, &et_i;
-  const mfem::ParGridFunction &bt_r, &bt_i;
-  const MaterialOperator &mat_op;
-
-public:
-  ModeSnCoefficient(const mfem::ParGridFunction &et_r, const mfem::ParGridFunction &et_i,
-                    const mfem::ParGridFunction &bt_r, const mfem::ParGridFunction &bt_i,
-                    const MaterialOperator &mat_op)
-    : et_r(et_r), et_i(et_i), bt_r(bt_r), bt_i(bt_i), mat_op(mat_op)
-  {
-  }
-
-  double Eval(mfem::ElementTransformation &T, const mfem::IntegrationPoint &ip) override
-  {
-    mfem::Vector etr(2), eti(2), btr(2), bti(2);
-    et_r.GetVectorValue(T, ip, etr);
-    et_i.GetVectorValue(T, ip, eti);
-    bt_r.GetVectorValue(T, ip, btr);
-    bt_i.GetVectorValue(T, ip, bti);
-
-    double muinv = mat_op.GetInvPermeabilityZZ(T.Attribute);
-    double hx_r = muinv * btr(0), hx_i = muinv * bti(0);
-    double hy_r = muinv * btr(1), hy_i = muinv * bti(1);
-
-    // Re{Ex(-Hy*) + Ey(Hx*)} = -Ex_r Hy_r - Ex_i Hy_i + Ey_r Hx_r + Ey_i Hx_i
-    return -etr(0) * hy_r - eti(0) * hy_i + etr(1) * hx_r + eti(1) * hx_i;
   }
 };
 

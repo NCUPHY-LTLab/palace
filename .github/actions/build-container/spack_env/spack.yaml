@@ -14,6 +14,9 @@ spack:
     targets:         # Compile for the local microarchitecture
       granularity: microarchitectures
   config:       
+    # Some upstream source mirrors are selected through redirects and can fail
+    # transiently. Let curl retry 5xx responses before failing the full build.
+    url_fetch_method: "curl --retry 10 --retry-delay 2 --retry-max-time 120"
     # Padding is needed to ensure that the binaries can be relocated. Without
     # padding, RPATH might be to short to allow for arbitrary relocation (so
     # that the package has to be recompiled).
@@ -23,17 +26,26 @@ spack:
     # $env is the current environment
     # $spack is the spack root
     template_dirs:
+      - "."
       - $env
       - $spack/share/spack/templates
   packages:
     all:
       require: ~openmp       # We don't want any package with OpenMP
+    # Enable AWS EFA
+    libfabric:
+      require: fabrics=efa,lnx,mrail,rxm,shm,sockets,tcp,udp
+    # We do not want to include the full Python stack in the container
+    rdma-core:
+      require: ~pyverbs
   container:
     format: docker
     template: PalaceDockerfile
     images:
       os: "ubuntu:24.04"
-      spack: develop
+      # Pinned to the Spack 1.2 release series (prebuilt spack/ubuntu-noble:1.2
+      # image on Docker Hub) instead of the moving `develop` tag.
+      spack: "1.2"
   # Find pre-compiled packages in binary caches. Requires GITHUB_USER and
   # GITHUB_TOKEN (or a personal access token).
   #
@@ -44,11 +56,34 @@ spack:
       url: https://binaries.spack.io/develop
     local-buildcache:
       binary: true
-      url: oci://ghcr.io/awslabs/palace-develop-testing
+      url: oci://ghcr.io/awslabs/palace-1.2
       signed: false
       access_pair:
         id_variable: GITHUB_USER
         secret_variable: GITHUB_TOKEN
+  # A non-empty PALACE_CUDA adds CUDA constraints to the common Palace root
+  # spec. The build action sets it when it detects an NVIDIA GPU.
+  definitions:
+  - palace_base:
+    - >-
+      palace@develop+libxsmm+superlu-dist+mumps+sundials+strumpack+slepc+arpack+int64
+      %gcc@15 ^openblas ^openmpi schedulers=none fabrics=ofi
+  - cuda_constraints:
+    # Palace and its CUDA-capable dependencies receive the same multi-valued
+    # architecture constraint. This is the single source of truth for the CUDA
+    # fat-binary architectures the container is built for.
+    - >-
+      +cuda cuda_arch=80,86,89,90 ^cuda@13
+      ^openmpi+cuda
+      ^libfabric+cuda+cuda_dlopen
+  - when: not env.get("PALACE_CUDA")
+    palace:
+    - $palace_base
+  - when: env.get("PALACE_CUDA")
+    palace:
+    - matrix:
+      - [$palace_base]
+      - [$cuda_constraints]
   specs:
     # FIXME(awslabs/palace#731): re-enable the `compilers` spec group when the
     # underlying Spack spec-groups bug is fixed; gcc-15 is currently apt-
@@ -72,15 +107,8 @@ spack:
     # FIXME(awslabs/palace#731): re-enable with `compilers` group above.
     # needs: [compilers]
     specs:
-    - palace@develop+libxsmm+superlu-dist+mumps+sundials+strumpack+slepc+arpack+int64 %gcc@15 ^openblas@0.3.29 ^openmpi schedulers=none fabrics=ofi
+    - $palace
     override:
-      packages:
-        # Enable AWS EFA
-        libfabric:
-          require: fabrics=efa,lnx,mrail,rxm,shm,sockets,tcp,udp
-        # We do not want to include the full Python stack in the container
-        rdma-core:
-          require: ~pyverbs
       develop:
         palace:
           spec: palace@=develop
