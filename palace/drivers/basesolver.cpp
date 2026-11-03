@@ -29,7 +29,8 @@ namespace palace
 
 using json = nlohmann::json;
 
-void SaveIteration(MPI_Comm comm, const fs::path &output_dir, int step, int width)
+void SaveIteration(MPI_Comm comm, const fs::path &output_dir, int step, int width,
+                   bool preserve_adapt_diagnostics)
 {
   BlockTimer bt(Timer::IO);
   Mpi::Barrier(comm);  // Wait for all processes to write postprocessing files
@@ -56,7 +57,8 @@ void SaveIteration(MPI_Comm comm, const fs::path &output_dir, int step, int widt
         for (const auto &path : entries)
         {
           const auto &fname = path.filename().string();
-          if (fname.starts_with("iteration"))
+          if (fname.starts_with("iteration") ||
+              (preserve_adapt_diagnostics && fname == "amr-diagnostics"))
           {
             continue;
           }
@@ -233,8 +235,38 @@ void BaseSolver::SolveEstimateMarkRefine(std::vector<std::unique_ptr<Mesh>> &mes
   }
   MPI_Comm comm = mesh.back()->GetComm();
 
+  if (refinement.save_adapt_diagnostics)
+  {
+    adapt_diagnostics_ = std::make_unique<AdaptDiagnostics>(comm, post_dir);
+  }
+  auto SolveAttempt = [&](int iteration)
+  {
+    if (adapt_diagnostics_)
+    {
+      adapt_diagnostics_->BeginSolve(*mesh.back(), iteration);
+    }
+    try
+    {
+      auto result = Solve(mesh);
+      if (adapt_diagnostics_)
+      {
+        adapt_diagnostics_->FinishSolve(solve_converged_, result.second,
+                                        result.first.Norml2(comm));
+      }
+      return result;
+    }
+    catch (...)
+    {
+      if (adapt_diagnostics_)
+      {
+        adapt_diagnostics_->FailSolve();
+      }
+      throw;
+    }
+  };
+
   // Perform initial solve and estimation.
-  auto [indicators, ntdof] = Solve(mesh);
+  auto [indicators, ntdof] = SolveAttempt(1);
   MFEM_VERIFY(solve_converged_,
               "Initial solve did not converge; no converged result to fall back on!");
   double err = indicators.Norml2(comm);
@@ -286,12 +318,12 @@ void BaseSolver::SolveEstimateMarkRefine(std::vector<std::unique_ptr<Mesh>> &mes
     if (refinement.save_adapt_iterations)
     {
       mesh::SaveAdaptMesh(iodata, *mesh.back());
-      SaveIteration(comm, post_dir, it,
-                    1 + static_cast<int>(std::log10(refinement.max_it)));
+      SaveIteration(comm, post_dir, it, 1 + static_cast<int>(std::log10(refinement.max_it)),
+                    refinement.save_adapt_diagnostics);
     }
 
     // Mark.
-    const auto marked_elements = [&comm, &refinement](const auto &indicators)
+    const auto marked_elements = [this, &comm, &refinement, &mesh](const auto &indicators)
     {
       const auto [threshold, marked_error] = utils::ComputeDorflerThreshold(
           comm, indicators.Local(), refinement.update_fraction);
@@ -302,6 +334,12 @@ void BaseSolver::SolveEstimateMarkRefine(std::vector<std::unique_ptr<Mesh>> &mes
           " Marked {:d}/{:d} elements for refinement ({:.2f}% of the error, θ = {:.2f})\n",
           glob_marked_elements, glob_elements, 100 * marked_error,
           refinement.update_fraction);
+      if (adapt_diagnostics_)
+      {
+        adapt_diagnostics_->BeginTransition(
+            *mesh.back(), marked_elements, indicators.Local(), threshold,
+            refinement.update_fraction, refinement.max_nc_levels);
+      }
       return marked_elements;
     }(indicators);
 
@@ -310,6 +348,10 @@ void BaseSolver::SolveEstimateMarkRefine(std::vector<std::unique_ptr<Mesh>> &mes
       mfem::ParMesh &fine_mesh = *mesh.back();
       const auto initial_elem_count = fine_mesh.GetGlobalNE();
       fine_mesh.GeneralRefinement(marked_elements, -1, refinement.max_nc_levels);
+      if (adapt_diagnostics_)
+      {
+        adapt_diagnostics_->EndRefinement(fine_mesh);
+      }
       const auto final_elem_count = fine_mesh.GetGlobalNE();
       Mpi::Print(" {} mesh refinement added {:d} elements (initial = {:d}, final = {:d})\n",
                  fine_mesh.Nonconforming() ? "Nonconforming" : "Conforming",
@@ -332,6 +374,10 @@ void BaseSolver::SolveEstimateMarkRefine(std::vector<std::unique_ptr<Mesh>> &mes
                    ratio_pre, refinement.maximum_imbalance, ratio_post);
       }
       mesh.back()->Update();
+      if (adapt_diagnostics_)
+      {
+        adapt_diagnostics_->FinishTransition(*mesh.back());
+      }
     }
 
     // Record the adapted mesh's topology now, paired with the mesh file RebalanceMesh
@@ -353,7 +399,7 @@ void BaseSolver::SolveEstimateMarkRefine(std::vector<std::unique_ptr<Mesh>> &mes
     // Solve + estimate.
     Mpi::Print("\nProceeding with solve/estimate iteration {}...\n", it + 1);
     const auto prev_ntdof = ntdof;
-    std::tie(indicators, ntdof) = Solve(mesh);
+    std::tie(indicators, ntdof) = SolveAttempt(it + 1);
     if (!solve_converged_)
     {
       // Keep the previous converged iteration for the summary/CSVs (restore its DOF count);

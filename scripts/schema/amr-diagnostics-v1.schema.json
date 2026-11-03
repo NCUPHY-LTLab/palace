@@ -1,0 +1,629 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Palace native AMR diagnostics version 1",
+  "description": "Paths are relative to the manifest directory. Started attempts may reference incomplete files.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/manifest"
+    },
+    {
+      "$ref": "#/$defs/solve"
+    },
+    {
+      "$ref": "#/$defs/terminal"
+    },
+    {
+      "$ref": "#/$defs/transition"
+    },
+    {
+      "$ref": "#/$defs/rank"
+    }
+  ],
+  "$defs": {
+    "relative_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$"
+    },
+    "linear_solve": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "available": {
+              "const": false
+            }
+          },
+          "required": [
+            "available"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "available": {
+              "const": true
+            },
+            "algorithm": {
+              "enum": [
+                "cg",
+                "gmres",
+                "fgmres"
+              ]
+            },
+            "residual_norm": {
+              "type": "string"
+            },
+            "final_residual_is_estimate": {
+              "type": "boolean"
+            },
+            "iterations": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "initial_residual": {
+              "oneOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "enum": [
+                    "NaN",
+                    "Infinity",
+                    "-Infinity"
+                  ]
+                }
+              ]
+            },
+            "final_residual": {
+              "oneOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "enum": [
+                    "NaN",
+                    "Infinity",
+                    "-Infinity"
+                  ]
+                }
+              ]
+            },
+            "reference_residual": {
+              "oneOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "enum": [
+                    "NaN",
+                    "Infinity",
+                    "-Infinity"
+                  ]
+                }
+              ]
+            },
+            "reference_residual_source": {
+              "enum": [
+                "rhs",
+                "initial_residual"
+              ]
+            },
+            "relative_tolerance": {
+              "type": "number"
+            },
+            "absolute_tolerance": {
+              "type": "number"
+            },
+            "maximum_iterations": {
+              "type": "integer"
+            },
+            "converged": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "available",
+            "algorithm",
+            "residual_norm",
+            "final_residual_is_estimate",
+            "iterations",
+            "initial_residual",
+            "final_residual",
+            "reference_residual",
+            "reference_residual_source",
+            "relative_tolerance",
+            "absolute_tolerance",
+            "maximum_iterations",
+            "converged"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "manifest": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "palace.amr_diagnostics"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "manifest"
+        },
+        "coordinate_units": {
+          "const": "nondimensional"
+        },
+        "mpi_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "solves": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        },
+        "transitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "record_type",
+        "coordinate_units",
+        "mpi_size",
+        "solves",
+        "transitions",
+        "files"
+      ],
+      "additionalProperties": false
+    },
+    "solve": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "palace.amr_diagnostics"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "solve"
+        },
+        "iteration": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mesh_id": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "started",
+            "completed",
+            "failed"
+          ]
+        },
+        "owned_global_cells": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "true_dofs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "capacitance_written": {
+          "type": "boolean"
+        },
+        "capacitance_iteration": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "capacitance_terminal_order": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        },
+        "mesh_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        },
+        "indicator_norm": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "indicator_semantics": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "record_type",
+        "iteration",
+        "mesh_id",
+        "state",
+        "owned_global_cells",
+        "true_dofs",
+        "capacitance_written",
+        "capacitance_iteration",
+        "capacitance_terminal_order",
+        "terminal_records",
+        "mesh_paths"
+      ],
+      "additionalProperties": false
+    },
+    "terminal": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "palace.amr_diagnostics"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "terminal"
+        },
+        "iteration": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mesh_id": {
+          "type": "string"
+        },
+        "terminal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "statistics": {
+          "type": "object",
+          "properties": {
+            "terminal_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "capacitance_column": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "main": {
+              "$ref": "#/$defs/linear_solve"
+            },
+            "recovery": {
+              "$ref": "#/$defs/linear_solve"
+            }
+          },
+          "required": [
+            "terminal_index",
+            "capacitance_column",
+            "main",
+            "recovery"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "record_type",
+        "iteration",
+        "mesh_id",
+        "terminal",
+        "statistics"
+      ],
+      "additionalProperties": false
+    },
+    "transition": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "palace.amr_diagnostics"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "transition"
+        },
+        "pre_iteration": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "next_iteration": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pre_mesh_id": {
+          "type": "string"
+        },
+        "refined_mesh_id": {
+          "type": "string"
+        },
+        "next_mesh_id": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "started",
+            "refined",
+            "completed"
+          ]
+        },
+        "threshold": {
+          "type": "number"
+        },
+        "theta_requested": {
+          "type": "number"
+        },
+        "eta_squared_total": {
+          "type": "number"
+        },
+        "eta_squared_marked": {
+          "type": "number"
+        },
+        "marked_error_fraction": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "marked_error_fraction_reason": {
+          "enum": [
+            null,
+            "zero_total_indicator"
+          ]
+        },
+        "mesh_conformity": {
+          "enum": [
+            "C",
+            "NC"
+          ]
+        },
+        "max_nc_levels": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "owned_global_cells_pre": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "owned_global_cells_post_refinement": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "owned_global_cells_post_rebalance": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "marked_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "refined_parent_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "extra_refined_parent_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "refined_mesh_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        },
+        "rank_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "record_type",
+        "pre_iteration",
+        "next_iteration",
+        "pre_mesh_id",
+        "refined_mesh_id",
+        "next_mesh_id",
+        "state",
+        "threshold",
+        "theta_requested",
+        "eta_squared_total",
+        "eta_squared_marked",
+        "marked_error_fraction",
+        "marked_error_fraction_reason",
+        "mesh_conformity",
+        "max_nc_levels",
+        "owned_global_cells_pre"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "refined",
+                  "completed"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "owned_global_cells_post_refinement",
+              "marked_count",
+              "refined_parent_count",
+              "extra_refined_parent_count",
+              "refined_mesh_paths",
+              "rank_records"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "completed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "owned_global_cells_post_rebalance"
+            ]
+          }
+        }
+      ]
+    },
+    "rank": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "palace.amr_diagnostics"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "record_type": {
+          "const": "rank"
+        },
+        "rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pre_mesh_id": {
+          "type": "string"
+        },
+        "refined_mesh_id": {
+          "type": "string"
+        },
+        "owned_cells_pre": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "owned_cells_post_refinement": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "marked": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uniqueItems": true
+        },
+        "refined_parents": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uniqueItems": true
+        },
+        "fine_to_coarse": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "fine": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "coarse": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "fine",
+              "coarse"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "marked_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "refined_parent_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "extra_refined_parent_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "record_type",
+        "rank",
+        "pre_mesh_id",
+        "refined_mesh_id",
+        "owned_cells_pre",
+        "owned_cells_post_refinement",
+        "marked",
+        "refined_parents",
+        "fine_to_coarse",
+        "marked_count",
+        "refined_parent_count",
+        "extra_refined_parent_count"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

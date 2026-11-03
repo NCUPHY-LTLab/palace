@@ -20,6 +20,28 @@ namespace palace
 // real- or complex-valued systems.
 //
 
+// Observations from one completed solve. Residuals use the algorithm's native norm;
+// no true-residual recomputation is performed for diagnostics.
+struct LinearSolveDiagnostics
+{
+  bool available = false;
+  const char *algorithm = "unavailable";
+  // B denotes application of the inverse-preconditioner, not the preconditioner matrix.
+  const char *residual_norm = "unavailable";
+  bool final_residual_is_estimate = false;
+  int iterations = 0;
+  double initial_residual = 0.0;
+  double final_residual = 0.0;
+  // Convergence reference: the RHS norm when an initial guess is used, otherwise the
+  // initial residual norm. The stopping threshold is max(rel_tol * reference, abs_tol).
+  double reference_residual = 0.0;
+  const char *reference_residual_source = "unavailable";
+  double relative_tolerance = 0.0;
+  double absolute_tolerance = 0.0;
+  int maximum_iterations = 0;
+  bool converged = false;
+};
+
 // Base class for iterative solvers based on Krylov subspace methods with optional
 // preconditioning.
 template <OperatorType OperType>
@@ -52,6 +74,26 @@ protected:
   mutable bool converged;
   mutable double initial_res, final_res;
   mutable int final_it;
+
+  // Reset at the beginning of every attempt; only completed solves are available.
+  mutable LinearSolveDiagnostics diagnostics;
+
+  void CompleteDiagnostics(const char *algorithm, const char *norm, bool estimate) const
+  {
+    diagnostics.available = true;
+    diagnostics.algorithm = algorithm;
+    diagnostics.residual_norm = norm;
+    diagnostics.final_residual_is_estimate = estimate;
+    diagnostics.iterations = final_it;
+    diagnostics.final_residual = final_res;
+    diagnostics.reference_residual = initial_res;
+    diagnostics.reference_residual_source =
+        this->initial_guess ? "rhs" : "initial_residual";
+    diagnostics.relative_tolerance = rel_tol;
+    diagnostics.absolute_tolerance = abs_tol;
+    diagnostics.maximum_iterations = max_it;
+    diagnostics.converged = GetConverged();
+  }
 
   // Enable timer contribution for Timer::PRECONDITIONER.
   bool use_timer;
@@ -105,6 +147,10 @@ public:
 
   // Returns the number of iterations for the previous solve.
   int GetNumIterations() const { return final_it; }
+
+  // Return observations for the most recent completed solve, or unavailable after an
+  // interrupted attempt or before the first solve.
+  LinearSolveDiagnostics GetSolveDiagnostics() const { return diagnostics; }
 
   // Get the associated MPI communicator.
   MPI_Comm GetComm() const { return comm; }

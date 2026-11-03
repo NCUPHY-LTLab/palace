@@ -53,6 +53,8 @@ public:
                 bool use_mg);
 
   void Mult(const VecType &x, VecType &y) const;
+
+  LinearSolveDiagnostics GetSolveDiagnostics() const { return ksp->GetSolveDiagnostics(); }
 };
 
 // Forward declarations for friend access.
@@ -89,6 +91,12 @@ public:
   // and fold into an existing indicator. The indicators are nondimensionalized using the
   // total field energy.
   void AddErrorIndicator(const VecType &E, double Et, ErrorIndicator &indicator) const;
+
+  // The recovery projection is a separate solve from the main field solve.
+  LinearSolveDiagnostics GetProjectionSolveDiagnostics() const
+  {
+    return projector.GetSolveDiagnostics();
+  }
 };
 
 // Class used for computing curl flux error estimate, η_K = || μ⁻¹ Bₕ - H ||_K where H

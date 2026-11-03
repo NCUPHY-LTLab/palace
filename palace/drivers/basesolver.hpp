@@ -8,6 +8,7 @@
 #include <vector>
 #include <fmt/os.h>
 #include "fem/errorindicator.hpp"
+#include "utils/adaptdiagnostics.hpp"
 #include "utils/filesystem.hpp"
 #include "utils/geodata.hpp"
 #include "utils/memoryreporting.hpp"
@@ -50,6 +51,9 @@ protected:
   // converged iteration, instead of aborting or reporting a collapsed inductance.
   mutable bool solve_converged_ = true;
 
+  // Opt-in collective diagnostics, scoped to the active native solve attempt.
+  mutable std::unique_ptr<AdaptDiagnostics> adapt_diagnostics_;
+
   // Previous adaptation iteration's total London kinetic energy S(A_t − a_h), for detecting
   // an anomalous spike; negative until the first London solve sets it.
   mutable double prev_london_kinetic_ = -1.0;
@@ -87,7 +91,8 @@ public:
 // relative symlinks behind so that the output directory always has accessible results.
 // The palace.json metadata file is copied (not moved) since it is read and updated by
 // subsequent iterations.
-void SaveIteration(MPI_Comm comm, const fs::path &output_dir, int step, int width);
+void SaveIteration(MPI_Comm comm, const fs::path &output_dir, int step, int width,
+                   bool preserve_adapt_diagnostics = false);
 
 }  // namespace palace
 

@@ -340,6 +340,7 @@ IterativeSolver<OperType>::IterativeSolver(MPI_Comm comm, int print)
 template <OperatorType OperType>
 void CgSolver<OperType>::Mult(const VecType &b, VecType &x) const
 {
+  this->diagnostics = {};
   // Set up workspace.
   ScalarType beta, beta_prev = 0.0, alpha, denom;
   RealType res, eps;
@@ -375,6 +376,7 @@ void CgSolver<OperType>::Mult(const VecType &b, VecType &x) const
   beta = linalg::Dot(comm, z, r);
   CheckDot(beta, "PCG preconditioner is not positive definite: (Br, r) = ");
   res = std::sqrt(std::abs(beta));
+  this->diagnostics.initial_residual = res;
   if (this->initial_guess)
   {
     ScalarType beta_rhs;
@@ -465,6 +467,12 @@ void CgSolver<OperType>::Mult(const VecType &b, VecType &x) const
   }
   final_res = res;
   final_it = it;
+  this->CompleteDiagnostics("cg",
+                            B ? (std::is_same_v<OperType, ComplexOperator>
+                                     ? "sqrt(abs((B r)^H r))"
+                                     : "sqrt(r^T B r)")
+                              : "||r||_2",
+                            it > 0);
 }
 
 template <OperatorType OperType>
@@ -525,6 +533,7 @@ void GmresSolver<OperType>::Update(int j) const
 template <OperatorType OperType>
 void GmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
 {
+  this->diagnostics = {};
   // Set up workspace.
   RealType beta = 0.0, true_beta, eps = 0.0;
   MFEM_VERIFY(A, "Operator must be set for GmresSolver::Mult!");
@@ -551,6 +560,7 @@ void GmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
     CheckDot(true_beta, "GMRES residual norm is not valid: beta = ");
     if (it == 0)
     {
+      this->diagnostics.initial_residual = true_beta;
       if (this->initial_guess)
       {
         RealType beta_rhs;
@@ -582,6 +592,7 @@ void GmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
           std::string(tab_width, ' '), true_beta, beta, initial_res);
     }
     beta = true_beta;
+    this->diagnostics.final_residual_is_estimate = false;
     if (beta <= eps)
     {
       converged = true;
@@ -622,6 +633,7 @@ void GmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
       ApplyPlaneRotation(s[j], s[j + 1], cs[j], sn[j]);
 
       beta = std::abs(s[j + 1]);
+      this->diagnostics.final_residual_is_estimate = true;
       CheckDot(beta, "GMRES residual norm is not valid: beta = ");
       converged = (beta <= eps);
       if (converged || j + 1 == max_dim || it + 1 == max_it)
@@ -684,6 +696,13 @@ void GmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
   }
   final_res = beta;
   final_it = it;
+  // With no iterations allowed, the native GMRES path does not initialize either norm.
+  if (max_it > 0)
+  {
+    this->CompleteDiagnostics(
+        "gmres", B && pc_side == PreconditionerSide::LEFT ? "||B r||_2" : "||r||_2",
+        this->diagnostics.final_residual_is_estimate);
+  }
 }
 
 template <OperatorType OperType>
@@ -715,6 +734,7 @@ void FgmresSolver<OperType>::Update(int j) const
 template <OperatorType OperType>
 void FgmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
 {
+  this->diagnostics = {};
   // Set up workspace.
   RealType beta = 0.0, true_beta, eps = 0.0;
   MFEM_VERIFY(A && B, "Operator and preconditioner must be set for FgmresSolver::Mult!");
@@ -739,6 +759,7 @@ void FgmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
     CheckDot(true_beta, "FGMRES residual norm is not valid: beta = ");
     if (it == 0)
     {
+      this->diagnostics.initial_residual = true_beta;
       if (this->initial_guess)
       {
         auto beta_rhs = linalg::Norml2(comm, b);
@@ -761,6 +782,7 @@ void FgmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
           std::string(tab_width, ' '), true_beta, beta, initial_res);
     }
     beta = true_beta;
+    this->diagnostics.final_residual_is_estimate = false;
     if (beta <= eps)
     {
       converged = true;
@@ -801,6 +823,7 @@ void FgmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
       ApplyPlaneRotation(s[j], s[j + 1], cs[j], sn[j]);
 
       beta = std::abs(s[j + 1]);
+      this->diagnostics.final_residual_is_estimate = true;
       CheckDot(beta, "FGMRES residual norm is not valid: beta = ");
       converged = (beta <= eps);
       if (converged || j + 1 == max_dim || it + 1 == max_it)
@@ -850,6 +873,12 @@ void FgmresSolver<OperType>::Mult(const VecType &b, VecType &x) const
   }
   final_res = beta;
   final_it = it;
+  // With no iterations allowed, the native FGMRES path does not initialize either norm.
+  if (max_it > 0)
+  {
+    this->CompleteDiagnostics("fgmres", "||r||_2",
+                              this->diagnostics.final_residual_is_estimate);
+  }
 }
 
 template class IterativeSolver<Operator>;

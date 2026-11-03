@@ -66,6 +66,8 @@ public:
   // Whether the most recent Mult converged to the requested tolerance.
   bool GetConverged() const { return ksp->GetConverged(); }
 
+  LinearSolveDiagnostics GetSolveDiagnostics() const { return ksp->GetSolveDiagnostics(); }
+
   // Forward tolerance access to the underlying iterative solver.
   double GetRelTol() const { return ksp->GetRelTol(); }
   double GetAbsTol() const { return ksp->GetAbsTol(); }

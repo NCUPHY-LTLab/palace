@@ -229,6 +229,7 @@ void ConcretizeModel(const config::ModelData &model, json &j_model)
                 {"MaximumImbalance", ref.maximum_imbalance},
                 {"SaveAdaptIterations", ref.save_adapt_iterations},
                 {"SaveAdaptMesh", ref.save_adapt_mesh},
+                {"SaveAdaptDiagnostics", ref.save_adapt_diagnostics},
                 {"UniformLevels", ref.uniform_ref_levels},
                 {"SerialUniformLevels", ref.ser_uniform_ref_levels}});
 }
