@@ -3,6 +3,7 @@
 
 #include "electrostaticsolver.hpp"
 
+#include <cmath>
 #include <mfem.hpp>
 #include "fem/errorindicator.hpp"
 #include "fem/mesh.hpp"
@@ -11,12 +12,52 @@
 #include "linalg/operator.hpp"
 #include "models/laplaceoperator.hpp"
 #include "models/postoperator.hpp"
+#include "utils/adaptdiagnostics.hpp"
 #include "utils/communication.hpp"
 #include "utils/iodata.hpp"
 #include "utils/timer.hpp"
 
 namespace palace
 {
+
+namespace
+{
+
+nlohmann::json DiagnosticScalar(double value)
+{
+  if (std::isnan(value))
+  {
+    return "NaN";
+  }
+  if (std::isinf(value))
+  {
+    return std::signbit(value) ? "-Infinity" : "Infinity";
+  }
+  return value;
+}
+
+nlohmann::json LinearDiagnostics(const LinearSolveDiagnostics &stats)
+{
+  if (!stats.available)
+  {
+    return {{"available", false}};
+  }
+  return {{"available", true},
+          {"algorithm", stats.algorithm},
+          {"residual_norm", stats.residual_norm},
+          {"final_residual_is_estimate", stats.final_residual_is_estimate},
+          {"iterations", stats.iterations},
+          {"initial_residual", DiagnosticScalar(stats.initial_residual)},
+          {"final_residual", DiagnosticScalar(stats.final_residual)},
+          {"reference_residual", DiagnosticScalar(stats.reference_residual)},
+          {"reference_residual_source", stats.reference_residual_source},
+          {"relative_tolerance", stats.relative_tolerance},
+          {"absolute_tolerance", stats.absolute_tolerance},
+          {"maximum_iterations", stats.maximum_iterations},
+          {"converged", stats.converged}};
+}
+
+}  // namespace
 
 std::pair<ErrorIndicator, long long int>
 ElectrostaticSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
@@ -27,6 +68,10 @@ ElectrostaticSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   // prescribed BC values.
   BlockTimer bt0(Timer::CONSTRUCT);
   LaplaceOperator laplace_op(iodata, mesh);
+  if (adapt_diagnostics_)
+  {
+    adapt_diagnostics_->SetTrueDofs(laplace_op.GlobalTrueVSize());
+  }
   auto K = laplace_op.GetStiffnessMatrix();
   const auto &Grad = laplace_op.GetGradMatrix();
   SaveMetadata(laplace_op.GetH1Spaces());
@@ -52,6 +97,16 @@ ElectrostaticSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
       iodata.solver.linear.estimator_mg);
   ErrorIndicator indicator;
 
+  std::vector<int> terminal_order;
+  if (adapt_diagnostics_)
+  {
+    for (const auto &[idx, data] : laplace_op.GetSources())
+    {
+      terminal_order.push_back(idx);
+    }
+    adapt_diagnostics_->SetCapacitanceTerminalOrder(terminal_order);
+  }
+
   // Main loop over terminal boundaries.
   Mpi::Print("\nComputing electrostatic fields for {:d} terminal {}\n", n_step,
              (n_step > 1) ? "boundaries" : "boundary");
@@ -66,7 +121,19 @@ ElectrostaticSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
     // terminal.
     Mpi::Print("\n");
     laplace_op.GetExcitationVector(idx, *K, V[step], RHS);
+    if (adapt_diagnostics_)
+    {
+      adapt_diagnostics_->WriteTerminal(
+          idx, {{"terminal_index", idx}, {"capacitance_column", step}});
+    }
     ksp.Mult(RHS, V[step]);
+    if (adapt_diagnostics_)
+    {
+      adapt_diagnostics_->WriteTerminal(
+          idx, {{"terminal_index", idx},
+                {"capacitance_column", step},
+                {"main", LinearDiagnostics(ksp.GetSolveDiagnostics())}});
+    }
 
     // Start Post-processing.
     BlockTimer bt2(Timer::POSTPRO);
@@ -84,6 +151,12 @@ ElectrostaticSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
     // Calculate and record the error indicators.
     Mpi::Print(" Updating solution error estimates\n");
     estimator.AddErrorIndicator(E, total_domain_energy, indicator);
+    if (adapt_diagnostics_)
+    {
+      adapt_diagnostics_->WriteTerminal(
+          idx,
+          {{"recovery", LinearDiagnostics(estimator.GetProjectionSolveDiagnostics())}});
+    }
 
     // Next terminal.
     step++;
@@ -93,6 +166,10 @@ ElectrostaticSolver::Solve(const std::vector<std::unique_ptr<Mesh>> &mesh) const
   BlockTimer bt1(Timer::POSTPRO);
   SaveMetadata(ksp);
   PostprocessTerminals(post_op, laplace_op.GetSources(), V);
+  if (adapt_diagnostics_)
+  {
+    adapt_diagnostics_->MarkCapacitanceWritten(terminal_order);
+  }
   post_op.MeasureFinalize(indicator);
   return {indicator, laplace_op.GlobalTrueVSize()};
 }

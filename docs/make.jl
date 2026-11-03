@@ -98,6 +98,7 @@ makedocs(
         ],
         "Configuration File" => Any["config/config.md", "config/reference.md"],
         "Features" => Any[
+            "features/amr_diagnostics.md",
             "features/farfield.md",
             "features/adaptive_driven_solver.md",
             "features/circuit_extraction.md"

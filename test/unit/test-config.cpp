@@ -1476,6 +1476,26 @@ TEST_CASE("ConcretizeDefaults", "[config][Serial]")
     CHECK(l2.gs_orthog == l1.gs_orthog);
   }
 
+  SECTION("Refinement diagnostics default to disabled and parse explicitly")
+  {
+    json config = {
+        {"Problem", {{"Type", "Driven"}, {"Output", "test_output"}}},
+        {"Model", {{"Mesh", "test.msh"}}},
+        {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+        {"Solver", {{"Driven", {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.1}}}}}};
+
+    IoData default_data(config, false);
+    CHECK_FALSE(default_data.model.refinement.save_adapt_diagnostics);
+
+    config["Model"]["Refinement"]["SaveAdaptDiagnostics"] = true;
+    IoData enabled_data(config, false);
+    CHECK(enabled_data.model.refinement.save_adapt_diagnostics);
+
+    config["Model"]["Refinement"]["SaveAdaptDiagnostics"] = false;
+    IoData disabled_data(config, false);
+    CHECK_FALSE(disabled_data.model.refinement.save_adapt_diagnostics);
+  }
+
   SECTION("Round-trip: Model, Refinement, and Boundaries are reproducible")
   {
     json config = {
@@ -1485,7 +1505,11 @@ TEST_CASE("ConcretizeDefaults", "[config][Serial]")
           {"L0", 1.0e-3},
           {"MakeSimplex", true},
           {"Partitioning", "parts.txt"},
-          {"Refinement", {{"MaxIts", 4}, {"MaxSize", 1000}, {"UpdateFraction", 0.5}}}}},
+          {"Refinement",
+           {{"MaxIts", 4},
+            {"MaxSize", 1000},
+            {"UpdateFraction", 0.5},
+            {"SaveAdaptDiagnostics", true}}}}},
         {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
         {"Boundaries",
          {{"Absorbing", {{"Attributes", {2}}, {"Order", 2}}},
@@ -1560,6 +1584,8 @@ TEST_CASE("ConcretizeDefaults", "[config][Serial]")
     CHECK(r2.maximum_imbalance == r1.maximum_imbalance);
     CHECK(r2.save_adapt_iterations == r1.save_adapt_iterations);
     CHECK(r2.save_adapt_mesh == r1.save_adapt_mesh);
+    CHECK(r2.save_adapt_diagnostics == r1.save_adapt_diagnostics);
+    CHECK(r2.save_adapt_diagnostics);
     CHECK(r2.uniform_ref_levels == r1.uniform_ref_levels);
     CHECK(r2.ser_uniform_ref_levels == r1.ser_uniform_ref_levels);
     CHECK(iodata2.boundaries.farfield.order == iodata1.boundaries.farfield.order);

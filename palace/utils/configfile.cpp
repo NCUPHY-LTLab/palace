@@ -233,6 +233,7 @@ RefinementData::RefinementData(const json &refinement)
   maximum_imbalance = refinement.value("MaximumImbalance", maximum_imbalance);
   save_adapt_iterations = refinement.value("SaveAdaptIterations", save_adapt_iterations);
   save_adapt_mesh = refinement.value("SaveAdaptMesh", save_adapt_mesh);
+  save_adapt_diagnostics = refinement.value("SaveAdaptDiagnostics", save_adapt_diagnostics);
 
   // Options for a priori refinement.
   uniform_ref_levels = refinement.value("UniformLevels", uniform_ref_levels);

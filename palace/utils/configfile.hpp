@@ -131,6 +131,9 @@ public:
   // Whether to write a (serial) mesh to file after mesh modification during AMR.
   bool save_adapt_mesh = false;
 
+  // Whether to save diagnostic data from each adaptive mesh refinement iteration.
+  bool save_adapt_diagnostics = false;
+
   // Parallel uniform mesh refinement levels.
   int uniform_ref_levels = 0;
 

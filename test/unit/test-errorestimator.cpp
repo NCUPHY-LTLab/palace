@@ -175,6 +175,38 @@ TEST_CASE("Flux error estimators on mixed-geometry meshes",
         rt_fespace);
   }
 
+  SECTION("Gradient projection solve diagnostics")
+  {
+    GradFluxErrorEstimator<Vector> estimator(mat_op, nd_fespace, rt_fespaces, tol, 1, print,
+                                             use_mg);
+    CHECK_FALSE(estimator.GetProjectionSolveDiagnostics().available);
+    Vector E(nd_fespace.GetTrueVSize());
+    E.UseDevice(true);
+    E = 0.0;
+    ErrorIndicator zero;
+    estimator.AddErrorIndicator(E, 1.0, zero);
+    const auto zero_stats = estimator.GetProjectionSolveDiagnostics();
+    CHECK(zero_stats.available);
+    CHECK(zero_stats.converged);
+    CHECK(zero_stats.iterations == 0);
+    CHECK(zero_stats.initial_residual == 0.0);
+    CHECK(zero_stats.final_residual == 0.0);
+
+    FillRandom(E, 7);
+    ErrorIndicator nonzero;
+    estimator.AddErrorIndicator(E, 1.0, nonzero);
+    const auto stats = estimator.GetProjectionSolveDiagnostics();
+    CHECK(stats.available);
+    CHECK(stats.iterations == 1);
+    CHECK(stats.maximum_iterations == 1);
+    CHECK_FALSE(stats.converged);
+    CHECK(stats.initial_residual > 0.0);
+    CHECK(stats.final_residual > 0.0);
+    CHECK(std::string(stats.algorithm) == "cg");
+    CHECK(std::string(stats.residual_norm) == "sqrt(r^T B r)");
+    CHECK(stats.relative_tolerance == tol);
+  }
+
   SECTION("Gradient flux estimator")
   {
     Run(

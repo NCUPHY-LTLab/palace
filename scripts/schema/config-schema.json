@@ -527,6 +527,12 @@
           "default": false,
           "x-palace-advanced": true
         },
+        "SaveAdaptDiagnostics": {
+          "type": "boolean",
+          "description": "Save adaptive mesh refinement diagnostic data.",
+          "default": false,
+          "x-palace-advanced": true
+        },
         "UniformLevels": {
           "type": "integer",
           "minimum": 0,
