@@ -1482,6 +1482,7 @@ TEST_CASE("ConcretizeDefaults", "[config][Serial]")
         {"Problem", {{"Type", "Driven"}, {"Output", "test_output"}}},
         {"Model", {{"Mesh", "test.msh"}}},
         {"Domains", {{"Materials", {{{"Attributes", {1}}}}}}},
+        {"Boundaries", json::object()},
         {"Solver", {{"Driven", {{"MinFreq", 1.0}, {"MaxFreq", 2.0}, {"FreqStep", 0.1}}}}}};
 
     IoData default_data(config, false);
